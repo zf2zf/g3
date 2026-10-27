@@ -27,6 +27,10 @@ use crate::module::http_forward::HttpProxyClientResponse;
 use crate::module::tcp_connect::{
     TcpConnectError, TcpConnectTaskConf, TcpConnectTaskNotes, TcpConnection,
 };
+use crate::serve::ftp_proxy::audit_bridge::{
+    FtpUploadAuditContext, run_ftp_upload_audit_or_relay_bidi,
+};
+use crate::serve::ftp_proxy::upload_state::get_ftp_upload_state;
 use crate::serve::http_proxy::HttpConnectTaskAliveGuard;
 use crate::serve::{
     ServerStats, ServerTaskError, ServerTaskForbiddenError, ServerTaskNotes, ServerTaskResult,
@@ -444,6 +448,20 @@ impl HttpProxyConnectTask {
         self.task_notes.stage = ServerTaskStage::Replying;
         self.reply_ok(&mut clt_w).await?;
 
+        // For FTPS control channel (port 990), mark the domain early
+        // This ensures data channels can find the domain when they connect
+        let upstream_port = self.upstream.port();
+        if upstream_port == 990 {
+            let client_ip = self.task_notes.client_addr().ip();
+            if let Some(server_ip) = self.tcp_notes.next.map(|addr| addr.ip()) {
+                let domain = match self.upstream.host() {
+                    g3_types::net::Host::Domain(d) => d.to_string(),
+                    g3_types::net::Host::Ip(ip) => ip.to_string(),
+                };
+                get_ftp_upload_state().mark_ftps_domain(client_ip, server_ip, &domain);
+            }
+        }
+
         self.task_notes.mark_relaying();
         if let Some(user_ctx) = self.task_notes.user_ctx() {
             user_ctx.foreach_req_stats(|s| {
@@ -451,6 +469,8 @@ impl HttpProxyConnectTask {
             });
         }
         let clt_w = clt_w.into_inner();
+
+        // Just relay - bidirectional TCP tunnel forwarding
         self.relay(clt_r, clt_w, ups_r, ups_w).await
     }
 
@@ -469,7 +489,99 @@ impl HttpProxyConnectTask {
     {
         let (clt_r, clt_w) = self.update_clt(clt_r, clt_w);
 
-        if let Some(audit_handle) = self.audit_ctx.handle() {
+        let upstream_port = self.upstream.port();
+        let is_ftp_control = upstream_port == 21 || upstream_port == 990;
+        let is_ftps_control = upstream_port == 990;
+
+        let client_ip = self.task_notes.client_addr().ip();
+        let Some(server_ip) = self.tcp_notes.next.map(|addr| addr.ip()) else {
+            return self.transit_transparent(clt_r, clt_w, ups_r, ups_w).await;
+        };
+
+        // For FTPS control channel, save the domain to global state
+        // This domain will be used for data channel TLS certificate generation
+        if is_ftps_control {
+            let domain = match self.upstream.host() {
+                g3_types::net::Host::Domain(d) => d.to_string(),
+                g3_types::net::Host::Ip(ip) => ip.to_string(),
+            };
+            get_ftp_upload_state().mark_ftps_domain(client_ip, server_ip, &domain);
+        }
+
+        // Check if this is FTPS data channel by looking up the saved domain
+        let ftps_domain = get_ftp_upload_state().get_ftps_domain(client_ip, server_ip);
+        let is_ftps_data_channel = ftps_domain.is_some();
+
+        if (is_ftp_control || is_ftps_data_channel)
+            && let Some(audit_handle) = self.audit_ctx.handle()
+        {
+            let ctx = StreamInspectContext::new(
+                audit_handle.clone(),
+                self.ctx.server_config.clone(),
+                self.ctx.server_stats.clone(),
+                self.ctx.server_quit_policy.clone(),
+                self.ctx.idle_wheel.clone(),
+                &self.task_notes,
+                &self.tcp_notes,
+            );
+            return crate::inspect::stream::transit_with_inspection(
+                clt_r,
+                clt_w,
+                ups_r,
+                ups_w,
+                ctx,
+                self.upstream.clone(),
+                None,
+            )
+            .await;
+        }
+
+        if !is_ftp_control
+            && !is_ftps_data_channel
+            && let Some(upload_info) = get_ftp_upload_state().consume_upload(client_ip, server_ip)
+            && let Some(audit_handle) = self.audit_ctx.handle()
+            && let Some(icap_client) = audit_handle.icap_reqmod_client().cloned()
+        {
+            let data_channel_tuple = self.tcp_notes.local.and_then(|local_addr| {
+                self.tcp_notes
+                    .next
+                    .map(|remote_addr| g3_icap_client::reqmod::ConnectionTuple {
+                        server_addr: local_addr,
+                        remote_addr,
+                        protocol: g3_icap_client::reqmod::ConnectionProtocol::Tcp,
+                    })
+            });
+
+            let audit_ctx = FtpUploadAuditContext {
+                icap_client: Arc::new(icap_client),
+                idle_wheel: self.ctx.idle_wheel.clone(),
+                max_idle_count: self.ctx.server_config.task_max_idle_count(),
+                copy_config: self.ctx.server_config.limited_copy_config(),
+                client_addr: Some(self.task_notes.client_addr()),
+                ftp_command: upload_info.ftp_command,
+                ftp_path: upload_info.ftp_path,
+                data_channel_tuple,
+                keylog_buffer: None,
+            };
+
+            let _ = run_ftp_upload_audit_or_relay_bidi(
+                clt_r,
+                clt_w,
+                ups_r,
+                ups_w,
+                self.ctx.idle_wheel.clone(),
+                self.ctx.server_config.task_max_idle_count(),
+                Some(audit_ctx),
+            )
+            .await;
+            return Ok(());
+        }
+
+        // For non-FTP traffic (including HTTPS), perform ICAP audit if configured
+        if !is_ftp_control
+            && !is_ftps_data_channel
+            && let Some(audit_handle) = self.audit_ctx.handle()
+        {
             let audit_task = self
                 .task_notes
                 .user_ctx()

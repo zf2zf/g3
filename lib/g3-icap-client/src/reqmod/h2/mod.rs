@@ -18,9 +18,9 @@ use tokio::time::Instant;
 use g3_h2::H2StreamFromChunkedTransfer;
 use g3_http::server::HttpAdaptedRequest;
 use g3_io_ext::{IdleCheck, StreamCopyConfig};
-use g3_types::net::HttpHeaderMap;
+use g3_types::net::{HttpHeaderMap, TlsKeyLogBuffer};
 
-use super::IcapReqmodClient;
+use super::{ConnectionTuple, IcapReqmodClient};
 use crate::{IcapClientConnection, IcapClientReader, IcapServiceClient, IcapServiceOptions};
 
 pub use crate::reqmod::h1::HttpAdapterErrorResponse;
@@ -63,6 +63,9 @@ impl IcapReqmodClient {
             idle_checker,
             client_addr: None,
             client_username: None,
+            /* added by wming for repid audit */
+            connection_tuple: None,
+            keylog_buffer: None,
         })
     }
 }
@@ -79,6 +82,9 @@ pub struct H2RequestAdapter<I: IdleCheck> {
     idle_checker: I,
     client_addr: Option<SocketAddr>,
     client_username: Option<ArcStr>,
+    /* added by wming for repid audit */
+    connection_tuple: Option<ConnectionTuple>,
+    keylog_buffer: Option<Arc<TlsKeyLogBuffer>>,
 }
 
 pub struct ReqmodAdaptationRunState {
@@ -130,6 +136,15 @@ impl<I: IdleCheck> H2RequestAdapter<I> {
         self.client_username = Some(user);
     }
 
+    /* added by wming for repid audit */
+    pub fn set_connection_tuple(&mut self, tuple: ConnectionTuple) {
+        self.connection_tuple = Some(tuple);
+    }
+
+    pub fn set_keylog_buffer(&mut self, buffer: Arc<TlsKeyLogBuffer>) {
+        self.keylog_buffer = Some(buffer);
+    }
+
     fn push_extended_headers(&self, data: &mut Vec<u8>, extensions: Option<&Extensions>) {
         data.put_slice(b"X-Transformed-From: HTTP/2.0\r\n");
         if let Some(addr) = self.client_addr {
@@ -144,6 +159,13 @@ impl<I: IdleCheck> H2RequestAdapter<I> {
             data.put_slice(b"X-HTTP-Upgrade: ");
             data.put_slice(p.as_str().as_bytes());
             data.put_slice(b"\r\n");
+        }
+        /* added by wming for repid audit */
+        if let Some(ref tuple) = self.connection_tuple {
+            crate::serialize::add_connection_tuple(data, tuple);
+        }
+        if let Some(ref keylog) = self.keylog_buffer {
+            crate::serialize::add_keylog_headers(data, keylog);
         }
     }
 

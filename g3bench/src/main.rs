@@ -37,6 +37,7 @@ fn build_cli_args() -> Command {
         .subcommand(g3bench::target::keyless::command())
         .subcommand(g3bench::target::thrift::command())
         .subcommand(g3bench::target::websocket::command())
+        .subcommand(g3bench::target::icap::command())
 }
 
 fn main() -> anyhow::Result<ExitCode> {
@@ -115,6 +116,9 @@ fn main() -> anyhow::Result<ExitCode> {
             }
             g3bench::target::websocket::COMMAND => {
                 g3bench::target::websocket::run(&proc_args, sub_args).await
+            }
+            g3bench::target::icap::COMMAND => {
+                g3bench::target::icap::run(&proc_args, sub_args).await
             }
             cmd => Err(anyhow!("invalid subcommand {}", cmd)),
         }

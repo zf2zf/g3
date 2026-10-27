@@ -7,10 +7,12 @@ use bytes::BytesMut;
 use openssl::x509::X509VerifyResult;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+use std::sync::Arc;
+
 use g3_dpi::Protocol;
 use g3_io_ext::{AsyncStream, OnceBufReader};
 use g3_slog_types::{LtUpstreamAddr, LtUuid, LtX509VerifyResult};
-use g3_types::net::{TlsServiceType, UpstreamAddr};
+use g3_types::net::{TlsKeyLogBuffer, TlsServiceType, UpstreamAddr};
 use g3_udpdump::{ExportedPduDissectorHint, StreamDumpProxyAddresses};
 
 #[cfg(not(feature = "vendored-tongsuo"))]
@@ -44,11 +46,12 @@ macro_rules! intercept_log {
     };
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub(crate) enum StartTlsProtocol {
     Smtp,
     #[allow(unused)]
     Imap,
+    Ftp,
 }
 
 impl From<StartTlsProtocol> for Protocol {
@@ -56,6 +59,7 @@ impl From<StartTlsProtocol> for Protocol {
         match value {
             StartTlsProtocol::Smtp => Protocol::Smtp,
             StartTlsProtocol::Imap => Protocol::Imap,
+            StartTlsProtocol::Ftp => Protocol::FtpControl,
         }
     }
 }
@@ -65,6 +69,7 @@ impl From<StartTlsProtocol> for TlsServiceType {
         match value {
             StartTlsProtocol::Smtp => TlsServiceType::Smtp,
             StartTlsProtocol::Imap => TlsServiceType::Imap,
+            StartTlsProtocol::Ftp => TlsServiceType::Ftp,
         }
     }
 }
@@ -83,6 +88,7 @@ pub(crate) struct StartTlsInterceptObject<SC: ServerConfig> {
     tls_interception: TlsInterceptionContext,
     protocol: StartTlsProtocol,
     server_verify_result: Option<X509VerifyResult>,
+    keylog_buffer: Option<Arc<TlsKeyLogBuffer>>,
 }
 
 impl<SC> StartTlsInterceptObject<SC>
@@ -102,6 +108,7 @@ where
             tls_interception: tls,
             protocol,
             server_verify_result: None,
+            keylog_buffer: None,
         }
     }
 
@@ -267,19 +274,19 @@ where
                     Box::new(ups_w),
                 );
                 StreamInspection::Imap(imap_obj)
-            } /*
-              _ => {
-                  let mut stream_obj =
-                      crate::inspect::stream::StreamInspectObject::new(ctx, self.upstream.clone());
-                  stream_obj.set_io(
-                      Box::new(clt_r),
-                      Box::new(clt_w),
-                      Box::new(ups_r),
-                      Box::new(ups_w),
-                  );
-                  StreamInspection::StreamUnknown(stream_obj)
-              }
-               */
+            }
+            StartTlsProtocol::Ftp => {
+                let mut ftp_obj =
+                    crate::inspect::ftp::FtpInterceptObject::new(ctx, self.upstream.clone());
+                ftp_obj.set_from_starttls();
+                ftp_obj.set_io(
+                    Box::new(clt_r),
+                    Box::new(clt_w),
+                    OnceBufReader::with_no_buf(Box::new(ups_r)),
+                    Box::new(ups_w),
+                );
+                StreamInspection::Ftp(ftp_obj)
+            }
         }
     }
 }

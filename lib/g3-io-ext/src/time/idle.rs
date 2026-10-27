@@ -50,3 +50,31 @@ pub trait IdleCheck {
     fn check_quit(&self, idle_count: usize) -> bool;
     fn check_force_quit(&self) -> Option<IdleForceQuitReason>;
 }
+
+/// A simple `IdleCheck` implementation backed by an `IdleWheel`.
+/// It never forces a quit, so it is useful for sub-tasks whose
+/// lifecycle is controlled by an outer relay (e.g., the FTP
+/// upload data channel audit pipeline).
+pub struct IdleWheelChecker {
+    idle_wheel: Arc<IdleWheel>,
+}
+
+impl IdleWheelChecker {
+    pub fn new(idle_wheel: Arc<IdleWheel>) -> Self {
+        IdleWheelChecker { idle_wheel }
+    }
+}
+
+impl IdleCheck for IdleWheelChecker {
+    fn interval_timer(&self) -> IdleInterval {
+        self.idle_wheel.register()
+    }
+
+    fn check_quit(&self, _idle_count: usize) -> bool {
+        false
+    }
+
+    fn check_force_quit(&self) -> Option<IdleForceQuitReason> {
+        None
+    }
+}

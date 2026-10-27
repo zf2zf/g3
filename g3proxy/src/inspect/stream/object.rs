@@ -10,6 +10,8 @@ use g3_dpi::{Protocol, ProtocolInspectError, ProtocolInspector};
 use g3_io_ext::{FlexBufReader, OnceBufReader};
 use g3_types::net::UpstreamAddr;
 
+use g3_icap_client::reqmod::{ConnectionProtocol, ConnectionTuple};
+
 use crate::config::server::ServerConfig;
 use crate::inspect::{BoxAsyncRead, BoxAsyncWrite, StreamInspectContext, StreamInspection};
 use crate::log::inspect::InspectSource;
@@ -127,6 +129,43 @@ where
         StreamInspectLog::new(&self.ctx).log(InspectSource::StreamInspection, protocol);
         match protocol {
             Protocol::Unknown => {
+                // For non-TLS FTP data channels (plain FTP over HTTP CONNECT):
+                // try the pending upload mark. In passive mode the data channel
+                // connects *before* STOR is sent on the control channel, so the
+                // mark may not exist yet. If the server IP is a known FTP/FTPS
+                // server, fall back to deferred checking inside intercept_pending.
+                let upload_info = crate::inspect::ftp::check_ftp_upload_data(
+                    self.ctx.task_notes.client_addr,
+                    self.ctx.connect_notes.server_addr,
+                );
+                let is_ftp_server = upload_info.is_some()
+                    || crate::inspect::ftp::get_ftps_domain(
+                        self.ctx.task_notes.client_addr,
+                        self.ctx.connect_notes.server_addr,
+                    )
+                    .is_some();
+
+                if is_ftp_server {
+                    let data_channel_tuple = Some(ConnectionTuple {
+                        server_addr: self.ctx.connect_notes.client_addr,
+                        remote_addr: self.ctx.connect_notes.server_addr,
+                        protocol: ConnectionProtocol::Tcp,
+                    });
+                    let mut ftp_upload_obj = crate::inspect::ftp::FtpUploadDataInterceptObject::new(
+                        self.ctx,
+                        upload_info,
+                        data_channel_tuple,
+                        None,
+                    );
+                    ftp_upload_obj.set_io(
+                        Box::new(OnceBufReader::new(clt_r, clt_r_buf)),
+                        Box::new(clt_w),
+                        Box::new(OnceBufReader::new(ups_r, ups_r_buf)),
+                        Box::new(ups_w),
+                    );
+                    return Ok(StreamInspection::FtpUploadData(ftp_upload_obj));
+                }
+
                 self.ctx
                     .transit_inspect_unknown(
                         OnceBufReader::new(clt_r, clt_r_buf),
@@ -172,7 +211,7 @@ where
                 }
             }
             Protocol::Http1 => {
-                let mut h1_obj = crate::inspect::http::H1InterceptObject::new(self.ctx);
+                let mut h1_obj = crate::inspect::http::H1InterceptObject::new(self.ctx, None);
                 h1_obj.set_io(
                     FlexBufReader::with_bytes(clt_r_buf, clt_r),
                     clt_w,
@@ -182,8 +221,11 @@ where
                 return Ok(StreamInspection::H1(h1_obj));
             }
             Protocol::Http2 => {
-                let mut h2_obj =
-                    crate::inspect::http::H2InterceptObject::new(self.ctx, self.upstream.clone());
+                let mut h2_obj = crate::inspect::http::H2InterceptObject::new(
+                    self.ctx,
+                    self.upstream.clone(),
+                    None,
+                );
                 h2_obj.set_io(OnceBufReader::new(clt_r, clt_r_buf), clt_w, ups_r, ups_w);
                 return Ok(StreamInspection::H2(h2_obj));
             }
@@ -198,6 +240,17 @@ where
                     crate::inspect::imap::ImapInterceptObject::new(self.ctx, self.upstream.clone());
                 imap_obj.set_io(clt_r, clt_w, OnceBufReader::new(ups_r, ups_r_buf), ups_w);
                 return Ok(StreamInspection::Imap(imap_obj));
+            }
+            Protocol::FtpControl => {
+                let mut ftp_obj =
+                    crate::inspect::ftp::FtpInterceptObject::new(self.ctx, self.upstream.clone());
+                ftp_obj.set_io(
+                    Box::new(clt_r),
+                    Box::new(clt_w),
+                    OnceBufReader::new(ups_r, ups_r_buf),
+                    Box::new(ups_w),
+                );
+                return Ok(StreamInspection::Ftp(ftp_obj));
             }
             _ => {}
         }

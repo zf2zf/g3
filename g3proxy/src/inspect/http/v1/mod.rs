@@ -12,6 +12,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use g3_dpi::Protocol;
 use g3_io_ext::{FlexBufReader, LimitedBufReadExt};
 use g3_slog_types::LtUuid;
+use g3_types::net::TlsKeyLogBuffer;
 
 use crate::config::server::ServerConfig;
 use crate::inspect::{
@@ -35,6 +36,9 @@ use forward::H1ForwardTask;
 mod upgrade;
 use upgrade::H1UpgradeTask;
 
+/* added by wming for repid audit */
+use g3_http::HttpBodyType;
+
 pub(crate) struct HttpRequestIo<CR: AsyncRead> {
     clt_r: FlexBufReader<CR>,
 }
@@ -56,14 +60,19 @@ pub(crate) struct H1InterceptObject<SC: ServerConfig> {
     io: Option<H1InterceptIo>,
     ctx: StreamInspectContext<SC>,
     req_id: usize,
+    keylog_buffer: Option<Arc<TlsKeyLogBuffer>>,
 }
 
 impl<SC: ServerConfig> H1InterceptObject<SC> {
-    pub(crate) fn new(ctx: StreamInspectContext<SC>) -> Self {
+    pub(crate) fn new(
+        ctx: StreamInspectContext<SC>,
+        keylog_buffer: Option<Arc<TlsKeyLogBuffer>>,
+    ) -> Self {
         H1InterceptObject {
             io: None,
             ctx,
             req_id: 0,
+            keylog_buffer,
         }
     }
 
@@ -172,7 +181,12 @@ where
                     return Err(e.into());
                 }
                 HttpRecvRequest::RequestWithoutIo(r) => {
-                    let mut forward_task = H1ForwardTask::new(self.ctx.clone(), &r, self.req_id);
+                    let mut forward_task = H1ForwardTask::new(
+                        self.ctx.clone(),
+                        &r,
+                        self.req_id,
+                        self.keylog_buffer.clone(),
+                    );
                     // not ICAP in this case
                     forward_task.forward_without_body(&mut rsp_io).await;
                     pipeline_stats.del_task();
@@ -203,7 +217,12 @@ where
                             pipeline_stats.del_task();
                         }
                     } else if r.inner.upgrade {
-                        let mut upgrade_task = H1UpgradeTask::new(self.ctx.clone(), r, self.req_id);
+                        let mut upgrade_task = H1UpgradeTask::new(
+                            self.ctx.clone(),
+                            r,
+                            self.req_id,
+                            self.keylog_buffer.clone(),
+                        );
                         let r = if let Some(reqmod_client) =
                             self.ctx.audit_handle.icap_reqmod_client()
                         {
@@ -225,15 +244,39 @@ where
                             pipeline_stats.del_task();
                         }
                     } else {
-                        let mut forward_task =
-                            H1ForwardTask::new(self.ctx.clone(), &r, self.req_id);
-                        if let Some(reqmod_client) = self.ctx.audit_handle.icap_reqmod_client() {
-                            forward_task
-                                .adapt_with_io(&mut req_io, &mut rsp_io, reqmod_client)
-                                .await;
+                        /* added by wming for repid audit */
+                        let mut forward_task = H1ForwardTask::new(
+                            self.ctx.clone(),
+                            &r,
+                            self.req_id,
+                            self.keylog_buffer.clone(),
+                        );
+
+                        let cfg = self.ctx.h1_interception();
+
+                        let body_pending = match r.inner.body_type() {
+                            Some(HttpBodyType::Chunked) => true,
+                            Some(HttpBodyType::ContentLength(v)) => {
+                                v > cfg.req_body_min_size as u64
+                            }
+                            _ => false,
+                        };
+
+                        let use_icap = if cfg.req_hasbody { body_pending } else { true };
+
+                        if use_icap {
+                            if let Some(reqmod_client) = self.ctx.audit_handle.icap_reqmod_client()
+                            {
+                                forward_task
+                                    .adapt_with_io(&mut req_io, &mut rsp_io, reqmod_client)
+                                    .await;
+                            } else {
+                                forward_task.forward_with_io(&mut req_io, &mut rsp_io).await;
+                            }
                         } else {
                             forward_task.forward_with_io(&mut req_io, &mut rsp_io).await;
                         }
+
                         pipeline_stats.del_task();
                         if forward_task.should_close() {
                             req_acceptor.close();

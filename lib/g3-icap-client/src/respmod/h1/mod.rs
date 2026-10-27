@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arcstr::ArcStr;
+use bytes::BufMut;
 use http::Method;
 use tokio::io::{AsyncBufRead, AsyncWrite};
 use tokio::time::Instant;
@@ -152,6 +153,7 @@ impl<I: IdleCheck> HttpResponseAdapter<I> {
     }
 
     fn push_extended_headers(&self, data: &mut Vec<u8>) {
+        data.put_slice(b"X-Transformed-From: HTTP/1.0\r\n");
         if let Some(addr) = self.client_addr {
             crate::serialize::add_client_addr(data, addr);
         }

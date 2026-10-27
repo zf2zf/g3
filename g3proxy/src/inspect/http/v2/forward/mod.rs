@@ -3,6 +3,7 @@
  * Copyright 2023-2025 ByteDance and/or its affiliates.
  */
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::anyhow;
@@ -15,6 +16,8 @@ use http::{Method, Request, Response, StatusCode, Uri, Version};
 use tokio::time::Instant;
 
 use g3_h2::{H2StreamBodyTransferError, H2StreamFromChunkedTransferError, RequestExt};
+use g3_icap_client::reqmod::{ConnectionProtocol, ConnectionTuple};
+
 use g3_icap_client::reqmod::h2::{
     H2RequestAdapter, HttpAdapterErrorResponse, ReqmodAdaptationEndState, ReqmodAdaptationRunState,
     ReqmodRecvHttpResponseBody,
@@ -23,7 +26,7 @@ use g3_icap_client::respmod::h2::{
     H2ResponseAdapter, RespmodAdaptationEndState, RespmodAdaptationRunState,
 };
 use g3_slog_types::{LtDateTime, LtDuration, LtH2StreamId, LtHttpMethod, LtHttpUri, LtUuid};
-use g3_types::net::HttpHeaderMap;
+use g3_types::net::{HttpHeaderMap, TlsKeyLogBuffer};
 
 use super::{H2BodyTransfer, H2StreamTransferError};
 use crate::config::server::ServerConfig;
@@ -120,6 +123,7 @@ pub(crate) struct H2ForwardTask<SC: ServerConfig> {
     ups_stream_id: Option<StreamId>,
     send_error_response: bool,
     http_notes: HttpForwardTaskNotes,
+    keylog_buffer: Option<Arc<TlsKeyLogBuffer>>,
 }
 
 impl<SC> H2ForwardTask<SC>
@@ -130,6 +134,7 @@ where
         ctx: StreamInspectContext<SC>,
         clt_stream_id: StreamId,
         req: &Request<RecvStream>,
+        keylog_buffer: Option<Arc<TlsKeyLogBuffer>>,
     ) -> Self {
         let http_notes = HttpForwardTaskNotes::new(req.method().clone(), req.uri().clone());
         H2ForwardTask {
@@ -138,6 +143,7 @@ where
             ups_stream_id: None,
             send_error_response: false,
             http_notes,
+            keylog_buffer,
         }
     }
 
@@ -222,6 +228,13 @@ where
             }
         };
 
+        /* added by wming for repid audit */
+        let content_length = parts
+            .headers
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok());
+
         self.send_error_response = true;
         let ups_req = Request::from_parts(parts, ());
 
@@ -244,26 +257,55 @@ where
                     if let Some(username) = self.ctx.raw_user_name() {
                         adapter.set_client_username(username.clone());
                     }
-                    let r = self
-                        .forward_with_adaptation(
-                            ups_send_req,
-                            ups_req,
-                            clt_body,
-                            clt_send_rsp,
-                            adapter,
-                            &mut adaptation_state,
-                        )
-                        .await;
-                    if let Some(dur) = adaptation_state.dur_ups_send_header {
-                        self.http_notes.dur_req_send_hdr = dur;
+
+                    /* added by wming for repid audit */
+                    let tuple = ConnectionTuple {
+                        server_addr: self.ctx.connect_notes.client_addr,
+                        remote_addr: self.ctx.connect_notes.server_addr,
+                        protocol: ConnectionProtocol::Tcp,
+                    };
+                    adapter.set_connection_tuple(tuple);
+
+                    if let Some(ref keylog) = self.keylog_buffer {
+                        adapter.set_keylog_buffer(keylog.clone());
                     }
-                    if let Some(dur) = adaptation_state.dur_ups_send_all {
-                        self.http_notes.dur_req_send_all = dur;
+
+                    let cfg = self.ctx.h1_interception();
+
+                    let mut use_icap = true;
+
+                    if cfg.req_hasbody {
+                        if clt_body.is_end_stream() {
+                            use_icap = false;
+                        } else if let Some(cl) = content_length
+                            && (cl < cfg.req_body_min_size as u64)
+                        {
+                            use_icap = false;
+                        }
                     }
-                    if let Some(dur) = adaptation_state.dur_ups_recv_header {
-                        self.http_notes.dur_rsp_recv_hdr = dur;
+
+                    if use_icap {
+                        let r = self
+                            .forward_with_adaptation(
+                                ups_send_req,
+                                ups_req,
+                                clt_body,
+                                clt_send_rsp,
+                                adapter,
+                                &mut adaptation_state,
+                            )
+                            .await;
+                        if let Some(dur) = adaptation_state.dur_ups_send_header {
+                            self.http_notes.dur_req_send_hdr = dur;
+                        }
+                        if let Some(dur) = adaptation_state.dur_ups_send_all {
+                            self.http_notes.dur_req_send_all = dur;
+                        }
+                        if let Some(dur) = adaptation_state.dur_ups_recv_header {
+                            self.http_notes.dur_rsp_recv_hdr = dur;
+                        }
+                        return r;
                     }
-                    return r;
                 }
                 Err(e) => {
                     if !reqmod.bypass() {

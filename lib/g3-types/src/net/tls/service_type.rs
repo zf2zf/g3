@@ -12,6 +12,7 @@ pub enum TlsServiceType {
     Http = 0,
     Smtp = 1,
     Imap = 2,
+    Ftp = 3,
 }
 
 impl TlsServiceType {
@@ -20,6 +21,7 @@ impl TlsServiceType {
             TlsServiceType::Http => "http",
             TlsServiceType::Smtp => "smtp",
             TlsServiceType::Imap => "imap",
+            TlsServiceType::Ftp => "ftp",
         }
     }
 }
@@ -46,6 +48,7 @@ impl TryFrom<u8> for TlsServiceType {
             0 => Ok(TlsServiceType::Http),
             1 => Ok(TlsServiceType::Smtp),
             2 => Ok(TlsServiceType::Imap),
+            3 => Ok(TlsServiceType::Ftp),
             _ => Err(InvalidServiceType),
         }
     }
@@ -59,6 +62,7 @@ impl FromStr for TlsServiceType {
             "http" | "HTTP" => Ok(TlsServiceType::Http),
             "smtp" | "SMTP" => Ok(TlsServiceType::Smtp),
             "imap" | "IMAP" => Ok(TlsServiceType::Imap),
+            "ftp" | "FTP" => Ok(TlsServiceType::Ftp),
             _ => Err(InvalidServiceType),
         }
     }
@@ -96,11 +100,15 @@ mod tests {
             TlsServiceType::try_from(2),
             Ok(TlsServiceType::Imap)
         ));
+        assert!(matches!(
+            TlsServiceType::try_from(3),
+            Ok(TlsServiceType::Ftp)
+        ));
     }
 
     #[test]
     fn try_from_u8_invalid() {
-        assert!(TlsServiceType::try_from(3).is_err());
+        assert!(TlsServiceType::try_from(4).is_err());
         assert!(TlsServiceType::try_from(255).is_err());
     }
 
@@ -112,12 +120,13 @@ mod tests {
         assert!(matches!("SMTP".parse(), Ok(TlsServiceType::Smtp)));
         assert!(matches!("imap".parse(), Ok(TlsServiceType::Imap)));
         assert!(matches!("IMAP".parse(), Ok(TlsServiceType::Imap)));
+        assert!(matches!("ftp".parse(), Ok(TlsServiceType::Ftp)));
+        assert!(matches!("FTP".parse(), Ok(TlsServiceType::Ftp)));
     }
 
     #[test]
     fn from_str_invalid() {
         assert!("https".parse::<TlsServiceType>().is_err());
-        assert!("ftp".parse::<TlsServiceType>().is_err());
         assert!("pop3".parse::<TlsServiceType>().is_err());
         assert!("".parse::<TlsServiceType>().is_err());
     }

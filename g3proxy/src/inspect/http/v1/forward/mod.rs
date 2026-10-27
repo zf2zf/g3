@@ -3,6 +3,7 @@
  * Copyright 2023-2025 ByteDance and/or its affiliates.
  */
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::anyhow;
@@ -16,17 +17,18 @@ use tokio::time::Instant;
 use g3_http::client::HttpTransparentResponse;
 use g3_http::server::HttpTransparentRequest;
 use g3_http::{HttpBodyReader, HttpBodyType};
-use g3_icap_client::reqmod::IcapReqmodClient;
 use g3_icap_client::reqmod::h1::{
     HttpAdapterErrorResponse, HttpRequestAdapter, ReqmodAdaptationEndState,
     ReqmodAdaptationRunState, ReqmodRecvHttpResponseBody,
 };
+use g3_icap_client::reqmod::{ConnectionProtocol, ConnectionTuple, IcapReqmodClient};
 use g3_icap_client::respmod::h1::{
     HttpResponseAdapter, RespmodAdaptationEndState, RespmodAdaptationRunState,
 };
 use g3_io_ext::{LimitedBufReadExt, LimitedWriteExt, StreamCopy, StreamCopyError};
 use g3_slog_types::{LtDateTime, LtDuration, LtHttpHeaderValue, LtHttpMethod, LtHttpUri, LtUuid};
 use g3_types::net::HttpHeaderMap;
+use g3_types::net::TlsKeyLogBuffer;
 
 use super::{HttpRequest, HttpRequestIo, HttpResponseIo};
 use crate::config::server::ServerConfig;
@@ -121,10 +123,16 @@ pub(super) struct H1ForwardTask<'a, SC: ServerConfig> {
     send_error_response: bool,
     should_close: bool,
     http_notes: HttpForwardTaskNotes,
+    keylog_buffer: Option<Arc<TlsKeyLogBuffer>>,
 }
 
 impl<'a, SC: ServerConfig> H1ForwardTask<'a, SC> {
-    pub(super) fn new(ctx: StreamInspectContext<SC>, req: &'a HttpRequest, req_id: usize) -> Self {
+    pub(super) fn new(
+        ctx: StreamInspectContext<SC>,
+        req: &'a HttpRequest,
+        req_id: usize,
+        keylog_buffer: Option<Arc<TlsKeyLogBuffer>>,
+    ) -> Self {
         let http_notes = HttpForwardTaskNotes::new(req.datetime_received, req.time_received);
         let should_close = !req.inner.keep_alive();
         H1ForwardTask {
@@ -134,6 +142,7 @@ impl<'a, SC: ServerConfig> H1ForwardTask<'a, SC> {
             send_error_response: true,
             should_close,
             http_notes,
+            keylog_buffer,
         }
     }
 
@@ -211,6 +220,17 @@ impl<'a, SC: ServerConfig> H1ForwardTask<'a, SC> {
                 if let Some(username) = self.ctx.raw_user_name() {
                     adapter.set_client_username(username.clone());
                 }
+                /* added by wming for repid audit */
+                let tuple = ConnectionTuple {
+                    server_addr: self.ctx.connect_notes.client_addr,
+                    remote_addr: self.ctx.connect_notes.server_addr,
+                    protocol: ConnectionProtocol::Tcp,
+                };
+                adapter.set_connection_tuple(tuple);
+                if let Some(ref keylog) = self.keylog_buffer {
+                    adapter.set_keylog_buffer(keylog.clone());
+                }
+
                 adapter
             }
             Err(e) => {

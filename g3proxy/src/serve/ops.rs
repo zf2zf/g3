@@ -26,6 +26,7 @@ use super::plain_quic_port::PlainQuicPort;
 use super::plain_tcp_port::PlainTcpPort;
 use super::plain_tls_port::PlainTlsPort;
 
+use super::ftp_proxy::FtpProxyServer;
 use super::http_proxy::HttpProxyServer;
 use super::http_rproxy::HttpRProxyServer;
 use super::sni_proxy::SniProxyServer;
@@ -309,6 +310,7 @@ fn spawn_new_unlocked(config: AnyServerConfig) -> anyhow::Result<()> {
         AnyServerConfig::SocksProxy(c) => SocksProxyServer::prepare_initial(c)?,
         AnyServerConfig::HttpProxy(c) => HttpProxyServer::prepare_initial(c)?,
         AnyServerConfig::HttpRProxy(c) => HttpRProxyServer::prepare_initial(c)?,
+        AnyServerConfig::FtpProxy(c) => FtpProxyServer::prepare_initial(c)?,
     };
     registry::add(name.clone(), server)?;
     update_dependency_to_server_unlocked(&name, "spawned");

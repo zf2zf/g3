@@ -16,6 +16,9 @@ pub struct H1InterceptionConfig {
     pub rsp_head_max_size: usize,
     pub body_line_max_len: usize,
     pub steal_forwarded_for: bool,
+    /* added by wming for repid audit */
+    pub req_hasbody: bool,
+    pub req_body_min_size: usize,
 }
 
 impl Default for H1InterceptionConfig {
@@ -29,6 +32,9 @@ impl Default for H1InterceptionConfig {
             rsp_head_max_size: 65536,
             body_line_max_len: 8192,
             steal_forwarded_for: false,
+            /* added by wming for repid audit */
+            req_hasbody: false,
+            req_body_min_size: 0,
         }
     }
 }

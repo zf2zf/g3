@@ -3,6 +3,8 @@
  * Copyright 2023-2025 ByteDance and/or its affiliates.
  */
 
+use std::sync::Arc;
+
 use anyhow::anyhow;
 use arcstr::ArcStr;
 use openssl::ssl::Ssl;
@@ -10,7 +12,7 @@ use openssl::ssl::Ssl;
 use g3_dpi::{Protocol, ProtocolInspector};
 use g3_io_ext::OnceBufReader;
 use g3_openssl::{SslAcceptor, SslConnector};
-use g3_types::net::{AlpnProtocol, Host, TlsCertUsage, TlsServiceType};
+use g3_types::net::{AlpnProtocol, Host, TlsCertUsage, TlsKeyLogBuffer, TlsServiceType};
 
 use super::{ParsedClientHello, TlsInterceptIo, TlsInterceptObject, TlsInterceptionError};
 use crate::config::server::ServerConfig;
@@ -61,7 +63,14 @@ where
                 new_ext
             }
         });
-        let ups_ssl = match self.ctx.user_site_tls_client() {
+        let keylog_buffer = if self.ctx.audit_handle.tls_keylog() {
+            Some(Arc::new(TlsKeyLogBuffer::new_with_max(
+                self.ctx.audit_handle.tls_keylog_max_entries(),
+            )))
+        } else {
+            None
+        };
+        let mut ups_ssl = match self.ctx.user_site_tls_client() {
             Some(c) => c
                 .build_mimic_ssl(sni_hostname, &self.upstream, alpn_ext.as_ref())
                 .map_err(|e| {
@@ -72,18 +81,55 @@ where
             None => self
                 .tls_interception
                 .client_config
-                .build_ssl(sni_hostname, &self.upstream, alpn_ext.as_ref())
+                .build_ssl(
+                    sni_hostname,
+                    &self.upstream,
+                    alpn_ext.as_ref(),
+                    keylog_buffer.clone(),
+                )
                 .map_err(|e| {
                     TlsInterceptionError::UpstreamPrepareFailed(anyhow!(
                         "failed to build general ssl context: {e}"
                     ))
                 })?,
         };
+        self.keylog_buffer = keylog_buffer;
+
+        // Check if this is an FTPS data channel (vsftpd require_ssl_reuse)
+        let ftps_domain = crate::inspect::ftp::get_ftps_domain(
+            self.ctx.task_notes.client_addr,
+            self.ctx.connect_notes.server_addr,
+        );
+
+        // Reuse FTPS control channel TLS session for data channel (vsftpd require_ssl_reuse)
+        if ftps_domain.is_some()
+            && let Some(session_der) = crate::serve::ftp_proxy::upload_state::get_ftp_upload_state()
+                .get_tls_session(
+                    self.ctx.task_notes.client_addr.ip(),
+                    self.ctx.connect_notes.server_addr.ip(),
+                )
+        {
+            match openssl::ssl::SslSession::from_der(&session_der) {
+                Ok(session) => unsafe {
+                    if let Err(e) = ups_ssl.set_session(&session) {
+                        log::warn!("FTPS data channel set_session failed: {e}");
+                    }
+                },
+                Err(e) => {
+                    log::warn!("FTPS data channel session deserialization failed: {e}");
+                }
+            }
+        }
 
         // fetch fake server cert early in the background
-        let cert_domain = sni_hostname
-            .map(ArcStr::from)
-            .unwrap_or_else(|| self.upstream.host().to_arc_str());
+        // Use FTPS domain if available, otherwise use SNI or upstream hostname
+        let cert_domain = if let Some(domain) = ftps_domain {
+            ArcStr::from(domain)
+        } else {
+            sni_hostname
+                .map(ArcStr::from)
+                .unwrap_or_else(|| self.upstream.host().to_arc_str())
+        };
         let cert_domain2 = cert_domain.clone();
         let cert_agent = self.tls_interception.cert_agent.clone();
         let pre_fetch_handle = tokio::spawn(async move {

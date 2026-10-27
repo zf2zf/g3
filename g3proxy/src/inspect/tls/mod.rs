@@ -16,11 +16,12 @@ use g3_codec::tls::{
     ClientHello, ExtensionType, HandshakeCoalescer, RawVersion, Record, RecordParseError,
 };
 use g3_dpi::{Protocol, ProtocolInspector};
+use g3_icap_client::reqmod::{ConnectionProtocol, ConnectionTuple};
 use g3_io_ext::{AsyncStream, FlexBufReader, OnceBufReader};
 use g3_slog_types::{LtUpstreamAddr, LtUuid, LtX509VerifyResult};
 use g3_types::net::{
     AlpnProtocol, OpensslInterceptionClientConfig, OpensslInterceptionServerConfig, TlsAlpn,
-    TlsServerName, UpstreamAddr,
+    TlsKeyLogBuffer, TlsServerName, UpstreamAddr,
 };
 use g3_udpdump::{
     ExportedPduDissectorHint, StreamDumpConfig, StreamDumpProxyAddresses, StreamDumper,
@@ -228,6 +229,8 @@ pub(crate) struct TlsInterceptObject<SC: ServerConfig> {
     upstream: UpstreamAddr,
     tls_interception: TlsInterceptionContext,
     server_verify_result: Option<X509VerifyResult>,
+    /// TLS keylog buffer for the upstream TLS connection
+    keylog_buffer: Option<Arc<TlsKeyLogBuffer>>,
 }
 
 macro_rules! intercept_log {
@@ -256,6 +259,7 @@ impl<SC: ServerConfig> TlsInterceptObject<SC> {
             upstream,
             tls_interception: tls,
             server_verify_result: None,
+            keylog_buffer: None,
         }
     }
 
@@ -425,6 +429,44 @@ where
         }
     }
 
+    fn prepare_ctx(&self, protocol: Protocol) -> StreamInspectContext<SC> {
+        let mut ctx = self.ctx.clone();
+        ctx.increase_inspection_depth();
+        StreamInspectLog::new(&ctx).log(InspectSource::TlsAlpn, protocol);
+        ctx
+    }
+
+    fn build_stream_inspect<CR, CW, UR, UW>(
+        &self,
+        protocol: Protocol,
+        has_alpn: bool,
+        clt_r: CR,
+        clt_w: CW,
+        ups_r: UR,
+        ups_w: UW,
+    ) -> StreamInspection<SC>
+    where
+        CR: AsyncRead + Send + Sync + Unpin + 'static,
+        CW: AsyncWrite + Send + Sync + Unpin + 'static,
+        UR: AsyncRead + Send + Sync + Unpin + 'static,
+        UW: AsyncWrite + Send + Sync + Unpin + 'static,
+    {
+        let ctx = self.prepare_ctx(protocol);
+        let mut stream_obj =
+            crate::inspect::stream::StreamInspectObject::new(ctx, self.upstream.clone());
+        stream_obj.set_io(
+            Box::new(clt_r),
+            Box::new(clt_w),
+            Box::new(ups_r),
+            Box::new(ups_w),
+        );
+        if has_alpn {
+            StreamInspection::StreamUnknown(stream_obj)
+        } else {
+            StreamInspection::StreamInspect(stream_obj)
+        }
+    }
+
     fn inspect_inner<CR, CW, UR, UW>(
         &self,
         protocol: Protocol,
@@ -440,12 +482,11 @@ where
         UR: AsyncRead + Send + Sync + Unpin + 'static,
         UW: AsyncWrite + Send + Sync + Unpin + 'static,
     {
-        let mut ctx = self.ctx.clone();
-        ctx.increase_inspection_depth();
-        StreamInspectLog::new(&ctx).log(InspectSource::TlsAlpn, protocol);
         match protocol {
             Protocol::Http1 => {
-                let mut h1_obj = crate::inspect::http::H1InterceptObject::new(ctx);
+                let ctx = self.prepare_ctx(protocol);
+                let mut h1_obj =
+                    crate::inspect::http::H1InterceptObject::new(ctx, self.keylog_buffer.clone());
                 h1_obj.set_io(
                     FlexBufReader::new(Box::new(clt_r)),
                     Box::new(clt_w),
@@ -455,8 +496,12 @@ where
                 StreamInspection::H1(h1_obj)
             }
             Protocol::Http2 => {
-                let mut h2_obj =
-                    crate::inspect::http::H2InterceptObject::new(ctx, self.upstream.clone());
+                let ctx = self.prepare_ctx(protocol);
+                let mut h2_obj = crate::inspect::http::H2InterceptObject::new(
+                    ctx,
+                    self.upstream.clone(),
+                    self.keylog_buffer.clone(),
+                );
                 h2_obj.set_io(
                     OnceBufReader::with_no_buf(Box::new(clt_r)),
                     Box::new(clt_w),
@@ -466,6 +511,7 @@ where
                 StreamInspection::H2(h2_obj)
             }
             Protocol::Smtp => {
+                let ctx = self.prepare_ctx(protocol);
                 let mut smtp_obj =
                     crate::inspect::smtp::SmtpInterceptObject::new(ctx, self.upstream.clone());
                 smtp_obj.set_io(
@@ -477,6 +523,7 @@ where
                 StreamInspection::Smtp(smtp_obj)
             }
             Protocol::Imap => {
+                let ctx = self.prepare_ctx(protocol);
                 let mut imap_obj =
                     crate::inspect::imap::ImapInterceptObject::new(ctx, self.upstream.clone());
                 imap_obj.set_io(
@@ -487,23 +534,85 @@ where
                 );
                 StreamInspection::Imap(imap_obj)
             }
-            _ => {
-                let mut stream_obj =
-                    crate::inspect::stream::StreamInspectObject::new(ctx, self.upstream.clone());
-                stream_obj.set_io(
+            Protocol::FtpControl => {
+                let ctx = self.prepare_ctx(protocol);
+                let mut ftp_obj =
+                    crate::inspect::ftp::FtpInterceptObject::new(ctx, self.upstream.clone());
+                ftp_obj.set_io(
+                    Box::new(clt_r),
+                    Box::new(clt_w),
+                    OnceBufReader::with_no_buf(Box::new(ups_r)),
+                    Box::new(ups_w),
+                );
+                StreamInspection::Ftp(ftp_obj)
+            }
+            Protocol::Unknown => {
+                // FTP control ports (21, 990) running over FTPS are still
+                // control channels: route them to FtpInterceptObject so the
+                // STOR/APPE command can be parsed.
+                let port = self.upstream.port();
+                if port == 21 || port == 990 {
+                    let ctx = self.prepare_ctx(protocol);
+                    let mut ftp_obj =
+                        crate::inspect::ftp::FtpInterceptObject::new(ctx, self.upstream.clone());
+                    ftp_obj.set_io(
+                        Box::new(clt_r),
+                        Box::new(clt_w),
+                        OnceBufReader::with_no_buf(Box::new(ups_r)),
+                        Box::new(ups_w),
+                    );
+                    return StreamInspection::Ftp(ftp_obj);
+                }
+
+                // For FTPS data channels: try the pending upload mark. In
+                // passive mode the data channel connects (and completes TLS)
+                // *before* STOR is sent on the control channel, so the mark
+                // may not exist yet. If the server IP is known FTPS, fall
+                // back to deferred checking inside intercept_pending.
+                let upload_info = crate::inspect::ftp::check_ftp_upload_data(
+                    self.ctx.task_notes.client_addr,
+                    self.ctx.connect_notes.server_addr,
+                );
+                let upload_info = match upload_info {
+                    Some(info) => Some(info),
+                    None => {
+                        if crate::inspect::ftp::get_ftps_domain(
+                            self.ctx.task_notes.client_addr,
+                            self.ctx.connect_notes.server_addr,
+                        )
+                        .is_some()
+                        {
+                            None
+                        } else {
+                            return self.build_stream_inspect(
+                                protocol, has_alpn, clt_r, clt_w, ups_r, ups_w,
+                            );
+                        }
+                    }
+                };
+
+                let data_channel_tuple = Some(ConnectionTuple {
+                    server_addr: self.ctx.connect_notes.client_addr,
+                    remote_addr: self.ctx.connect_notes.server_addr,
+                    protocol: ConnectionProtocol::Tcp,
+                });
+
+                let ctx = self.prepare_ctx(protocol);
+                let mut ftp_upload_obj = crate::inspect::ftp::FtpUploadDataInterceptObject::new(
+                    ctx,
+                    upload_info,
+                    data_channel_tuple,
+                    self.keylog_buffer.clone(),
+                );
+                ftp_upload_obj.set_io(
                     Box::new(clt_r),
                     Box::new(clt_w),
                     Box::new(ups_r),
                     Box::new(ups_w),
                 );
-                if has_alpn {
-                    // Just treat it as unknown. Unknown protocol should be forbidden if needed.
-                    StreamInspection::StreamUnknown(stream_obj)
-                } else {
-                    // Inspect if no ALPN is set
-                    StreamInspection::StreamInspect(stream_obj)
-                }
+                StreamInspection::FtpUploadData(ftp_upload_obj)
             }
+            _ => self.build_stream_inspect(protocol, has_alpn, clt_r, clt_w, ups_r, ups_w),
         }
     }
 }

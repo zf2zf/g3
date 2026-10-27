@@ -3,7 +3,10 @@
  * Copyright 2023-2025 ByteDance and/or its affiliates.
  */
 
+use std::net::SocketAddr;
 use std::sync::Arc;
+
+use g3_types::net::TlsKeyLogBuffer;
 
 use crate::IcapServiceClient;
 
@@ -20,8 +23,23 @@ pub mod h2;
 
 pub mod mail;
 
+pub mod ftp;
 pub mod imap;
 pub mod smtp;
+
+/* added by wming for repid audit */
+pub struct ConnectionTuple {
+    pub server_addr: SocketAddr,
+    pub remote_addr: SocketAddr,
+    pub protocol: ConnectionProtocol,
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectionProtocol {
+    Tcp = 6,
+    Udp = 17,
+}
 
 #[derive(Clone)]
 pub struct IcapReqmodClient {
@@ -35,5 +53,10 @@ impl IcapReqmodClient {
 
     pub fn bypass(&self) -> bool {
         self.inner.config.bypass
+    }
+
+    /// Get a reference to the inner service client, used by protocol adapters.
+    pub fn service_client(&self) -> &Arc<IcapServiceClient> {
+        &self.inner
     }
 }

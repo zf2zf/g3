@@ -12,6 +12,16 @@ v1.13.0:
      - task_idle_check_duration in server config, use task_idle_check_interval instead
  - Removed: remove the long deprecated cache_file config option in lua and python user group source
 
+
+v1.12.3:
+ - BUG FIX: fix default ingress network filter rules
+
+v1.12.2:
+ - Compatibility: support to build rpm packages on OpenSUSE
+
+v1.12.1:
+ - BUG FIX: fix deb build of tarball
+
 v1.12.0:
  - Feature: allow to connect to ICAP server via UNIX domain socket
 

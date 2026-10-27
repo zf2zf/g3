@@ -96,7 +96,7 @@ mod tests {
     #[test]
     fn as_tls_service_type_err() {
         // Invalid string
-        let v = ValueRef::String("ftp".into());
+        let v = ValueRef::String("gopher".into());
         assert!(as_tls_service_type(&v).is_err());
 
         // Invalid UTF-8 in string
@@ -104,7 +104,7 @@ mod tests {
         assert!(as_tls_service_type(&v).is_err());
 
         // Out-of-range integer
-        let v = ValueRef::Integer(3.into());
+        let v = ValueRef::Integer(4.into());
         assert!(as_tls_service_type(&v).is_err());
 
         // Invalid UTF-8 in binary

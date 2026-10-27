@@ -3,6 +3,8 @@
  * Copyright 2025 ByteDance and/or its affiliates.
  */
 
+use std::sync::Arc;
+
 use anyhow::anyhow;
 use arcstr::ArcStr;
 use bytes::BytesMut;
@@ -10,7 +12,7 @@ use openssl::ssl::Ssl;
 
 use g3_io_ext::OnceBufReader;
 use g3_openssl::{SslAcceptor, SslConnector};
-use g3_types::net::{Host, TlsCertUsage, TlsServiceType};
+use g3_types::net::{Host, TlsCertUsage, TlsKeyLogBuffer, TlsServiceType, TlsVersion};
 
 use super::{StartTlsInterceptIo, StartTlsInterceptObject};
 use crate::config::server::ServerConfig;
@@ -52,6 +54,13 @@ where
             self.upstream.set_host(Host::from(domain));
         }
         let alpn_ext = client_hello.alpn.as_ref();
+        let keylog_buffer = if self.ctx.audit_handle.tls_keylog() {
+            Some(Arc::new(TlsKeyLogBuffer::new_with_max(
+                self.ctx.audit_handle.tls_keylog_max_entries(),
+            )))
+        } else {
+            None
+        };
         let ups_ssl = match self.ctx.user_site_tls_client() {
             Some(c) => c
                 .build_mimic_ssl(sni_hostname, &self.upstream, alpn_ext)
@@ -63,13 +72,19 @@ where
             None => self
                 .tls_interception
                 .client_config
-                .build_ssl(sni_hostname, &self.upstream, alpn_ext)
+                .build_ssl(
+                    sni_hostname,
+                    &self.upstream,
+                    alpn_ext,
+                    keylog_buffer.clone(),
+                )
                 .map_err(|e| {
                     TlsInterceptionError::UpstreamPrepareFailed(anyhow!(
                         "failed to build general ssl context: {e}"
                     ))
                 })?,
         };
+        self.keylog_buffer = keylog_buffer;
 
         // handshake with upstream server
         let ups_tls_connector =
@@ -87,6 +102,43 @@ where
         .map_err(|e| {
             TlsInterceptionError::UpstreamHandshakeFailed(anyhow!("upstream handshake error: {e}"))
         })?;
+
+        // Save TLS session for FTPS data channel reuse (vsftpd require_ssl_reuse)
+        if self.protocol == super::StartTlsProtocol::Ftp
+            && let Some(session) = ups_tls_stream.ssl().session()
+        {
+            match session.to_der() {
+                Ok(session_der) => {
+                    let client_ip = self.ctx.task_notes.client_addr.ip();
+                    let ftp_server_ip = self.ctx.connect_notes.server_addr.ip();
+                    crate::serve::ftp_proxy::upload_state::get_ftp_upload_state().save_tls_session(
+                        client_ip,
+                        ftp_server_ip,
+                        session_der,
+                    );
+                }
+                Err(e) => {
+                    log::warn!("FTPS control channel session serialization failed: {e}");
+                }
+            }
+        }
+
+        if let Some(buf) = &self.keylog_buffer {
+            if let Some(ssl_version) = ups_tls_stream.ssl().version2()
+                && let Ok(version) = TlsVersion::try_from(ssl_version)
+            {
+                buf.set_tls_version(version);
+            }
+            if let Some(cipher) = ups_tls_stream.ssl().current_cipher() {
+                let cipher_id = u16::from_be_bytes(cipher.protocol_id());
+                buf.set_cipher_suite(cipher_id);
+            }
+            let mut random_buf = [0u8; 32];
+            let random_len = ups_tls_stream.ssl().server_random(&mut random_buf);
+            if random_len > 0 {
+                buf.set_server_random(hex::encode(&random_buf[..random_len]));
+            }
+        }
 
         let upstream_cert = ups_tls_stream.ssl().peer_certificate().ok_or_else(|| {
             TlsInterceptionError::NoFakeCertGenerated(anyhow!("failed to get upstream certificate"))

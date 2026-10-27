@@ -41,6 +41,7 @@ use start_tls::StartTlsProtocol;
 pub(crate) mod http;
 mod websocket;
 
+pub(crate) mod ftp;
 pub(crate) mod imap;
 pub(crate) mod smtp;
 
@@ -359,6 +360,8 @@ pub(crate) enum StreamInspection<SC: ServerConfig> {
     Websocket(websocket::H1WebsocketInterceptObject<SC>),
     Smtp(smtp::SmtpInterceptObject<SC>),
     Imap(imap::ImapInterceptObject<SC>),
+    Ftp(ftp::FtpInterceptObject<SC>),
+    FtpUploadData(ftp::FtpUploadDataInterceptObject<SC>),
 }
 
 type BoxAsyncRead = Box<dyn AsyncRead + Send + Sync + Unpin + 'static>;

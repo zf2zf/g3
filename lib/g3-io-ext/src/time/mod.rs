@@ -7,4 +7,4 @@ mod optional_interval;
 pub use optional_interval::OptionalInterval;
 
 mod idle;
-pub use idle::{IdleCheck, IdleForceQuitReason, IdleInterval, IdleWheel};
+pub use idle::{IdleCheck, IdleForceQuitReason, IdleInterval, IdleWheel, IdleWheelChecker};

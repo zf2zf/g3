@@ -481,7 +481,8 @@ where
                     inspector.unset_no_explicit_ssl();
                 }
                 StreamInspection::TlsModern(tls) => {
-                    obj = tls.intercept(&mut inspector).await?;
+                    let result = tls.intercept(&mut inspector).await;
+                    obj = result?;
                     inspector.reset_state();
                     inspector.set_no_explicit_ssl();
                 }
@@ -523,6 +524,16 @@ where
                     }
                     None => break,
                 },
+                StreamInspection::Ftp(ftp) => match ftp.intercept().await? {
+                    Some(new_obj) => {
+                        obj = new_obj;
+                    }
+                    None => break,
+                },
+                StreamInspection::FtpUploadData(ftp_upload) => {
+                    ftp_upload.intercept().await?;
+                    break;
+                }
                 StreamInspection::End => break,
             }
         }

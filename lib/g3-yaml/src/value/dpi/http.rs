@@ -51,6 +51,15 @@ pub fn as_h1_interception_config(value: &Yaml) -> anyhow::Result<H1InterceptionC
                 config.steal_forwarded_for = crate::value::as_bool(v)?;
                 Ok(())
             }
+            /* added by wming for repid audit */
+            "req_hasbody" => {
+                config.req_hasbody = crate::value::as_bool(v)?;
+                Ok(())
+            }
+            "req_body_min_size" => {
+                config.req_body_min_size = crate::value::as_usize(v)?;
+                Ok(())
+            }
             _ => Err(anyhow!("invalid key {k}")),
         })?;
 
