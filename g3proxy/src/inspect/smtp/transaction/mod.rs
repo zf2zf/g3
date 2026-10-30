@@ -3,6 +3,13 @@
  * Copyright 2024-2025 ByteDance and/or its affiliates.
  */
 
+//! SMTP 事务（transaction）阶段：一次 MAIL FROM 之后、到邮件数据传输完成为止。
+//!
+//! [`Transaction`] 处理 RCPT/DATA/BDAT/BURL/NOOP/RSET/QUIT 等命令的转发与响应中继，
+//! 并在邮件正文到达代理时接入 ICAP reqmod 内容检测（放行原文、改写后转发或阻断）。
+//! 本阶段是内容审计的核心：文本正文经 [`g3_smtp_proto::io::TextDataReader`] 还原点转义后
+//! 交给适配器，二进制正文（BDAT）则按声明长度直接流式拷贝。
+
 use std::net::IpAddr;
 use std::time::Duration;
 
@@ -24,6 +31,7 @@ use crate::config::server::ServerConfig;
 use crate::inspect::StreamInspectContext;
 use crate::serve::{ServerIdleChecker, ServerTaskError, ServerTaskResult};
 
+// 记录一条事务级拦截日志，自动附带事务 id 与发件人地址等公共字段。
 macro_rules! intercept_log {
     ($obj:tt, $($args:tt)+) => {
         if let Some(logger) = $obj.ctx.intercept_logger() {
@@ -38,19 +46,21 @@ macro_rules! intercept_log {
     };
 }
 
+/// 一次邮件事务的状态机：从 MAIL 命令成功后开始，到正文传输完成（或 QUIT/RSET）结束。
 pub(super) struct Transaction<'a, SC: ServerConfig> {
     config: &'a SmtpInterceptionConfig,
     ctx: &'a StreamInspectContext<SC>,
     transaction_id: usize,
     local_ip: IpAddr,
-    allow_chunking: bool,
-    allow_burl: bool,
-    mail_from: MailParam,
-    mail_to: Vec<RecipientParam>,
-    quit: bool,
+    allow_chunking: bool,         // 服务端宣告且配置允许 BDAT 分块传输
+    allow_burl: bool,             // 服务端宣告且配置允许 BURL 按 URL 投递
+    mail_from: MailParam,         // MAIL FROM 参数，ICAP 检测时作为信封发件人
+    mail_to: Vec<RecipientParam>, // 已收集的 RCPT TO 收件人列表
+    quit: bool,                   // 事务内收到 QUIT 的标志，上层据此结束整个会话
 }
 
 impl<'a, SC: ServerConfig> Transaction<'a, SC> {
+    /// 创建事务对象；`from` 为已转发成功的 MAIL FROM 命令参数，收件人列表初始为空。
     pub(super) fn new(
         ctx: &'a StreamInspectContext<SC>,
         transaction_id: usize,
@@ -72,11 +82,13 @@ impl<'a, SC: ServerConfig> Transaction<'a, SC> {
         }
     }
 
+    /// 事务是否因客户端 QUIT 而结束；为 true 时上层应关闭会话而非开启下一事务。
     #[inline]
     pub(super) fn quit(&self) -> bool {
         self.quit
     }
 
+    /// 对外入口：执行事务中继并在结束时记录拦截日志。
     pub(super) async fn relay<CR, CW, UR, UW>(
         &mut self,
         buf: &mut SmtpRelayBuf,
@@ -103,6 +115,9 @@ impl<'a, SC: ServerConfig> Transaction<'a, SC> {
         }
     }
 
+    /// 事务命令循环：按命令类型分发到对应的转发/传输逻辑。
+    /// `in_chunking` 跟踪 BDAT 分段状态：一旦进入分块模式，RCPT/DATA 等文本命令均为时序错误。
+    /// 正文传输完成（DATA 或最后一块 BDAT）后 `Ok(())` 返回，上层可开启下一事务。
     async fn do_relay<CR, CW, UR, UW>(
         &mut self,
         buf: &mut SmtpRelayBuf,
@@ -127,6 +142,7 @@ impl<'a, SC: ServerConfig> Transaction<'a, SC> {
 
             match cmd {
                 Command::Recipient(p) => {
+                    // 收件人命令只在正文传输前合法；分块模式中属于时序错误
                     if in_chunking {
                         self.send_error_to_client(clt_w, ResponseEncoder::BAD_SEQUENCE_OF_COMMANDS)
                             .await?;
@@ -139,6 +155,7 @@ impl<'a, SC: ServerConfig> Transaction<'a, SC> {
                     self.mail_to.push(p);
                 }
                 Command::Data => {
+                    // 传统文本正文流程：DATA -> 354 -> 读正文 -> 源站最终响应，事务结束
                     if in_chunking {
                         self.send_error_to_client(clt_w, ResponseEncoder::BAD_SEQUENCE_OF_COMMANDS)
                             .await?;
@@ -148,6 +165,7 @@ impl<'a, SC: ServerConfig> Transaction<'a, SC> {
                     let rsp = self
                         .recv_relay_rsp(self.config.data_initiation_timeout, buf, ups_r, clt_w)
                         .await?;
+                    // 源站未回 354（开始邮件输入）则客户端不会发正文，继续等下一条命令
                     if rsp != ReplyCode::START_MAIL_INPUT {
                         continue;
                     }
@@ -158,6 +176,7 @@ impl<'a, SC: ServerConfig> Transaction<'a, SC> {
                     return Ok(());
                 }
                 Command::BinaryData(size) => {
+                    // BDAT 中间块：传输声明长度后仍停留在分块模式，等待后续块
                     if !self.allow_chunking {
                         self.send_error_to_client(clt_w, ResponseEncoder::COMMAND_NOT_IMPLEMENTED)
                             .await?;
@@ -171,6 +190,7 @@ impl<'a, SC: ServerConfig> Transaction<'a, SC> {
                     in_chunking = true;
                 }
                 Command::LastBinaryData(size) => {
+                    // LAST-parameters BDAT：传输完最后一块后事务结束
                     if !self.allow_chunking {
                         self.send_error_to_client(clt_w, ResponseEncoder::COMMAND_NOT_IMPLEMENTED)
                             .await?;
@@ -184,6 +204,7 @@ impl<'a, SC: ServerConfig> Transaction<'a, SC> {
                     return Ok(());
                 }
                 Command::DataByUrl(url) => {
+                    // BURL 中间块：依赖 CHUNKING 与 BURL 双重许可，服务端异步取数据
                     if !self.allow_burl || !self.allow_chunking {
                         self.send_error_to_client(clt_w, ResponseEncoder::COMMAND_NOT_IMPLEMENTED)
                             .await?;
@@ -196,6 +217,7 @@ impl<'a, SC: ServerConfig> Transaction<'a, SC> {
                     in_chunking = true;
                 }
                 Command::LastDataByUrl(url) => {
+                    // BURL 最后一块：受理后事务即结束（正文由服务端自行拉取）
                     if !self.allow_burl {
                         self.send_error_to_client(clt_w, ResponseEncoder::COMMAND_NOT_IMPLEMENTED)
                             .await?;
@@ -208,6 +230,7 @@ impl<'a, SC: ServerConfig> Transaction<'a, SC> {
                     return Ok(());
                 }
                 Command::NoOperation => {
+                    // NOOP 保活命令：转发并确认 250，异常响应码视为协议错误
                     self.send_cmd(ups_w, clt_w, cmd_line).await?;
                     let rsp = self
                         .recv_relay_rsp(self.config.response_wait_timeout, buf, ups_r, clt_w)
@@ -219,6 +242,7 @@ impl<'a, SC: ServerConfig> Transaction<'a, SC> {
                     }
                 }
                 Command::Reset => {
+                    // RSET：清空本次事务（收件人列表随之作废），返回上层重新等 MAIL
                     self.send_cmd(ups_w, clt_w, cmd_line).await?;
                     let rsp = self
                         .recv_relay_rsp(self.config.response_wait_timeout, buf, ups_r, clt_w)
@@ -232,6 +256,7 @@ impl<'a, SC: ServerConfig> Transaction<'a, SC> {
                     };
                 }
                 Command::Quit => {
+                    // QUIT：转发并中继响应后置位 quit 标志，通知上层结束会话
                     self.send_cmd(ups_w, clt_w, cmd_line).await?;
                     let _ = self
                         .recv_relay_rsp(self.config.response_wait_timeout, buf, ups_r, clt_w)
@@ -239,6 +264,7 @@ impl<'a, SC: ServerConfig> Transaction<'a, SC> {
                     self.quit = true;
                     return Ok(());
                 }
+                // 其余命令（如再次 MAIL/EHLO）在事务中均属时序错误，本地回 503
                 _ => {
                     self.send_error_to_client(clt_w, ResponseEncoder::BAD_SEQUENCE_OF_COMMANDS)
                         .await?;
@@ -247,6 +273,8 @@ impl<'a, SC: ServerConfig> Transaction<'a, SC> {
         }
     }
 
+    /// 逐行读取源站响应并原样转发给客户端，直到完整响应结束，返回最终响应码。
+    /// 421（SERVICE_NOT_AVAILABLE）视为源站即将下线，转换为 `UpstreamAppUnavailable` 错误终止任务。
     async fn recv_relay_rsp<CW, UR>(
         &mut self,
         recv_timeout: Duration,
@@ -285,6 +313,10 @@ impl<'a, SC: ServerConfig> Transaction<'a, SC> {
         }
     }
 
+    /// 传输 DATA 命令后的文本邮件正文。
+    /// 若配置了 ICAP reqmod 客户端，则把正文交给适配器做内容检测/改写；
+    /// ICAP 不可用时：客户端允许旁路则退化为原始传输，否则报错。
+    /// 无 ICAP 时用 [`TextDataReader`] 按 SMTP 点转义规则读取正文直到独占一行的 "."。
     async fn send_txt_data<CR, CW, UW>(
         &self,
         clt_r: &mut CR,
@@ -313,6 +345,7 @@ impl<'a, SC: ServerConfig> Transaction<'a, SC> {
                     if !client.bypass() {
                         return Err(ServerTaskError::InternalAdapterError(e));
                     }
+                    // ICAP 故障且策略允许旁路：落入下方原始传输
                 }
             }
         }
@@ -321,6 +354,9 @@ impl<'a, SC: ServerConfig> Transaction<'a, SC> {
         self.transfer_data(&mut reader, ups_w).await
     }
 
+    /// 经 ICAP reqmod 适配器传输正文：适配器按信封（发件人/收件人）改写或放行邮件。
+    /// 结束后按 [`ReqmodAdaptationEndState`] 分派：原文/改写后转发均成功；
+    /// HTTP 错误响应表示 ICAP 阻断，向客户端回 554 后终止事务。
     async fn send_txt_data_with_adaptation<CR, CW, UW>(
         &self,
         clt_r: &mut CR,
@@ -333,6 +369,7 @@ impl<'a, SC: ServerConfig> Transaction<'a, SC> {
         CW: AsyncWrite + Unpin,
         UW: AsyncWrite + Unpin,
     {
+        // 把客户端地址与用户名填入 ICAP 头，供检测服务做身份/来源维度的策略
         adapter.set_client_addr(self.ctx.task_notes.client_addr);
         if let Some(username) = self.ctx.raw_user_name() {
             adapter.set_client_username(username.clone());
@@ -352,6 +389,7 @@ impl<'a, SC: ServerConfig> Transaction<'a, SC> {
             Ok(ReqmodAdaptationEndState::OriginalTransferred) => Ok(()),
             Ok(ReqmodAdaptationEndState::AdaptedTransferred) => Ok(()),
             Ok(ReqmodAdaptationEndState::HttpErrResponse(rsp, body)) => {
+                // 读完并丢弃 HTTP 错误响应体，尽量回收连接后关闭
                 if let Some(mut body) = body {
                     let mut body_reader = body.body_reader();
                     let mut sinker = tokio::io::sink();
@@ -375,6 +413,9 @@ impl<'a, SC: ServerConfig> Transaction<'a, SC> {
         }
     }
 
+    /// 传输 BDAT 声明的 `size` 字节二进制数据。
+    /// 命令行缓冲里可能已预读到部分正文（命令与数据在同一 TCP 段到达），
+    /// 先把这段缓存写往源站，剩余长度再用 `take` 精确拷贝。
     async fn send_bin_data<CR, UW>(
         &self,
         buf: &mut SmtpRelayBuf,
@@ -395,6 +436,7 @@ impl<'a, SC: ServerConfig> Transaction<'a, SC> {
                 .map_err(ServerTaskError::UpstreamWriteFailed)?;
             copy_size -= cache.len();
             if copy_size == 0 {
+                // 预读缓存已覆盖全部声明长度，无需再从 socket 读取
                 ups_w
                     .flush()
                     .await
@@ -408,6 +450,8 @@ impl<'a, SC: ServerConfig> Transaction<'a, SC> {
         self.transfer_data(&mut reader, ups_w).await
     }
 
+    /// 带空闲检测与限流的单向拷贝（客户端 -> 源站）。
+    /// 空闲计数连续达到上限时，根据是否有未发送缓存判定超时方（客户端读空闲或源站写停滞）。
     async fn transfer_data<CR, UW>(&self, clt_r: &mut CR, ups_w: &mut UW) -> ServerTaskResult<()>
     where
         CR: AsyncRead + Unpin,
@@ -430,6 +474,7 @@ impl<'a, SC: ServerConfig> Transaction<'a, SC> {
                             Ok(())
                         }
                         Err(StreamCopyError::ReadFailed(e)) => {
+                            // 读侧失败前先把已缓存数据冲刷给源站，减少邮件损坏面
                             let _ = clt_to_ups.write_flush().await;
                             Err(ServerTaskError::ClientTcpReadFailed(e))
                         }
@@ -440,6 +485,7 @@ impl<'a, SC: ServerConfig> Transaction<'a, SC> {
                     if clt_to_ups.is_idle() {
                         idle_count += n;
                         if idle_count >= self.ctx.max_idle_count {
+                            // 无缓存数据 => 客户端不发数据；有缓存 => 源站不收数据
                             return if clt_to_ups.no_cached_data() {
                                 Err(ServerTaskError::ClientAppTimeout("idle while reading BDAT data"))
                             } else {
@@ -451,6 +497,7 @@ impl<'a, SC: ServerConfig> Transaction<'a, SC> {
                         clt_to_ups.reset_active();
                     }
 
+                    // 每个空闲周期复查用户封禁与服务退出，保证能快速中止长传输
                     if self.ctx.belongs_to_blocked_user() {
                         let _ = clt_to_ups.write_flush().await;
                         return Err(ServerTaskError::CanceledAsUserBlocked);
@@ -465,6 +512,7 @@ impl<'a, SC: ServerConfig> Transaction<'a, SC> {
         }
     }
 
+    /// 转发 DATA 命令（当前与 [`send_cmd`] 相同，预留按命令类型差异化处理的钩子）。
     async fn send_data_cmd<UW, CW>(
         &self,
         ups_w: &mut UW,
@@ -478,6 +526,7 @@ impl<'a, SC: ServerConfig> Transaction<'a, SC> {
         self.send_cmd(ups_w, clt_w, cmd_line).await
     }
 
+    /// 转发 BDAT 命令行（含长度参数），`_size` 仅用于接口一致性，实际按原行转发。
     async fn send_bdat_cmd<UW, CW>(
         &self,
         ups_w: &mut UW,
@@ -492,6 +541,7 @@ impl<'a, SC: ServerConfig> Transaction<'a, SC> {
         self.send_cmd(ups_w, clt_w, cmd_line).await
     }
 
+    /// 转发 BURL 命令行（含 URL 参数），`_url` 仅用于接口一致性，实际按原行转发。
     async fn send_burl_cmd<UW, CW>(
         &self,
         ups_w: &mut UW,
@@ -506,6 +556,7 @@ impl<'a, SC: ServerConfig> Transaction<'a, SC> {
         self.send_cmd(ups_w, clt_w, cmd_line).await
     }
 
+    /// 把命令行原样写入源站并 flush；失败时先向客户端回 451 IO 错误再返回错误。
     async fn send_cmd<UW, CW>(
         &self,
         ups_w: &mut UW,
@@ -527,6 +578,7 @@ impl<'a, SC: ServerConfig> Transaction<'a, SC> {
         }
     }
 
+    /// 向客户端写入一条由 `rsp_encoder` 构造的本地错误响应。
     async fn send_error_to_client<W>(
         &self,
         clt_w: &mut W,

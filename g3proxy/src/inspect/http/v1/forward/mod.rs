@@ -3,6 +3,13 @@
  * Copyright 2023-2025 ByteDance and/or its affiliates.
  */
 
+//! HTTP/1.1 普通方法（GET/POST 等）请求的转发拦截。
+//!
+//! [`H1ForwardTask`] 是检测流水线中处理单个非 CONNECT、非 Upgrade 请求的任务：
+//! 将请求头（可选经 ICAP reqmod 改写、并携带请求体）转发到上游，接收响应头
+//! （自动处理 100 Continue / 103 Early Hints 临时响应），响应头与响应体可再经
+//! ICAP respmod 送检后回传客户端。全程记录各阶段耗时供拦截审计日志使用。
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,6 +46,7 @@ use crate::serve::{ServerIdleChecker, ServerTaskError, ServerTaskResult};
 mod adaptation;
 pub(crate) use adaptation::HttpRequestWriterForAdaptation;
 
+// 转发任务审计日志宏：附带方法、URI、Host、各阶段状态码与耗时。
 macro_rules! intercept_log {
     ($obj:tt, $($args:tt)+) => {
         if let Some(logger) = $obj.ctx.intercept_logger() {
@@ -63,6 +71,9 @@ macro_rules! intercept_log {
     };
 }
 
+/// 单个转发请求的状态码与各阶段耗时快照，用于拦截审计日志。
+/// rsp_status 为客户端实际收到的状态码，origin_status 为上游返回的状态码，
+/// 二者在响应经改写或尚未发出时会不同；未发生的阶段保持 0/默认值。
 struct HttpForwardTaskNotes {
     rsp_status: u16,
     origin_status: u16,
@@ -76,6 +87,8 @@ struct HttpForwardTaskNotes {
 }
 
 impl HttpForwardTaskNotes {
+    /// 以请求到达时刻为基准创建快照；`dur_req_pipeline` 是请求在流水线
+    /// channel 中排队等待主循环处理的时间。
     fn new(datetime_received: DateTime<Utc>, time_received: Instant) -> Self {
         let dur_req_pipeline = time_received.elapsed();
         HttpForwardTaskNotes {
@@ -91,42 +104,54 @@ impl HttpForwardTaskNotes {
         }
     }
 
+    /// 记录请求头发送完成的耗时
     pub(crate) fn mark_req_send_hdr(&mut self) {
         self.dur_req_send_hdr = self.receive_ins.elapsed();
     }
 
+    /// 无请求体的请求：发送全部耗时等于发送头部耗时
     pub(crate) fn mark_req_no_body(&mut self) {
         self.dur_req_send_all = self.dur_req_send_hdr;
     }
 
+    /// 记录请求（头+体）全部发送完成的耗时
     pub(crate) fn mark_req_send_all(&mut self) {
         self.dur_req_send_all = self.receive_ins.elapsed();
     }
 
+    /// 记录上游响应头接收完成的耗时
     pub(crate) fn mark_rsp_recv_hdr(&mut self) {
         self.dur_rsp_recv_hdr = self.receive_ins.elapsed();
     }
 
+    /// 无响应体的应答：接收全部耗时等于接收头部耗时
     pub(crate) fn mark_rsp_no_body(&mut self) {
         self.dur_rsp_recv_all = self.dur_rsp_recv_hdr;
     }
 
+    /// 记录响应（头+体）全部接收转发的耗时
     pub(crate) fn mark_rsp_recv_all(&mut self) {
         self.dur_rsp_recv_all = self.receive_ins.elapsed();
     }
 }
 
+/// HTTP/1 普通请求转发任务。req 以引用借用主循环持有的已解析请求，
+/// 任务结束后请求仍归调用方所有。
 pub(super) struct H1ForwardTask<'a, SC: ServerConfig> {
     ctx: StreamInspectContext<SC>,
     req: &'a HttpTransparentRequest,
     req_id: usize,
+    // 是否还允许向客户端发送代理层错误响应；响应头一旦写出即置 false
     send_error_response: bool,
+    // 本次交互后连接是否必须关闭
     should_close: bool,
     http_notes: HttpForwardTaskNotes,
+    // TLS keylog 缓冲，供 ICAP 送检时导出会话密钥解密 HTTPS 流量
     keylog_buffer: Option<Arc<TlsKeyLogBuffer>>,
 }
 
 impl<'a, SC: ServerConfig> H1ForwardTask<'a, SC> {
+    /// 创建转发任务；请求不保持 keep-alive 时初始即要求关闭连接。
     pub(super) fn new(
         ctx: StreamInspectContext<SC>,
         req: &'a HttpRequest,
@@ -146,11 +171,16 @@ impl<'a, SC: ServerConfig> H1ForwardTask<'a, SC> {
         }
     }
 
+    /// 上层据此决定是否关闭整条客户端连接
     #[inline]
     pub(super) fn should_close(&self) -> bool {
         self.should_close
     }
 
+    /// 把任务错误映射为 HTTP 错误响应回给客户端。
+    /// 关键细节：若请求体尚未读完（body_pending），即使错误响应本身可复用连接，
+    /// 残留的请求体会破坏下一个请求的解析，因此强制按关闭处理；
+    /// 无法生成错误响应（如响应已部分发出）且有残留体时同样必须断开。
     async fn reply_task_err<CW>(&mut self, e: &ServerTaskError, clt_w: &mut CW)
     where
         CW: AsyncWrite + Unpin,
@@ -177,6 +207,8 @@ impl<'a, SC: ServerConfig> H1ForwardTask<'a, SC> {
         }
     }
 
+    /// 转发无请求体的请求（读端留在流水线解析任务中，不经本函数）。
+    /// 失败时若仍允许发错误响应则回复客户端，最终一律打拦截日志，不向外抛错。
     pub(super) async fn forward_without_body<CW, UR, UW>(
         &mut self,
         rsp_io: &mut HttpResponseIo<CW, UR, UW>,
@@ -195,6 +227,11 @@ impl<'a, SC: ServerConfig> H1ForwardTask<'a, SC> {
         }
     }
 
+    /// 经 ICAP reqmod 送检并转发带请求体的请求。
+    /// 流程：创建 adapter（注入客户端地址、用户名、连接五元组、TLS keylog）→
+    /// 运行送检 → 用适配器的实测耗时回填审计字段；客户端数据未读完或上游
+    /// 未写全时强制关闭连接（残留字节会破坏流水线上的下一个请求）。
+    /// adapter 创建失败且配置了 bypass 时降级为普通转发。
     pub(super) async fn adapt_with_io<CR, CW, UR, UW>(
         &mut self,
         req_io: &mut HttpRequestIo<CR>,
@@ -221,6 +258,7 @@ impl<'a, SC: ServerConfig> H1ForwardTask<'a, SC> {
                     adapter.set_client_username(username.clone());
                 }
                 /* added by wming for repid audit */
+                // 注入真实连接五元组，便于 ICAP 服务端按会话做审计/改写决策
                 let tuple = ConnectionTuple {
                     server_addr: self.ctx.connect_notes.client_addr,
                     remote_addr: self.ctx.connect_notes.server_addr,
@@ -250,6 +288,7 @@ impl<'a, SC: ServerConfig> H1ForwardTask<'a, SC> {
             .run_with_adaptation(req_io, rsp_io, adapter, &mut adaptation_state)
             .await;
 
+        // 送检路径下请求头/体的实际发送耗时由适配器统计，回填到审计快照
         if let Some(dur) = adaptation_state.dur_ups_send_header {
             self.http_notes.dur_req_send_hdr = dur;
         }
@@ -273,6 +312,8 @@ impl<'a, SC: ServerConfig> H1ForwardTask<'a, SC> {
         }
     }
 
+    /// 不经 ICAP 的普通转发入口：按请求是否带体选择实现路径，
+    /// 错误时视情况回复客户端并记录拦截日志。
     pub(super) async fn forward_with_io<CR, CW, UR, UW>(
         &mut self,
         req_io: &mut HttpRequestIo<CR>,
@@ -301,6 +342,12 @@ impl<'a, SC: ServerConfig> H1ForwardTask<'a, SC> {
         }
     }
 
+    /// ICAP reqmod 送检的核心循环：并发执行"适配器搬运请求（客户端→ICAP→上游）"
+    /// 与"探测上游响应"两路任务。
+    /// 上游提前返回响应（常见于鉴权 401 或请求被拒）时：临时响应（100/103）直接
+    /// 透传后继续等待；最终响应到达则提前 break——此时请求体可能未搬完，
+    /// 之后据 clt_read_finished/ups_write_finished 决定是否断连。
+    /// 适配器若返回错误响应（阻断），则直接把它回给客户端并结束。
     async fn run_with_adaptation<CR, CW, UR, UW>(
         &mut self,
         req_io: &mut HttpRequestIo<CR>,
@@ -334,11 +381,11 @@ impl<'a, SC: ServerConfig> H1ForwardTask<'a, SC> {
                 r = rsp_io.ups_r.fill_wait_data() => {
                     match r {
                         Ok(true) => {
-                            // we got some data from upstream
+                            // we got some data from upstream（上游提前返回数据，开始解析响应头）
                             let (rsp, bytes) = self.recv_response_header(&mut rsp_io.ups_r).await?;
                             match rsp.code {
                                 100 | 103 => {
-                                    // CONTINUE | Early Hints
+                                    // CONTINUE | Early Hints：临时响应透传，继续等最终响应
                                     self.send_response_header(&mut rsp_io.clt_w, bytes).await?;
                                 }
                                 _ => {
@@ -354,6 +401,7 @@ impl<'a, SC: ServerConfig> H1ForwardTask<'a, SC> {
                 r = &mut adaptation_fut => {
                     match r {
                         Ok(ReqmodAdaptationEndState::OriginalTransferred) => {
+                            // 请求原样搬运完毕，等待上游最终响应
                             break;
                         }
                         Ok(ReqmodAdaptationEndState::AdaptedTransferred(_r)) => {
@@ -370,6 +418,8 @@ impl<'a, SC: ServerConfig> H1ForwardTask<'a, SC> {
         }
         drop(adaptation_fut);
 
+        // 若循环因上游提前响应而退出，rsp_head 已备好；否则在这里带超时地
+        // 等待最终响应头（跳过所有 100/103 临时响应）
         let rsp_head = match rsp_head {
             Some(header) => {
                 if !adaptation_state.clt_read_finished || !adaptation_state.ups_write_finished {
@@ -400,6 +450,7 @@ impl<'a, SC: ServerConfig> H1ForwardTask<'a, SC> {
             rsp_head.0,
             rsp_head.1,
             rsp_io,
+            // 把 reqmod 阶段 ICAP 附加的共享响应头带入 respmod 送检
             adaptation_state.take_respond_shared_headers(),
         )
         .await?;
@@ -407,6 +458,9 @@ impl<'a, SC: ServerConfig> H1ForwardTask<'a, SC> {
         Ok(())
     }
 
+    /// 把 ICAP 适配器返回的错误响应（阻断页）透传给客户端。
+    /// 响应头写出后禁止再发代理层错误响应；错误响应体若存在则流式拷贝后
+    /// 归还 ICAP 连接到连接池。整个连接此后必须关闭。
     async fn send_adaptation_error_response<W>(
         &mut self,
         clt_w: &mut W,
@@ -450,6 +504,7 @@ impl<'a, SC: ServerConfig> H1ForwardTask<'a, SC> {
         Ok(())
     }
 
+    /// 序列化请求头（面向源站的透明转发形式）并写入上游，随后打点。
     async fn send_request_header<UW>(&mut self, ups_w: &mut UW) -> ServerTaskResult<()>
     where
         UW: AsyncWrite + Unpin,
@@ -464,6 +519,8 @@ impl<'a, SC: ServerConfig> H1ForwardTask<'a, SC> {
         Ok(())
     }
 
+    /// 无请求体路径：发送请求头后带超时等待上游响应头并转发响应。
+    /// 超时归因为上游应用层超时。
     async fn do_forward_without_body<CW, UR, UW>(
         &mut self,
         rsp_io: &mut HttpResponseIo<CW, UR, UW>,
@@ -495,6 +552,11 @@ impl<'a, SC: ServerConfig> H1ForwardTask<'a, SC> {
         }
     }
 
+    /// 带请求体路径：发送请求头后，并发进行"客户端请求体→上游"的流式拷贝
+    /// 与"上游响应头探测"——支持上游提前响应（expect-continue、鉴权拒绝等）。
+    /// 空闲检查区分停滞方向：无缓存数据=客户端不吐体（ClientAppTimeout），
+    /// 有积压=上游不收（UpstreamAppTimeout）。任一方向未搬完都会置 should_close，
+    /// 因为残留字节会破坏流水线上下一个请求的边界。
     async fn do_forward_with_body<CR, CW, UR, UW>(
         &mut self,
         req_io: &mut HttpRequestIo<CR>,
@@ -532,11 +594,11 @@ impl<'a, SC: ServerConfig> H1ForwardTask<'a, SC> {
                 r = rsp_io.ups_r.fill_wait_data() => {
                     match r {
                         Ok(true) => {
-                            // we got some data from upstream
+                            // we got some data from upstream（上游提前返回数据，开始解析响应头）
                             let (rsp, bytes) = self.recv_response_header(&mut rsp_io.ups_r).await?;
                             match rsp.code {
                                 100 | 103 => {
-                                    // CONTINUE | Early Hints
+                                    // CONTINUE | Early Hints：临时响应透传，继续搬请求体
                                     self.send_response_header(&mut rsp_io.clt_w, bytes).await?;
                                 }
                                 _ => {
@@ -554,6 +616,7 @@ impl<'a, SC: ServerConfig> H1ForwardTask<'a, SC> {
                         StreamCopyError::ReadFailed(e) => ServerTaskError::ClientTcpReadFailed(e),
                         StreamCopyError::WriteFailed(e) => ServerTaskError::UpstreamWriteFailed(e),
                     })?;
+                    // 请求体全部搬运完成的打点
                     self.http_notes.mark_req_send_all();
                     break;
                 }
@@ -620,6 +683,8 @@ impl<'a, SC: ServerConfig> H1ForwardTask<'a, SC> {
         Ok(())
     }
 
+    /// 从上游读端解析一个响应头（可能带 body_type 所需信息），返回响应对象
+    /// 与其原始字节。解析失败按请求错误路径处理。
     async fn recv_response_header<UR>(
         &mut self,
         ups_r: &mut UR,
@@ -637,6 +702,9 @@ impl<'a, SC: ServerConfig> H1ForwardTask<'a, SC> {
         .map_err(|e| e.into())
     }
 
+    /// 循环读取直到拿到最终响应头：100 Continue 透传后立即再读一个响应
+    /// （1xx 后不允许插入其它临时响应），103 Early Hints 可多次出现、持续透传，
+    /// 其它状态码即为最终响应直接返回。
     async fn recv_final_response_header<CW, UR, UW>(
         &mut self,
         rsp_io: &mut HttpResponseIo<CW, UR, UW>,
@@ -666,6 +734,11 @@ impl<'a, SC: ServerConfig> H1ForwardTask<'a, SC> {
         }
     }
 
+    /// 响应处理总入口：统一处理 keep-alive 协商与打点后，按是否配置 ICAP
+    /// respmod 分流——有 respmod 时把响应送检（可被改写/阻断），并把
+    /// reqmod 阶段传来的共享响应头注入适配器；adapter 创建失败且未配 bypass
+    /// 时直接报错，bypass 时降级为原样转发。
+    /// send_error_response 的更新规则见各分支内注释。
     async fn send_response<CW, UR, UW>(
         &mut self,
         mut rsp: HttpTransparentResponse,
@@ -716,10 +789,12 @@ impl<'a, SC: ServerConfig> H1ForwardTask<'a, SC> {
                     if let Some(dur) = adaptation_state.dur_ups_recv_all {
                         self.http_notes.dur_rsp_recv_all = dur;
                     }
+                    // 客户端尚未收到任何响应字节时才允许继续发代理错误响应
                     self.send_error_response = !adaptation_state.clt_write_started;
                     return r;
                 }
                 Err(e) => {
+                    // respmod 不可用：未配置 bypass 则视为内部错误，配置则走原样转发
                     if !respmod.bypass() {
                         return Err(ServerTaskError::InternalAdapterError(e));
                     }
@@ -731,6 +806,8 @@ impl<'a, SC: ServerConfig> H1ForwardTask<'a, SC> {
             .await
     }
 
+    /// 响应经 ICAP respmod 送检后回传客户端。
+    /// rsp_status 按"原始透传"或"改写后应答"分别取上游码或适配器的新码。
     async fn send_response_with_adaptation<CW, UR, UW>(
         &mut self,
         rsp: HttpTransparentResponse,
@@ -765,6 +842,8 @@ impl<'a, SC: ServerConfig> H1ForwardTask<'a, SC> {
         }
     }
 
+    /// 响应不经送检的原样回传：有体时头体一并流式拷贝（头作为预置数据），
+    /// 无体时只发头并打"无体"标记。自此之后不再允许发代理层错误响应。
     async fn send_response_without_adaptation<CW, UR, UW>(
         &mut self,
         rsp: HttpTransparentResponse,
@@ -779,7 +858,10 @@ impl<'a, SC: ServerConfig> H1ForwardTask<'a, SC> {
         self.send_error_response = false;
 
         if let Some(body_type) = rsp.body_type(&self.req.method) {
-            self.http_notes.rsp_status = self.http_notes.origin_status; // the following function must send rsp header out
+            // the following function must send rsp header out
+            //（send_response_body 以头作为预置数据，必然会写出响应头，
+            //  因此可提前把 rsp_status 认定为上游状态码）
+            self.http_notes.rsp_status = self.http_notes.origin_status;
             self.send_response_body(
                 rsp_head.into(),
                 &mut rsp_io.ups_r,
@@ -796,6 +878,7 @@ impl<'a, SC: ServerConfig> H1ForwardTask<'a, SC> {
         }
     }
 
+    /// 把响应头原始字节写出并立即 flush（临时响应/无体响应均走此路径）。
     async fn send_response_header<CW>(
         &mut self,
         clt_w: &mut CW,
@@ -810,6 +893,9 @@ impl<'a, SC: ServerConfig> H1ForwardTask<'a, SC> {
             .map_err(ServerTaskError::ClientTcpWriteFailed)
     }
 
+    /// 把响应头（作为预置数据）+ 按 body_type 解析出的响应体流式拷贝给客户端。
+    /// 空闲/封禁/退出检查语义与 CONNECT 路径的响应体拷贝相同（见
+    /// `H1ConnectTask::send_response_body`），此处不再赘述。
     async fn send_response_body<UR, CW>(
         &mut self,
         header: Vec<u8>,
@@ -845,10 +931,11 @@ impl<'a, SC: ServerConfig> H1ForwardTask<'a, SC> {
                     return match r {
                         Ok(_) => {
                             self.http_notes.mark_rsp_recv_all();
-                            // clt_w is already flushed
+                            // clt_w is already flushed（拷贝结束时客户端写端已 flush，无需再刷）
                             Ok(())
                         }
                         Err(StreamCopyError::ReadFailed(e)) => {
+                            // 读失败也要把已缓冲的数据送达客户端再报错
                             let _ = ups_to_clt.write_flush().await;
                             Err(ServerTaskError::UpstreamReadFailed(e))
                         }

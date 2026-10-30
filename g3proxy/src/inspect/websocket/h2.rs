@@ -3,6 +3,14 @@
  * Copyright 2023-2025 ByteDance and/or its affiliates.
  */
 
+//! 基于 HTTP/2 的 WebSocket 检测对象。
+//!
+//! WebSocket 也可经由 HTTP/2 extended CONNECT 建立，此时双向数据以 HTTP/2 流
+//! （`RecvStream`/`SendStream`）而非裸 TCP 字节承载。[`H2WebsocketInterceptObject`]
+//! 在 `src/inspect` 检测状态机处于 `Websocket` 阶段时接管这条流，依据检测动作
+//! 完成转发（经 `H2StreamReader`/`H2StreamWriter` 适配为通用异步读写流）、转接中继
+//! 或注入关闭帧终止会话。
+
 use std::time::Duration;
 
 use anyhow::anyhow;
@@ -25,6 +33,10 @@ use crate::inspect::{StreamInspectContext, StreamTransitTask};
 use crate::log::task::TaskEvent;
 use crate::serve::{ServerTaskError, ServerTaskResult};
 
+/// 输出一条 H2 WebSocket 拦截审计日志。
+///
+/// 与 HTTP/1 版本同构，统一附带拦截类型、任务 id、检测深度、上游地址及 WebSocket
+/// 握手记录等字段；仅当上下文启用拦截日志时才实际写日志。
 macro_rules! intercept_log {
     ($obj:tt, $($args:tt)+) => {
         if let Some(logger) = $obj.ctx.intercept_logger() {
@@ -42,13 +54,21 @@ macro_rules! intercept_log {
     };
 }
 
+/// HTTP/2 通道的 WebSocket 检测/拦截对象。
+///
+/// I/O 句柄直接由 `intercept` 以参数传入（HTTP/2 流本身可独立读写），故这里无需
+/// 像 HTTP/1 版本那样用 `Option` 字段预先持有。
 pub(crate) struct H2WebsocketInterceptObject<SC: ServerConfig> {
+    /// 检测上下文：提供审计句柄、检测策略查询、日志与空闲检测等资源。
     ctx: StreamInspectContext<SC>,
+    /// 上游服务地址，用于查询检测动作与写审计日志。
     upstream: UpstreamAddr,
+    /// 协议切换握手阶段记录的 WebSocket 元信息（资源名、Origin、子协议、版本）。
     ws_notes: WebSocketNotes,
 }
 
 impl<SC: ServerConfig> H2WebsocketInterceptObject<SC> {
+    /// 新建检测对象；I/O 流在调用 `intercept` 时再传入。
     pub(crate) fn new(
         ctx: StreamInspectContext<SC>,
         upstream: UpstreamAddr,
@@ -61,6 +81,7 @@ impl<SC: ServerConfig> H2WebsocketInterceptObject<SC> {
         }
     }
 
+    /// 记录单向半关闭（partial shutdown）事件，任务事件类型由调用方传入。
     fn log_partial_shutdown(&self, task_event: TaskEvent) {
         if let Some(logger) = self.ctx.intercept_logger() {
             slog::info!(logger, "";
@@ -78,15 +99,18 @@ impl<SC: ServerConfig> H2WebsocketInterceptObject<SC> {
     }
 }
 
+/// 将本对象适配为通用的流转发任务：向转发引擎提供拷贝配置、空闲检测参数与日志回调。
 impl<SC: ServerConfig> StreamTransitTask for H2WebsocketInterceptObject<SC> {
     fn copy_config(&self) -> StreamCopyConfig {
         self.ctx.server_config.limited_copy_config()
     }
 
+    /// 注册到空闲定时器，返回周期性空闲检查间隔。
     fn idle_check_interval(&self) -> IdleInterval {
         self.ctx.idle_wheel.register()
     }
 
+    /// 允许连续空闲的检查次数上限，超出后转发任务视为超时结束。
     fn max_idle_count(&self) -> usize {
         self.ctx.max_idle_count
     }
@@ -103,6 +127,7 @@ impl<SC: ServerConfig> StreamTransitTask for H2WebsocketInterceptObject<SC> {
         // TODO
     }
 
+    /// 周期性刷新任务日志的间隔；`None` 表示不做定期刷新。
     fn log_flush_interval(&self) -> Option<Duration> {
         self.ctx.server_config.task_log_flush_interval()
     }
@@ -111,12 +136,15 @@ impl<SC: ServerConfig> StreamTransitTask for H2WebsocketInterceptObject<SC> {
         self.ctx.server_quit_policy.as_ref()
     }
 
+    /// 关联的认证用户；未认证时为 `None`。
     fn user(&self) -> Option<&User> {
         self.ctx.user()
     }
 }
 
 impl<SC: ServerConfig> H2WebsocketInterceptObject<SC> {
+    /// 检测入口：按上游主机名查询检测动作并分派到对应分支，随后依据结果输出
+    /// "完成"或错误审计日志。HTTP/2 流的收尾由 h2 层负责，故此处不返回 `Result`。
     pub(crate) async fn intercept(
         mut self,
         clt_r: RecvStream,
@@ -141,6 +169,8 @@ impl<SC: ServerConfig> H2WebsocketInterceptObject<SC> {
         }
     }
 
+    /// 转接（detour）：把 WebSocket 握手元信息交给外部审计服务，按其决策继续三方
+    /// 中继、放行或阻断。未配置转接客户端时退化为放行；出错时注入关闭帧并返回错误。
     #[cfg(feature = "quic")]
     async fn do_detour(
         &mut self,
@@ -153,6 +183,7 @@ impl<SC: ServerConfig> H2WebsocketInterceptObject<SC> {
             return self.do_bypass(clt_r, clt_w, ups_r, ups_w).await;
         };
 
+        // 建立到审计服务的转接流；失败即中止并向两端注入关闭帧。
         let mut detour_stream = match client.open_detour_stream().await {
             Ok(s) => s,
             Err(e) => {
@@ -161,6 +192,7 @@ impl<SC: ServerConfig> H2WebsocketInterceptObject<SC> {
             }
         };
 
+        // 组装转接上下文，并把序列化的 WebSocket 握手记录作为负载送给审计服务。
         let mut detour_ctx = client.build_context(
             &self.ctx.server_config,
             &self.ctx.server_quit_policy,
@@ -173,6 +205,7 @@ impl<SC: ServerConfig> H2WebsocketInterceptObject<SC> {
 
         match detour_ctx.check_detour_action(&mut detour_stream).await {
             Ok(DetourAction::Continue) => {
+                // 审计服务接管：把四条 HTTP/2 流适配为通用读写流后做三方中继转发。
                 let clt_r = H2StreamReader::new(clt_r);
                 let clt_w = H2StreamWriter::new(clt_w);
                 let ups_r = H2StreamReader::new(ups_r);
@@ -183,14 +216,17 @@ impl<SC: ServerConfig> H2WebsocketInterceptObject<SC> {
                     .await
             }
             Ok(DetourAction::Bypass) => {
+                // 审计服务放行：结束转接流后按普通透明转发继续。
                 detour_stream.finish();
                 self.do_bypass(clt_r, clt_w, ups_r, ups_w).await
             }
             Ok(DetourAction::Block) => {
+                // 审计服务阻断：结束转接流后走阻断关闭路径。
                 detour_stream.finish();
                 self.do_block(clt_w, ups_w).await
             }
             Err(e) => {
+                // 转接决策出错：关闭转接流并向两端注入关闭帧。
                 detour_stream.finish();
                 self.close_on_detour_error(clt_w, ups_w);
                 Err(ServerTaskError::InternalAdapterError(e))
@@ -198,6 +234,8 @@ impl<SC: ServerConfig> H2WebsocketInterceptObject<SC> {
         }
     }
 
+    /// 转接出错时的关闭握手：向客户端发送状态码 1011（服务端内部错误）、向上游
+    /// 发送状态码 1001（going away）。这里以 `end_stream=true` 直接关闭对应 HTTP/2 流。
     #[cfg(feature = "quic")]
     fn close_on_detour_error(
         &mut self,
@@ -211,6 +249,7 @@ impl<SC: ServerConfig> H2WebsocketInterceptObject<SC> {
         let _ = clt_w.send_data(Bytes::from_static(&SERVER_CLOSE_BYTES), true);
     }
 
+    /// 放行（bypass）：将 HTTP/2 流适配为通用读写流后做透明双向转发。
     async fn do_bypass(
         &mut self,
         clt_r: RecvStream,
@@ -226,6 +265,8 @@ impl<SC: ServerConfig> H2WebsocketInterceptObject<SC> {
         self.transit_transparent(clt_r, clt_w, ups_r, ups_w).await
     }
 
+    /// 阻断（block）：向客户端与上游各发送状态码 1001 的关闭帧（并结束对应流），
+    /// 随后返回内部适配错误以表明被检测策略阻断。
     async fn do_block(
         &mut self,
         mut clt_w: SendStream<Bytes>,
@@ -241,6 +282,8 @@ impl<SC: ServerConfig> H2WebsocketInterceptObject<SC> {
         )))
     }
 
+    /// 拦截（intercept）：对 HTTP/2 通道上的 WebSocket 帧做透明双向转发。当前与
+    /// 放行共用 `transit_transparent`，语义上表示处于检测接管下。
     async fn do_intercept(
         &mut self,
         clt_r: RecvStream,

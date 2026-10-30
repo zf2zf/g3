@@ -3,11 +3,12 @@
  * Copyright 2024-2025 ByteDance and/or its affiliates.
  */
 
-//! FTP protocol inspection for HTTP CONNECT tunnel mode.
+//! HTTP CONNECT 隧道模式下的 FTP 控制连接检测。
 //!
-//! This module handles FTP control channel inspection in HTTP CONNECT mode.
-//! Upload commands (STOR/APPE) are detected and marked in global state
-//! for ICAP audit in the subsequent data channel connection.
+//! 本模块处理 HTTP CONNECT 模式下的 FTP 控制连接检测。
+//! 上传命令（STOR/APPE）会被识别并写入全局状态，供后续数据连接建立时做 ICAP 审计；
+//! 遇到 AUTH TLS（或隐式 FTPS）时标记域名并切换到 TLS 拦截状态机（FTPS MITM）。
+//! 与原生 FTP 代理不同：这里不重写 PASV 响应，客户端直接连通 FTP 服务器。
 
 use std::time::Duration;
 
@@ -32,6 +33,7 @@ use crate::serve::ftp_proxy::ctl_common::{
 use crate::serve::ftp_proxy::upload_state::get_ftp_upload_state;
 use crate::serve::{ServerTaskError, ServerTaskResult};
 
+// 记录一条 FTP 拦截日志，自动附带会话公共字段（任务 id、检测深度、源站地址）。
 macro_rules! intercept_log {
     ($obj:tt, $($args:tt)+) => {
         if let Some(logger) = $obj.ctx.intercept_logger() {
@@ -45,6 +47,7 @@ macro_rules! intercept_log {
     };
 }
 
+/// FTP 控制连接的四条 IO 半端：客户端读/写、源站读（带一次性预读缓冲）/写。
 struct FtpIo {
     pub(crate) clt_r: BoxAsyncRead,
     pub(crate) clt_w: BoxAsyncWrite,
@@ -52,25 +55,30 @@ struct FtpIo {
     pub(crate) ups_w: BoxAsyncWrite,
 }
 
+/// FTP 控制连接拦截对象：在 HTTP CONNECT 隧道上逐条命令中继并识别上传/TLS 升级。
 pub(crate) struct FtpInterceptObject<SC: ServerConfig> {
     io: Option<FtpIo>,
     ctx: StreamInspectContext<SC>,
     upstream: UpstreamAddr,
-    /// Whether this connection comes from a TLS interception (FTPS MITM)
+    /// 本连接是否来自 TLS 拦截（FTPS MITM）升级之后
     from_starttls: bool,
 }
 
+/// [`relay_control_channel`] 的退出动作。
 enum FtpNextAction {
+    /// 控制连接上观察到 AUTH TLS 成功（234），携带原始 IO 交给上层切换 TLS 拦截状态机。
     StartTls {
         clt_r: BoxAsyncRead,
         clt_w: BoxAsyncWrite,
         ups_r: OnceBufReader<BoxAsyncRead>,
         ups_w: BoxAsyncWrite,
     },
+    /// 控制连接自然结束（EOF 或读写错误）。
     Finish,
 }
 
 impl<SC: ServerConfig> FtpInterceptObject<SC> {
+    /// 创建拦截对象；此时 IO 尚未注入（`io` 为 None），需后续调用 [`set_io`] 填充。
     pub(crate) fn new(ctx: StreamInspectContext<SC>, upstream: UpstreamAddr) -> Self {
         FtpInterceptObject {
             io: None,
@@ -80,10 +88,12 @@ impl<SC: ServerConfig> FtpInterceptObject<SC> {
         }
     }
 
+    /// 标记本控制连接建立于 FTPS（TLS 拦截）之上。
     pub(crate) fn set_from_starttls(&mut self) {
         self.from_starttls = true;
     }
 
+    /// 注入四条 IO 半端，供 [`intercept`] 消费。
     pub(crate) fn set_io(
         &mut self,
         clt_r: BoxAsyncRead,
@@ -100,6 +110,7 @@ impl<SC: ServerConfig> FtpInterceptObject<SC> {
         self.io = Some(io);
     }
 
+    /// 记录单侧（客户端或源站）关闭事件日志。
     fn log_partial_shutdown(&self, task_event: TaskEvent) {
         if let Some(logger) = self.ctx.intercept_logger() {
             slog::info!(logger, "";
@@ -112,20 +123,24 @@ impl<SC: ServerConfig> FtpInterceptObject<SC> {
         }
     }
 
+    /// FTP 检测动作策略：当前恒定拦截（HTTP CONNECT 隧道下无法做内容级旁路判定）。
     fn ftp_inspect_action(&self) -> ProtocolInspectAction {
         ProtocolInspectAction::Intercept
     }
 }
 
 impl<SC: ServerConfig> StreamTransitTask for FtpInterceptObject<SC> {
+    // 限流复制配置：控制单任务的最大拷贝速率与缓冲区大小。
     fn copy_config(&self) -> StreamCopyConfig {
         self.ctx.server_config.limited_copy_config()
     }
 
+    // 注册空闲检测定时器。
     fn idle_check_interval(&self) -> IdleInterval {
         self.ctx.idle_wheel.register()
     }
 
+    // 连续空闲达到该次数即判定超时。
     fn max_idle_count(&self) -> usize {
         self.ctx.max_idle_count
     }
@@ -159,6 +174,9 @@ impl<SC> FtpInterceptObject<SC>
 where
     SC: ServerConfig + Send + Sync + 'static,
 {
+    /// FTP 拦截总入口：依据策略分发到拦截/旁路/阻断/绕行。
+    /// 返回 `Some(StreamInspection)` 表示需切换到其它检测状态机（如 StartTls），
+    /// `None` 表示会话已在本状态机内处理完毕。
     pub(crate) async fn intercept(mut self) -> ServerTaskResult<Option<StreamInspection<SC>>> {
         let r = match self.ftp_inspect_action() {
             ProtocolInspectAction::Intercept => self.do_intercept().await,
@@ -179,6 +197,7 @@ where
         }
     }
 
+    /// 旁路：不做协议解析，直接双向透明中继。
     async fn do_bypass(&mut self) -> ServerTaskResult<()> {
         let FtpIo {
             clt_r,
@@ -190,6 +209,7 @@ where
         self.transit_transparent(clt_r, clt_w, ups_r, ups_w).await
     }
 
+    /// 阻断：关闭源站写端，向客户端回 421 服务不可用后终止任务。
     async fn do_block(&mut self) -> ServerTaskResult<()> {
         let FtpIo {
             clt_r: _,
@@ -215,11 +235,15 @@ where
         )))
     }
 
+    /// QUIC 绕行：FTP 暂无独立的绕行实现，退化为旁路。
     #[cfg(feature = "quic")]
     async fn do_detour(&mut self) -> ServerTaskResult<()> {
         self.do_bypass().await
     }
 
+    /// 拦截主流程：中继控制连接直到结束或需要 TLS 升级。
+    /// 升级时若无 MITM 配置则直接结束（返回 `None`），不再回退透明中继，
+    /// 因为客户端即将开始 TLS 握手，明文转发无意义。
     async fn do_intercept(&mut self) -> ServerTaskResult<Option<StreamInspection<SC>>> {
         let FtpIo {
             clt_r,
@@ -233,6 +257,7 @@ where
             .await?
         {
             FtpNextAction::Finish => Ok(None),
+            // AUTH TLS 成功：把 IO 交给 TLS 拦截状态机做 FTPS MITM
             FtpNextAction::StartTls {
                 clt_r,
                 clt_w,
@@ -246,6 +271,7 @@ where
                         tls_interception,
                         StartTlsProtocol::Ftp,
                     );
+                    // StartTls 需要普通 BoxAsyncRead，故将 OnceBufReader 再装箱传入
                     start_tls_obj.set_io(clt_r, clt_w, Box::new(ups_r), ups_w);
                     Ok(Some(StreamInspection::StartTls(start_tls_obj)))
                 } else {
@@ -255,12 +281,12 @@ where
         }
     }
 
-    /// Relay the FTP control channel through an HTTP CONNECT tunnel.
-    /// Handles upload commands (STOR/APPE) by marking them for ICAP audit.
+    /// 通过 HTTP CONNECT 隧道中继 FTP 控制连接。
+    /// 上传命令（STOR/APPE）会被标记到全局状态，供随后的数据连接做 ICAP 审计。
     ///
-    /// Key differences from native FTP proxy:
-    /// - No PASV response rewriting (client connects directly to FTP server)
-    /// - Upload commands are marked in global state for data channel detection
+    /// 与原生 FTP 代理的关键差异：
+    /// - 不重写 PASV 响应（客户端直连 FTP 服务器）
+    /// - 上传命令在全局状态中标记，供数据连接检测使用
     async fn relay_control_channel(
         &self,
         clt_r: BoxAsyncRead,
@@ -279,8 +305,8 @@ where
         let client_ip = self.ctx.task_notes.client_addr.ip();
         let ftp_server_ip = self.ctx.connect_notes.server_addr.ip();
 
-        // For both implicit FTPS (port 990) and explicit FTPS (STARTTLS),
-        // mark the domain so data channels can be identified for TLS interception.
+        // 无论隐式 FTPS（990 端口）还是显式 FTPS（STARTTLS/AUTH TLS），
+        // 都先按 (客户端IP, 服务器IP) 标记域名，数据连接建立时据此识别是否需 TLS 拦截
         let domain = match self.upstream.host() {
             g3_types::net::Host::Domain(d) => d.to_string(),
             g3_types::net::Host::Ip(ip) => ip.to_string(),
@@ -293,11 +319,13 @@ where
 
         let mut idle_interval = self.idle_check_interval();
         let mut idle_count = 0usize;
+        // 用户可自定义空闲上限，缺省用服务器配置
         let max_idle_count = self
             .user()
             .and_then(|u| u.task_max_idle_count())
             .unwrap_or(self.max_idle_count());
 
+        // 双工中继：命令方向按行解析（识别上传/AUTH TLS），响应方向按块透传
         loop {
             clt_line.clear();
 
@@ -311,6 +339,8 @@ where
                                         idle_count = 0;
 
                                         if is_upload_command(&clt_line) {
+                                            // STOR/APPE：解析命令名与路径记入全局上传状态，
+                                            // 后续该 IP 对的数据连接将触发 ICAP 上传审计
                                             let cmd_str = std::str::from_utf8(&clt_line)
                                                 .map(str::trim)
                                                 .unwrap_or("");
@@ -330,6 +360,8 @@ where
                                                 break;
                                             }
                                         } else if is_auth_tls_command(&clt_line) {
+                                            // AUTH TLS：转发后读源站响应，234 表示可开始 TLS 握手，
+                                            // 此时退出循环并把 IO 交给 TLS 拦截状态机
                                             if ups_writer.write_all(&clt_line).await.is_err() {
                                                 break;
                                             }
@@ -356,6 +388,7 @@ where
                             }
 
                             n = ups_reader.read(&mut ups_buf) => {
+                                // 源站响应原样转发给客户端，不做解析（数据通道信息由全局状态跟踪）
                                 match n {
                                     Ok(0) => break,
                                     Ok(n) => {
@@ -371,6 +404,7 @@ where
                             _ = idle_interval.tick() => {
                                 idle_count += 1;
 
+                                // 每个空闲周期复查用户封禁，支持运行中熔断
                                 if let Some(user) = self.user() && (user.is_blocked()) {
 
                                     return Err(ServerTaskError::CanceledAsUserBlocked);
@@ -390,6 +424,8 @@ where
         Ok(FtpNextAction::Finish)
     }
 
+    /// 带长度上限的按行读取（以 '\n' 结尾）：超限返回 InvalidData 错误，
+    /// 防止恶意 FTP 客户端用超长命令行耗尽内存。返回实际读取的字节数，EOF 时为已读部分长度。
     async fn read_line_limited<R>(
         reader: &mut R,
         buf: &mut Vec<u8>,

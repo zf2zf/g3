@@ -1,7 +1,25 @@
+//! ICAP 性能测试示例：手工构造一个最小 REQMOD 上报报文并测量吞吐。
+//!
+//! 演示的报文布局（RFC 3507，REQMOD 模式）分三段：
+//! 1. ICAP 请求头：`REQMOD icap://<server>/<service> ICAP/1.0` 状态行 +
+//!    `Host:` + 关键偏移头 `Encapsulated: req-hdr=0, req-body=170`
+//!    （消息体起点为 0；req-body=170 表示封装的 HTTP 请求头共 170 字节，
+//!    body 从其后开始——注意该数值需与实际发出的头文本长度一致）+
+//!    `Allow: 204` + 空行；
+//! 2. 封装的 HTTP 请求：请求行 + 头，`Transfer-Encoding: chunked`，空行；
+//! 3. chunked body：若干 `<十六进制长度>\r\n<data>\r\n` 分块，
+//!    最后以终止块 `0\r\n\r\n` 结束。
+//!
+//! 测试分两组：单个 12MB 大请求、以及 10 个 1MB 请求各跑一遍，
+//! 打印耗时与 MB/s。适合快速验证 ICAP 服务器（如 echo 服务）的基础吞吐，
+//! 也是理解"最小上报报文"长什么样的教材。
+
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+// 用法：先在本机 1344 端口起一个 ICAP 服务器（提供 "echo" 服务），再
+// `cargo run --example icap_perf_test`
 #[tokio::main]
 async fn main() {
     let icap_server = "127.0.0.1:1344";
@@ -49,6 +67,8 @@ async fn main() {
     }
 }
 
+/// 发送一次完整的 REQMOD 上报并等待 ICAP 应答，返回净传输耗时
+/// （计时从 body 开始写出算起，到收到应答结尾为止）。
 async fn test_single_request(
     server: &str,
     service: &str,
@@ -59,6 +79,8 @@ async fn test_single_request(
         .await
         .map_err(|e| format!("connect failed: {}", e))?;
 
+    // ICAP 请求头：req-body=170 即下面 http_header 的字节长度（偏移硬编码，
+    // 若修改 http_header 内容必须同步更新该偏移）
     let icap_header = format!(
         "REQMOD icap://{}/{} ICAP/1.0\r\n\
          Host: {}\r\n\
@@ -68,6 +90,7 @@ async fn test_single_request(
         server, service, server
     );
 
+    // 封装的 HTTP 请求（req-hdr=0 起算），声明 chunked 传输编码
     let http_header = "POST /upload/test.bin HTTP/1.1\r\n\
          Host: example.com\r\n\
          Content-Type: application/octet-stream\r\n\
@@ -89,6 +112,7 @@ async fn test_single_request(
 
     let start = Instant::now();
 
+    // 按 chunked 编码循环发送 body：每块 = 十六进制长度行 + 数据 + CRLF
     let mut remaining = total_bytes;
     let buf = vec![0x41u8; chunk_size];
 
@@ -114,6 +138,7 @@ async fn test_single_request(
         remaining -= this_chunk;
     }
 
+    // chunked 终止块：长度为 0 的块 + 空 trailer，标志 body 结束
     stream
         .write_all(b"0\r\n\r\n")
         .await
@@ -123,6 +148,7 @@ async fn test_single_request(
         .await
         .map_err(|e| format!("flush terminator failed: {}", e))?;
 
+    // 读取 ICAP 应答：等到连续的 \r\n\r\n（头结束）或连接关闭为止
     let mut response_buf = vec![0u8; 4096];
     let mut total_read = 0;
 

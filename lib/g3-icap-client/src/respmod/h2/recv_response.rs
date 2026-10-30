@@ -3,6 +3,16 @@
  * Copyright 2023-2025 ByteDance and/or its affiliates.
  */
 
+//! RESPMOD h2：收到 ICAP 最终响应之后的各收尾分支。
+//!
+//! 每个方法对应一种"ICAP 应答形态 -> h2 客户端"的转换组合，与 h1 版
+//! 对称，差异在于发送侧全部走 h2 `SendStream`：
+//! - 原样放行（204）：把降级前的原始 h2 响应直接 `send_response` 发出；
+//! - 应用改写：先用 `adapt_to()` 把 ICAP 返回的 HTTP/1.1 改写响应头
+//!   合并回 h2 响应再发送，其 chunked body（若有）由
+//!   `H2StreamFromChunkedTransfer` 解码为 h2 数据帧流式发出；
+//! - 所有分支结束时按 keep-alive / 连接是否干净决定是否回池。
+
 use h2::RecvStream;
 use http::Response;
 
@@ -21,6 +31,7 @@ use crate::reason::IcapErrorReason;
 use crate::respmod::response::RespmodResponse;
 
 impl<I: IdleCheck> H2ResponseAdapter<I> {
+    /// ICAP 返回 2xx 但没有封装任何 HTTP 报文：属于协议违例，回池后报错。
     pub(super) async fn handle_icap_ok_without_payload(
         self,
         icap_rsp: RespmodResponse,
@@ -36,6 +47,8 @@ impl<I: IdleCheck> H2ResponseAdapter<I> {
         ))
     }
 
+    /// 204 + 原始响应无 body：把原始 h2 响应以 end_of_stream=true 直接
+    /// 发给客户端（未做任何改写）。
     pub(super) async fn handle_original_http_response_without_body<CW>(
         self,
         state: &mut RespmodAdaptationRunState,
@@ -60,6 +73,9 @@ impl<I: IdleCheck> H2ResponseAdapter<I> {
         Ok(RespmodAdaptationEndState::OriginalTransferred)
     }
 
+    /// 204 + 原始响应带 body（preview 阶段 ICAP 就返回 204）：不再把
+    /// 剩余数据发给 ICAP，将已缓存的预览数据 + h2 上游剩余 body 原样
+    /// 直通转发给客户端（h2 -> h2，无需 chunked 转码）。
     pub(super) async fn handle_original_http_response_with_body<CW>(
         self,
         state: &mut RespmodAdaptationRunState,
@@ -82,17 +98,20 @@ impl<I: IdleCheck> H2ResponseAdapter<I> {
             .map_err(H2RespmodAdaptationError::HttpClientSendHeadFailed)?;
         state.mark_clt_send_header();
 
+        // 预览缓存数据直接作为 h2 数据帧发出（不预分配容量，交给 h2 driver 缓冲）
         // no reserve of capacity, let the driver buffer it
         preview_data
             .h2_unbounded_send_all(&mut clt_send_stream)
             .map_err(H2RespmodAdaptationError::HttpClientSendDataFailed)?;
 
+        // 剩余上游 body 走普通 h2 -> h2 搬运（含 trailer），带 idle 检查
         let mut body_transfer =
             H2BodyTransfer::new(ups_body, clt_send_stream, self.copy_config.yield_size());
 
         let mut idle_interval = self.idle_checker.interval_timer();
         let mut idle_count = 0;
 
+        // 搬运错误归一化：接收侧失败归上游，发送侧失败归客户端
         fn convert_transfer_error(e: H2StreamBodyTransferError) -> H2RespmodAdaptationError {
             match e {
                 H2StreamBodyTransferError::RecvDataFailed(e)
@@ -151,6 +170,8 @@ impl<I: IdleCheck> H2ResponseAdapter<I> {
         }
     }
 
+    /// ICAP 返回的改写响应只有头（无 body）：解析该 h1 形式响应头并
+    /// `adapt_to` 合并进原始 h2 响应后，以空 body 直接发给客户端。
     pub(super) async fn handle_icap_http_response_without_body<CW>(
         mut self,
         state: &mut RespmodAdaptationRunState,
@@ -169,6 +190,7 @@ impl<I: IdleCheck> H2ResponseAdapter<I> {
             self.icap_client.save_connection(self.icap_connection);
         }
 
+        // 把 ICAP 的 HTTP/1.1 改写响应头合并回原始 h2 响应（头升级回转）
         let final_rsp = orig_http_response.adapt_to(&http_rsp);
         state.mark_clt_send_start();
         clt_send_response
@@ -180,6 +202,9 @@ impl<I: IdleCheck> H2ResponseAdapter<I> {
         Ok(RespmodAdaptationEndState::AdaptedTransferred(http_rsp))
     }
 
+    /// ICAP 返回带 body 的改写响应，且上报侧已终结：单向顺序收尾——
+    /// 读改写响应头并发给客户端，再把 ICAP 的 chunked 响应体解码为
+    /// h2 数据帧持续写出，全程带 idle 检查；完成后可按 keep-alive 回池。
     pub(super) async fn handle_icap_http_response_with_body_after_transfer<CW>(
         mut self,
         state: &mut RespmodAdaptationRunState,
@@ -194,6 +219,7 @@ impl<I: IdleCheck> H2ResponseAdapter<I> {
         let http_rsp =
             HttpAdaptedResponse::parse(&mut self.icap_connection.reader, http_header_size).await?;
 
+        // 头升级回转：原始 h2 响应 + ICAP 改写的 h1 响应头 -> 最终 h2 响应
         let final_rsp = orig_http_response.adapt_to(&http_rsp);
         state.mark_clt_send_start();
         let mut clt_send_stream = clt_send_response
@@ -201,6 +227,7 @@ impl<I: IdleCheck> H2ResponseAdapter<I> {
             .map_err(H2RespmodAdaptationError::HttpClientSendHeadFailed)?;
         state.mark_clt_send_header();
 
+        // 下行：ICAP 的 chunked 改写 body -> h2 数据帧（含 trailer 回转）
         let mut body_transfer = H2StreamFromChunkedTransfer::new(
             &mut self.icap_connection.reader,
             &mut clt_send_stream,

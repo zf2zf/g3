@@ -45,28 +45,32 @@ use crate::serve::{
     ServerRegistry, ServerStats, WrapArcServer,
 };
 
+/// HTTP 代理服务器实例：负责监听 TCP/QUIC、终结 TLS、按 ACL 过滤入站连接，
+/// 并将每条客户端连接拆分为 reader/writer 流水线任务来处理各类代理请求。
 pub(crate) struct HttpProxyServer {
     config: Arc<HttpProxyServerConfig>,
     server_stats: Arc<HttpProxyServerStats>,
     listen_stats: Arc<ListenStats>,
-    tls_rolling_ticketer: Option<Arc<RollingTicketer<OpensslTicketKey>>>,
-    tls_acceptor: Option<TlsAcceptor>,
+    tls_rolling_ticketer: Option<Arc<RollingTicketer<OpensslTicketKey>>>, // TLS 会话票证的滚动密钥，用于 session resumption
+    tls_acceptor: Option<TlsAcceptor>, // 为 None 表示该服务器以明文 HTTP 监听
     tls_accept_timeout: Duration,
-    tls_client_config: Arc<OpensslClientConfig>,
-    ingress_net_filter: Option<AclNetworkRule>,
-    dst_host_filter: Option<Arc<AclDstHostRuleSet>>,
-    reload_sender: broadcast::Sender<ServerReloadCommand>,
+    tls_client_config: Arc<OpensslClientConfig>, // 代理向源站发起 TLS 连接时使用的客户端配置
+    ingress_net_filter: Option<AclNetworkRule>,  // 入站客户端源地址 ACL，不通过则提前丢弃
+    dst_host_filter: Option<Arc<AclDstHostRuleSet>>, // 目标主机名 ACL，供任务层检查
+    reload_sender: broadcast::Sender<ServerReloadCommand>, // 向监听运行时广播 reload/quit 命令
     task_logger: Option<Logger>,
 
-    escaper: ArcSwap<ArcEscaper>,
-    user_group: ArcSwapOption<UserGroup>,
-    audit_handle: ArcSwapOption<AuditHandle>,
+    escaper: ArcSwap<ArcEscaper>, // 域名逃逸（直连例外）策略，可原地热更新
+    user_group: ArcSwapOption<UserGroup>, // 认证用户组，可原地热更新
+    audit_handle: ArcSwapOption<AuditHandle>, // 审计日志句柄，可原地热更新
     quit_policy: Arc<ServerQuitPolicy>,
-    idle_wheel: Arc<IdleWheel>,
-    reload_version: usize,
+    idle_wheel: Arc<IdleWheel>, // 全局空闲定时器，用于任务超时检测
+    reload_version: usize,      // 配置版本号，每次 reload 递增
 }
 
 impl HttpProxyServer {
+    /// 从已解析的配置构造服务器实例：构建 TLS 服务端/客户端配置、ACL 过滤器，
+    /// 并启动空闲定时器 wheel。`version` 为当前 reload 版本号。
     fn new(
         config: Arc<HttpProxyServerConfig>,
         server_stats: Arc<HttpProxyServerStats>,
@@ -138,6 +142,7 @@ impl HttpProxyServer {
         Ok(server)
     }
 
+    /// 首次启动时创建服务器实例（reload 版本号为 1），并按需启动 TLS 票证滚动更新任务。
     pub(crate) fn prepare_initial(
         config: HttpProxyServerConfig,
     ) -> anyhow::Result<ArcServerInternal> {
@@ -159,12 +164,14 @@ impl HttpProxyServer {
         Ok(Arc::new(server))
     }
 
+    /// 用新配置构造下一代服务器实例：复用同一份服务器/监听统计对象，版本号加一。
     fn prepare_reload(&self, config: AnyServerConfig) -> anyhow::Result<HttpProxyServer> {
         if let AnyServerConfig::HttpProxy(config) = config {
             let config = Arc::new(config);
             let server_stats = Arc::clone(&self.server_stats);
             let listen_stats = Arc::clone(&self.listen_stats);
 
+            // ticketer 配置未变化时直接复用旧实例，避免重建密钥滚动任务
             let tls_rolling_ticketer = if self.config.tls_ticketer.eq(&config.tls_ticketer) {
                 self.tls_rolling_ticketer.clone()
             } else if let Some(c) = &config.tls_ticketer {
@@ -193,6 +200,7 @@ impl HttpProxyServer {
         }
     }
 
+    /// 为单条客户端连接组装任务公共上下文；escaper 等可热更新组件在此取当前快照。
     fn get_common_task_context(&self, cc_info: ClientConnectionInfo) -> Arc<CommonTaskContext> {
         Arc::new(CommonTaskContext {
             server_config: self.config.clone(),
@@ -207,6 +215,8 @@ impl HttpProxyServer {
         })
     }
 
+    /// 检查客户端源地址是否被入站 ACL 禁止；命中禁止规则时计一次丢弃并返回 true，
+    /// 调用方据此在建立任何任务前直接关闭连接（提前丢弃）。
     fn drop_early(&self, client_addr: SocketAddr) -> bool {
         if let Some(ingress_net_filter) = &self.ingress_net_filter {
             let (_, action) = ingress_net_filter.check(client_addr.ip());
@@ -224,10 +234,14 @@ impl HttpProxyServer {
         false
     }
 
+    /// 为单条流水线创建审计上下文，快照当前（可热更新的）审计句柄。
     fn audit_context(&self) -> AuditContext {
         AuditContext::new(self.audit_handle.load_full())
     }
 
+    /// 将一条完成 TLS 终结（或明文）的双向流拆分为读写两半：
+    /// reader 任务解析 HTTP 请求并通过 channel 派发子任务，writer 任务串行写回响应。
+    /// reader 以后台任务运行，writer 在当前协程中 await，直至流水线结束。
     async fn spawn_stream_task<T>(&self, stream: T, cc_info: ClientConnectionInfo)
     where
         T: AsyncStream,
@@ -236,6 +250,7 @@ impl HttpProxyServer {
     {
         let ctx = self.get_common_task_context(cc_info);
         let pipeline_stats = Arc::new(HttpProxyPipelineStats::default());
+        // channel 容量即流水线深度：允许同时有 pipeline_size 个请求在处理中
         let (task_sender, task_receiver) = mpsc::channel(ctx.server_config.pipeline_size.get());
 
         // NOTE tls underlying traffic is not counted in (server/task/user) stats
@@ -251,10 +266,13 @@ impl HttpProxyServer {
             &pipeline_stats,
         );
 
+        // reader 后台运行，writer 在当前任务中等待至连接结束
         tokio::spawn(r_task.into_running());
         w_task.into_running().await
     }
 
+    /// QUIC 版本的流水线：QUIC 双向流的收发半本身相互独立，
+    /// 因此 reader 与 writer 两个任务都以后台任务 spawn，本函数立即返回。
     #[cfg(feature = "quic")]
     fn spawn_quic_stream_task(
         &self,
@@ -282,6 +300,7 @@ impl HttpProxyServer {
     }
 }
 
+/// 服务器内部生命周期接口：配置克隆、依赖关系、热更新（reload）与运行时的启动/中止。
 impl ServerInternal for HttpProxyServer {
     fn _clone_config(&self) -> AnyServerConfig {
         AnyServerConfig::HttpProxy(self.config.as_ref().clone())
@@ -296,8 +315,10 @@ impl ServerInternal for HttpProxyServer {
         let _ = self.reload_sender.send(cmd);
     }
 
-    fn _update_next_servers_in_place(&self) {}
+    fn _update_next_servers_in_place(&self) {} // http_proxy 无下游服务器依赖，空实现
 
+    /// escaper / user_group / audit_handle 这类不依赖监听运行时的组件，
+    /// 通过 ArcSwap 在新旧实例间共享地原地替换，无需重建服务器。
     fn _update_escaper_in_place(&self) {
         let escaper = crate::escape::get_or_insert_default(self.config.escaper());
         self.escaper.store(Arc::new(escaper));
@@ -314,6 +335,8 @@ impl ServerInternal for HttpProxyServer {
         Ok(())
     }
 
+    /// reload 但复用旧实例的 reload_sender（旧 notifier）：适用于监听配置未变化，
+    /// 旧监听运行时继续存活，新实例通过同一 channel 接收后续的 reload/quit 命令。
     fn _reload_with_old_notifier(
         &self,
         config: AnyServerConfig,
@@ -324,6 +347,8 @@ impl ServerInternal for HttpProxyServer {
         Ok(Arc::new(server))
     }
 
+    /// reload 并使用新实例自带的 reload_sender（新 notifier）：适用于监听配置变化，
+    /// 旧监听运行时被替换，新版服务器将用新 channel 驱动重新拉起的监听任务。
     fn _reload_with_new_notifier(
         &self,
         config: AnyServerConfig,
@@ -333,6 +358,8 @@ impl ServerInternal for HttpProxyServer {
         Ok(Arc::new(server))
     }
 
+    /// 启动 TCP 监听运行时并为每个监听地址派生实例；成功后将服务器标记为在线。
+    /// 未配置 listen 时（如仅作为 escape 目标）直接返回。
     fn _start_runtime(&self, server: ArcServer) -> anyhow::Result<()> {
         let Some(listen_config) = &self.config.listen else {
             return Ok(());
@@ -348,12 +375,14 @@ impl ServerInternal for HttpProxyServer {
             .map(|_| self.server_stats.set_online())
     }
 
+    /// 中止监听运行时：广播退出命令并把服务器标记为离线。
     fn _abort_runtime(&self) {
         let _ = self.reload_sender.send(ServerReloadCommand::QuitRuntime);
         self.server_stats.set_offline();
     }
 }
 
+/// 服务器基础信息接口：名称、类型与当前 reload 版本号。
 impl BaseServer for HttpProxyServer {
     #[inline]
     fn name(&self) -> &NodeName {
@@ -371,8 +400,10 @@ impl BaseServer for HttpProxyServer {
     }
 }
 
+/// 处理明文 TCP 及 openssl 终结的 TLS TCP 连接。
 #[async_trait]
 impl AcceptTcpServer for HttpProxyServer {
+    /// TCP 连接入口：统计连接、ACL 提前丢弃检查，配置了 TLS 时先完成握手再进入流水线。
     async fn run_tcp_task(&self, stream: TcpStream, cc_info: ClientConnectionInfo) {
         let client_addr = cc_info.client_addr();
         self.server_stats.add_conn(client_addr);
@@ -385,6 +416,8 @@ impl AcceptTcpServer for HttpProxyServer {
                 Ok(Ok(tls_stream)) => {
                     if tls_stream.get_ref().1.session_reused() {
                         // Quick ACK is needed with session resumption
+                        // TLS 会话恢复时客户端在握手最后一条消息后即发数据，
+                        // 关闭 TCP 延迟确认（quick ack）以避免首个请求被延迟
                         cc_info.tcp_sock_try_quick_ack();
                     }
                     self.spawn_stream_task(tls_stream, cc_info).await
@@ -414,8 +447,10 @@ impl AcceptTcpServer for HttpProxyServer {
     }
 }
 
+/// 处理 QUIC 连接：单个连接内循环 accept 双向流，每条流各自派发流水线任务。
 #[async_trait]
 impl AcceptQuicServer for HttpProxyServer {
+    /// QUIC 连接入口：ACL 检查通过后持续接受客户端发起的双向流，直到连接出错。
     #[cfg(feature = "quic")]
     async fn run_quic_task(&self, connection: Connection, cc_info: ClientConnectionInfo) {
         let client_addr = cc_info.client_addr();
@@ -443,6 +478,8 @@ impl AcceptQuicServer for HttpProxyServer {
     }
 }
 
+/// 服务器对外查询接口：依赖组件名称、统计对象与存活任务数；
+/// 同时处理由监听层（rustls/openssl 配置）预先完成 TLS 握手的连接。
 #[async_trait]
 impl Server for HttpProxyServer {
     fn escaper(&self) -> &NodeName {
@@ -474,6 +511,7 @@ impl Server for HttpProxyServer {
         &self.quit_policy
     }
 
+    /// rustls 已在监听层完成握手，ACL 检查后直接进入流水线。
     async fn run_rustls_task(&self, stream: TlsStream<TcpStream>, cc_info: ClientConnectionInfo) {
         let client_addr = cc_info.client_addr();
         self.server_stats.add_conn(client_addr);
@@ -484,6 +522,7 @@ impl Server for HttpProxyServer {
         self.spawn_stream_task(stream, cc_info).await;
     }
 
+    /// openssl 已在监听层完成握手，ACL 检查后直接进入流水线。
     async fn run_openssl_task(&self, stream: SslStream<TcpStream>, cc_info: ClientConnectionInfo) {
         let client_addr = cc_info.client_addr();
         self.server_stats.add_conn(client_addr);

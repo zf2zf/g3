@@ -3,6 +3,19 @@
  * Copyright 2023-2025 ByteDance and/or its affiliates.
  */
 
+//! [`IcapServiceConfig`] 的 yaml 解析。
+//!
+//! 入口：[`IcapServiceConfig::parse_reqmod_service_yaml`] /
+//! [`IcapServiceConfig::parse_respmod_service_yaml`]。
+//!
+//! yaml 形态：
+//! - 简写：直接给一个 `icap://...` / `icaps://...` 字符串；
+//! - 完整：map 形式，必填 `url`，可选：
+//!   `tls_client` / `tls_name` / `tcp_keepalive` / `use_unix_socket`(unix) /
+//!   `icap_connection_pool`(别名 `connection_pool` / `pool`) /
+//!   `icap_max_header_size` / `disable_preview`(别名 `no_preview`) /
+//!   `preview_data_read_timeout` / `respond_shared_names` / `bypass`。
+
 use std::path::Path;
 use std::str::FromStr;
 
@@ -13,6 +26,8 @@ use yaml_rust::{Yaml, yaml};
 use super::{IcapMethod, IcapServiceConfig};
 
 impl IcapServiceConfig {
+    /// map 形式的统一解析入口：先调用 [`IcapServiceConfig::new`] 解析 URL，
+    /// 再 foreach 各 key 调用 `set_*` 或直接写字段（同 crate 内部特权）。
     fn parse_yaml(
         map: &yaml::Hash,
         method: IcapMethod,
@@ -26,6 +41,7 @@ impl IcapServiceConfig {
 
         g3_yaml::foreach_kv(map, |k, v| match g3_yaml::key::normalize(k).as_str() {
             KEY_URL => Ok(()),
+            // rustls TLS 客户端配置（CA、SNI 覆盖、会话缓存等），用于 icaps://。
             "tls_client" => {
                 let tls_client = g3_yaml::value::as_rustls_client_config_builder(v, lookup_dir)
                     .context(format!(
@@ -34,18 +50,21 @@ impl IcapServiceConfig {
                 config.set_tls_client(tls_client);
                 Ok(())
             }
+            // 显式覆盖 TLS ServerName（SNI/证书校验名）。
             "tls_name" => {
                 let tls_name = g3_yaml::value::as_rustls_server_name(v)
                     .context(format!("invalid rustls server name value for key {k}"))?;
                 config.set_tls_name(tls_name);
                 Ok(())
             }
+            // TCP keepalive：探测 ICAP 服务端半开连接。
             "tcp_keepalive" => {
                 let keepalive = g3_yaml::value::as_tcp_keepalive_config(v)
                     .context(format!("invalid tcp keepalive config value for key {k}"))?;
                 config.set_tcp_keepalive(keepalive);
                 Ok(())
             }
+            // 走本机 Unix Socket（用于 sidecar/本机 ICAP 服务），仅 unix 平台可用。
             #[cfg(unix)]
             "use_unix_socket" => {
                 let path = g3_yaml::value::as_absolute_path(v)
@@ -53,27 +72,32 @@ impl IcapServiceConfig {
                 config.use_unix_socket = Some(path);
                 Ok(())
             }
+            // 连接池参数：max/min idle、idle_timeout、check_interval。
             "icap_connection_pool" | "connection_pool" | "pool" => {
                 config.connection_pool = g3_yaml::value::as_connection_pool_config(v)
                     .context(format!("invalid connection pool config value for key {k}"))?;
                 Ok(())
             }
+            // ICAP 头读取上限（防 OOM），支持 "8KB" 等 humanize 写法。
             "icap_max_header_size" => {
                 let size = g3_yaml::humanize::as_usize(v)
                     .context(format!("invalid humanize usize value for key {k}"))?;
                 config.set_icap_max_header_size(size);
                 Ok(())
             }
+            // 关闭 ICAP PREVIEW：短消息直接发完整内容，跳过 100-continue。
             "disable_preview" | "no_preview" => {
                 config.disable_preview = g3_yaml::value::as_bool(v)?;
                 Ok(())
             }
+            // PREVIEW 等待业务喂数据的超时，超时回 204 释放连接。
             "preview_data_read_timeout" => {
                 let time = g3_yaml::humanize::as_duration(v)
                     .context(format!("invalid humanize duration value for key {k}"))?;
                 config.set_preview_data_read_timeout(time);
                 Ok(())
             }
+            // RESPMOD 响应扩展头白名单：单字符串或字符串数组均可。
             "respond_shared_names" => {
                 if let Yaml::Array(seq) = v {
                     for (i, v) in seq.iter().enumerate() {
@@ -88,6 +112,7 @@ impl IcapServiceConfig {
                 }
                 Ok(())
             }
+            // ICAP 服务故障时是否放行原流量。
             "bypass" => {
                 let bypass = g3_yaml::value::as_bool(v)?;
                 config.set_bypass(bypass);
@@ -99,6 +124,8 @@ impl IcapServiceConfig {
         Ok(config)
     }
 
+    /// 解析 REQMOD 服务配置：yaml 既可以是 map（完整配置）也可以是一个
+    /// `icap(s)://...` 字符串（仅默认 URL）。
     pub fn parse_reqmod_service_yaml(
         value: &Yaml,
         lookup_dir: Option<&Path>,
@@ -115,6 +142,7 @@ impl IcapServiceConfig {
         }
     }
 
+    /// 解析 RESPMOD 服务配置：同 [`Self::parse_reqmod_service_yaml`]，仅 method 不同。
     pub fn parse_respmod_service_yaml(
         value: &Yaml,
         lookup_dir: Option<&Path>,

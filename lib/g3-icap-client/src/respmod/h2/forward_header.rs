@@ -3,6 +3,13 @@
  * Copyright 2023-2025 ByteDance and/or its affiliates.
  */
 
+//! RESPMOD h2：无 body 响应的纯头部上报路径。
+//!
+//! 当上游 h2 响应没有 body（`RecvStream::is_end_stream()` 为真，如 204/304
+//! 或空响应）时走这里：只把降级序列化的 HTTP/1.1 请求头 + 响应头封装上报，
+//! `Encapsulated:` 用 `null-body=` 声明 body 长度为零，与 h1 版语义一致；
+//! 并允许 ICAP 以 204 应答表示"不改写、原样放行"。
+
 use std::io::{IoSlice, Write};
 
 use bytes::BufMut;
@@ -21,6 +28,11 @@ use crate::respmod::IcapRespmodResponsePayload;
 use crate::respmod::response::RespmodResponse;
 
 impl<I: IdleCheck> H2ResponseAdapter<I> {
+    /// 构造"仅上报头、无 body"的 ICAP 请求头。
+    ///
+    /// 偏移布局与 `build_forward_all_request` 相同（req-hdr=0 起算），
+    /// 但用 `null-body=<请求头+响应头长度>` 声明封装 body 为空；若服务
+    /// 允许 204 则加 `Allow: 204`，表示可接受"不改写"应答。
     fn build_header_only_request(
         &self,
         http_req_hdr_len: usize,
@@ -41,6 +53,8 @@ impl<I: IdleCheck> H2ResponseAdapter<I> {
         header
     }
 
+    /// 无 body 响应的完整往返：发送降级头 -> 等 ICAP 应答 -> 按
+    /// 204 / 2xx / 其它分别处理（原样放行、应用改写、或报错）。
     pub(super) async fn xfer_without_body<CW>(
         mut self,
         state: &mut RespmodAdaptationRunState,
@@ -51,11 +65,13 @@ impl<I: IdleCheck> H2ResponseAdapter<I> {
     where
         CW: H2SendResponseToClient,
     {
+        // 降级序列化 h2 请求/响应头为 HTTP/1.1 文本，并按其长度计算偏移
         let http_req_header = http_request.serialize_for_adapter();
         let http_rsp_header = http_response.serialize_for_adapter();
         let icap_header =
             self.build_header_only_request(http_req_header.len(), http_rsp_header.len());
 
+        // 聚合发送后 flush；无 body，请求到此结束
         let icap_w = &mut self.icap_connection.writer;
         icap_w
             .write_all_vectored([
@@ -78,6 +94,7 @@ impl<I: IdleCheck> H2ResponseAdapter<I> {
         .await?;
 
         match rsp.code {
+            // 204 No Modification：ICAP 不改写，把原始无 body 响应直接发给客户端
             204 => {
                 if rsp.payload == IcapRespmodResponsePayload::NoPayload {
                     self.icap_connection.mark_reader_finished();
@@ -90,6 +107,7 @@ impl<I: IdleCheck> H2ResponseAdapter<I> {
                 )
                 .await
             }
+            // 2xx：按 ICAP 封装负载的三种形态分别转回 h2 发给客户端
             n if (200..300).contains(&n) => match rsp.payload {
                 IcapRespmodResponsePayload::NoPayload => {
                     self.icap_connection.mark_reader_finished();
@@ -105,6 +123,7 @@ impl<I: IdleCheck> H2ResponseAdapter<I> {
                     )
                     .await
                 }
+                // 声明了 null-body 却收到带改写 body 的响应：读它（少见但合法）
                 IcapRespmodResponsePayload::HttpResponseWithBody(header_size) => {
                     self.handle_icap_http_response_with_body_after_transfer(
                         state,
@@ -116,6 +135,7 @@ impl<I: IdleCheck> H2ResponseAdapter<I> {
                     .await
                 }
             },
+            // 非 2xx（错误应答）：若无封装负载可尝试保活回池，然后向上报错
             _ => {
                 if rsp.payload == IcapRespmodResponsePayload::NoPayload {
                     self.icap_connection.mark_reader_finished();

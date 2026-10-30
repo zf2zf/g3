@@ -3,20 +3,38 @@
  * Copyright 2024-2025 ByteDance and/or its affiliates.
  */
 
+//! IMAP 扩展能力（CAPABILITY）白名单。
+//!
+//! [`Capability::check_supported`] 是逐行的能力名过滤器：识别的扩展原样放行
+//! （Some），未知或本机明确不支持的扩展被丢弃（None）。用于改写问候行、
+//! `* CAPABILITY`/`* ENABLED` 响应及 ENABLE 请求，使客户端只会看到代理能
+//! 正确中继/改写的扩展，避免未检测路径泄漏。
+
 #[derive(Default)]
 pub(super) struct Capability {
+    /// 服务器声明支持 IMAP4rev1（RFC 3501 基线）
     imap4_rev1: bool,
+    /// 仅在 ENABLE 阶段确认的 IMAP4rev2（RFC 9051）
     imap4_rev2: bool,
+    /// 出现过 LITERAL+/LITERAL- 任一非同步字面量扩展（RFC 7888）
     has_non_sync_literal: bool,
+    /// 服务器声明 LOGINDISABLED：禁止明文 LOGIN，只允许 SASL/STARTTLS
     login_disabled: bool,
 }
 
 impl Capability {
+    /// 判断能力名 `cap` 是否放行。放行返回 Some(原样字符串)，同时把有状态含义
+    /// 的项记录进 self；不认识的、以及 COMPRESS/CATENATE/URL-PARTIAL/
+    /// UNAUTHENTICATE 等明确不支持的项返回 None（调用方据此从行中剔除）。
+    /// `from_enable` 为 true 表示该项来自 `* ENABLED` 响应——IMAP4rev2 只有
+    /// 在 ENABLE 确认后才记录（CAPABILITY 列表里出现不代表已启用）
     pub(super) fn check_supported<'a>(
         &mut self,
         cap: &'a str,
         from_enable: bool,
     ) -> Option<&'a str> {
+        // NAME=VALUE 形式的参数化能力（RFC 5255 等）：只按前缀判断合法性，
+        // 参数值原样透传
         if let Some(p) = memchr::memchr(b'=', cap.as_bytes()) {
             let name = &cap[..p];
             match name.as_bytes() {

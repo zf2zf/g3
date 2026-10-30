@@ -3,6 +3,13 @@
  * Copyright 2024-2025 ByteDance and/or its affiliates.
  */
 
+//! SMTP 拦截各阶段共用的行读写扩展 trait。
+//!
+//! 把"读取一行 + 失败时先向对端回一条本地生成的错误响应"这一模式抽象为三个扩展：
+//! [`ResponseLineRecvExt`]（读源站响应行）、[`ResponseParseExt`]（喂入并解析响应行）、
+//! [`CommandLineRecvExt`]（读并解析客户端命令行）。
+//! 保证协议出错时客户端能收到符合 SMTP 语义的 4xx/5xx 响应而非被静默断开。
+
 use std::net::IpAddr;
 use std::time::Duration;
 
@@ -15,6 +22,7 @@ use g3_smtp_proto::response::{ResponseEncoder, ResponseParser};
 
 use crate::serve::{ServerTaskError, ServerTaskResult};
 
+/// 带"反馈"的响应行读取：从源站读一行响应，任何失败都先映射成一条本地 4xx/5xx 响应写给客户端。
 pub(super) trait ResponseLineRecvExt {
     async fn read_rsp_line_with_feedback<'a, R, W>(
         &'a mut self,
@@ -29,6 +37,8 @@ pub(super) trait ResponseLineRecvExt {
 }
 
 impl<const MAX_LINE_SIZE: usize> ResponseLineRecvExt for LineRecvBuf<MAX_LINE_SIZE> {
+    /// 四种失败各对应一条语义不同的响应：IO 错误(451)、对端关闭(451)、超时(421)、行过长(551)。
+    /// 写响应本身失败会被忽略（连接大概率已断），错误仍原样向上返回。
     async fn read_rsp_line_with_feedback<'a, R, W>(
         &'a mut self,
         recv_timeout: Duration,
@@ -76,6 +86,8 @@ impl<const MAX_LINE_SIZE: usize> ResponseLineRecvExt for LineRecvBuf<MAX_LINE_SI
     }
 }
 
+/// 带"反馈"的响应行解析：把已转发的响应行喂给 [`ResponseParser`]，解析失败时先向客户端回 501。
+/// 注意行本身已转发给客户端，这里只负责语义校验与错误反馈。
 pub(super) trait ResponseParseExt {
     async fn feed_line_with_feedback<'a, W>(
         &mut self,
@@ -88,6 +100,7 @@ pub(super) trait ResponseParseExt {
 }
 
 impl ResponseParseExt for ResponseParser {
+    /// 返回该行的消息文本部分（去掉响应码前缀），供上层继续解析扩展关键字等。
     async fn feed_line_with_feedback<'a, W>(
         &mut self,
         line: &'a [u8],
@@ -111,7 +124,10 @@ impl ResponseParseExt for ResponseParser {
     }
 }
 
+/// 客户端命令行的接收与解析扩展：读一行并解析为 [`Command`]，出错时向客户端回相应错误响应。
 pub(super) trait CommandLineRecvExt {
+    /// 返回 (解析出的命令, 原始行字节)。原始行用于把命令原样转发到源站，
+    /// 避免重新序列化导致与客户端发送内容不一致（如大小写、参数空格）。
     async fn recv_cmd<CR, CW>(
         &mut self,
         recv_timeout: Duration,
@@ -122,6 +138,7 @@ pub(super) trait CommandLineRecvExt {
         CR: AsyncRead + Unpin,
         CW: AsyncWrite + Unpin;
 
+    /// 把行读取错误转换为任务错误；行过长时先向客户端回 500 命令过长。
     async fn handle_line_error<CW>(e: RecvLineError, clt_w: &mut CW) -> ServerTaskError
     where
         CW: AsyncWrite + Unpin,
@@ -141,6 +158,7 @@ pub(super) trait CommandLineRecvExt {
 }
 
 impl<const MAX_LINE_SIZE: usize> CommandLineRecvExt for LineRecvBuf<MAX_LINE_SIZE> {
+    /// 解析失败时按 [`g3_smtp_proto`] 的错误类型生成对应 5xx 响应回给客户端后终止会话。
     async fn recv_cmd<CR, CW>(
         &mut self,
         recv_timeout: Duration,

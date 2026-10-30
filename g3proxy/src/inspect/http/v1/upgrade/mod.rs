@@ -3,6 +3,14 @@
  * Copyright 2023-2025 ByteDance and/or its affiliates.
  */
 
+//! HTTP/1.1 Upgrade 协议切换请求的拦截检测。
+//!
+//! [`H1UpgradeTask`] 处理带 Upgrade 头的请求：先按检测策略过滤/阻断不允许的
+//! 切换协议（如 WebSocket 可按域名阻断、Connect-IP 一律拒绝），再把请求（可选
+//! 经 ICAP reqmod 改写）发给上游；收到 101 Switching Protocols 后解析实际切换
+//! 目标，返回 (协议, 权威目标) 供主循环创建下一层检测状态机（H2/WebSocket/未知流）。
+//! 非 101 响应则按普通应答透传后继续在 HTTP/1 状态机内处理。
+
 use std::time::Duration;
 
 use anyhow::anyhow;
@@ -35,6 +43,7 @@ use crate::log::inspect::stream::StreamInspectLog;
 use crate::module::http_forward::HttpProxyClientResponse;
 use crate::serve::{ServerIdleChecker, ServerTaskError, ServerTaskResult};
 
+// Upgrade 任务审计日志宏：附带切换后的下一协议、下一跳上游与各阶段耗时。
 macro_rules! intercept_log {
     ($obj:tt, $r:expr, $($args:tt)+) => {
         if let Some(logger) = $obj.ctx.intercept_logger() {
@@ -57,6 +66,8 @@ macro_rules! intercept_log {
     };
 }
 
+/// Upgrade 请求各阶段的状态码与耗时快照，用于拦截审计日志。
+/// 未发生的阶段保持 0/Duration::default()。
 struct HttpForwardTaskNotes {
     rsp_status: u16,
     origin_status: u16,
@@ -68,6 +79,8 @@ struct HttpForwardTaskNotes {
 }
 
 impl HttpForwardTaskNotes {
+    /// 以请求到达时刻为基准创建快照；`dur_req_pipeline` 即请求在流水线
+    /// channel 中排队等待被主循环取出的时间。
     fn new(datetime_received: DateTime<Utc>, time_received: Instant) -> Self {
         let dur_req_pipeline = time_received.elapsed();
         HttpForwardTaskNotes {
@@ -81,23 +94,30 @@ impl HttpForwardTaskNotes {
         }
     }
 
+    /// 记录"请求头已发出"距到达时刻的耗时
     fn mark_ups_send_header(&mut self) {
         self.dur_req_send_hdr = self.receive_ins.elapsed();
     }
 
+    /// 记录"上游响应头已收到"距到达时刻的耗时
     pub(crate) fn mark_rsp_recv_hdr(&mut self) {
         self.dur_rsp_recv_hdr = self.receive_ins.elapsed();
     }
 }
 
+/// Upgrade 协议切换任务：处理单个带 Upgrade 头的请求直到 101 完成切换或失败。
 pub(super) struct H1UpgradeTask<SC: ServerConfig> {
     ctx: StreamInspectContext<SC>,
     req: HttpTransparentRequest,
     req_id: usize,
+    // 是否还可以向客户端发送错误响应；响应头一旦写出即置 false
     send_error_response: bool,
+    // 本次交互后连接是否必须关闭
     should_close: bool,
     http_notes: HttpForwardTaskNotes,
+    // 切换到 WebSocket 时收集请求/响应两侧头部，供 WebSocket 检测层记录审计
     ws_notes: Option<WebSocketNotes>,
+    // TLS keylog 缓冲，供 ICAP 送检时导出会话密钥
     keylog_buffer: Option<Arc<TlsKeyLogBuffer>>,
 }
 
@@ -105,6 +125,7 @@ impl<SC> H1UpgradeTask<SC>
 where
     SC: ServerConfig + Send + Sync + 'static,
 {
+    /// 创建协议切换任务；keylog_buffer 用于 ICAP 送检时导出 TLS 会话密钥。
     pub(super) fn new(
         ctx: StreamInspectContext<SC>,
         req: HttpRequest,
@@ -124,11 +145,14 @@ where
         }
     }
 
+    /// 上层据此决定是否关闭整条客户端连接
     #[inline]
     pub(super) fn should_close(&self) -> bool {
         self.should_close
     }
 
+    /// 把任务错误尽量映射为 HTTP 错误响应回给客户端；
+    /// 响应要求关闭或写失败时更新 [`Self::should_close`]。
     async fn reply_task_err<CW>(&mut self, e: &ServerTaskError, clt_w: &mut CW)
     where
         CW: AsyncWrite + Unpin,
@@ -148,6 +172,8 @@ where
         }
     }
 
+    /// 直接以指定的致命响应（403/400）终结本请求：必定关闭连接。
+    /// 用于检测策略阻断或请求本身不合法（缺 Upgrade 头）的场景。
     async fn reply_fatal<CW>(&mut self, rsp: HttpProxyClientResponse, clt_w: &mut CW)
     where
         CW: AsyncWrite + Unpin,
@@ -158,6 +184,12 @@ where
         }
     }
 
+    /// 按检测策略过滤 Upgrade 头中的协议令牌：
+    /// - WebSocket：查询该 Host 的 websocket 检测动作，被阻断则剔除；
+    /// - Connect-Ip（extended connect 携带客户端 IP 的变体）：一律剔除；
+    /// - 其它令牌：保留透传。
+    /// 返回值：None 表示请求根本没有 Upgrade 头（400 终结）；Some(0) 表示所有
+    /// 令牌都被剔除（403 终结）；Some(n>0) 表示仍有可切换协议，放行。
     async fn check_blocked<CW>(&mut self, clt_w: &mut CW) -> ServerTaskResult<()>
     where
         CW: AsyncWrite + Unpin,
@@ -197,6 +229,9 @@ where
         }
     }
 
+    /// 不经 ICAP、原样转发 Upgrade 请求。
+    /// 返回 `Some((协议, 权威目标))` 表示收到 101 且切换成功；`None` 表示失败
+    /// 或收到非 101 应答（此时已尽量透传响应），失败时视情况回复错误。
     pub(super) async fn forward_original<CW, UR, UW>(
         &mut self,
         rsp_io: &mut HttpResponseIo<CW, UR, UW>,
@@ -221,6 +256,7 @@ where
         }
     }
 
+    /// 原样路径的内部实现：先做协议阻断检查，再发送请求并处理响应。
     pub(super) async fn do_forward_original<CW, UR, UW>(
         &mut self,
         rsp_io: &mut HttpResponseIo<CW, UR, UW>,
@@ -234,6 +270,7 @@ where
         self.send_request(None, rsp_io).await
     }
 
+    /// 经 ICAP reqmod 送检后转发 Upgrade 请求。返回值语义同 [`Self::forward_original`]。
     pub(super) async fn forward_icap<CW, UR, UW>(
         &mut self,
         rsp_io: &mut HttpResponseIo<CW, UR, UW>,
@@ -259,6 +296,8 @@ where
         }
     }
 
+    /// ICAP 路径的内部实现：阻断检查通过后创建 reqmod adapter 并送检转发；
+    /// adapter 创建失败时，配置了 bypass 则降级为原样转发，否则直接报错。
     async fn do_forward_icap<CW, UR, UW>(
         &mut self,
         rsp_io: &mut HttpResponseIo<CW, UR, UW>,
@@ -299,6 +338,9 @@ where
         }
     }
 
+    /// 执行 Upgrade 请求的 ICAP 送检并按中间状态分派：
+    /// 原样转发 / 转发改写后的请求 / 直接返回适配器的错误响应（阻断）。
+    /// 复用 xfer_connect 通道：Upgrade 与 CONNECT 一样是无请求体的控制类请求。
     async fn forward_with_adaptation<CW, UR, UW>(
         &mut self,
         rsp_io: &mut HttpResponseIo<CW, UR, UW>,
@@ -324,6 +366,9 @@ where
         }
     }
 
+    /// 把 ICAP 适配器返回的错误响应（阻断页）透传给客户端。
+    /// 响应头写出后即禁止再发代理层错误响应；错误响应体若存在则经 ICAP
+    /// 连接流式拷贝后归还连接池。整个连接此后必须关闭。
     async fn send_adaptation_error_response<W>(
         &mut self,
         clt_w: &mut W,
@@ -367,6 +412,8 @@ where
         Ok(())
     }
 
+    /// 把 Upgrade 请求头（原样或经 ICAP 改写的 `adapted_req`）写向上游，
+    /// 随后接收并处理响应。Upgrade 请求无请求体，只需发送头部。
     async fn send_request<CW, UR, UW>(
         &mut self,
         adapted_req: Option<HttpTransparentRequest>,
@@ -389,6 +436,8 @@ where
         self.recv_response(rsp_io).await
     }
 
+    /// 在配置的超时窗口内解析上游响应头，随后透传给客户端。
+    /// 超时归因于上游应用层超时（`UpstreamAppTimeout`）。
     async fn recv_response<CW, UR, UW>(
         &mut self,
         rsp_io: &mut HttpResponseIo<CW, UR, UW>,
@@ -417,6 +466,12 @@ where
         }
     }
 
+    /// 把上游响应头原样写回客户端，并判定协议切换结果：
+    /// - 101 Switching Protocols：从响应 Upgrade 头取实际切换协议；WebSocket
+    ///   需收集响应头到 ws_notes，Connect-Udp（extended CONNECT）从 :protocol
+    ///   语义的 URI 解析目标；其余协议以 Host 头作为权威目标。缺 Upgrade 头的
+    ///   101 或缺 Host 的目标解析都会终止（并关闭连接）。
+    /// - 其它状态码：若有响应体则透传完毕后返回 None（切换未发生）。
     async fn send_response<CW, UR, UW>(
         &mut self,
         mut rsp: HttpTransparentResponse,
@@ -443,9 +498,11 @@ where
         self.http_notes.rsp_status = self.http_notes.origin_status;
 
         if rsp.code == StatusCode::SWITCHING_PROTOCOLS {
+            // 101：切换成功，确定实际切换到的协议令牌
             let upgrade_protocol = match rsp.upgrade {
                 Some(p) => p,
                 None => {
+                    // 101 却没有 Upgrade 头：协议定义冲突，必须断连
                     self.should_close = true;
                     return Err(ServerTaskError::UpstreamAppError(anyhow!(
                         "no upgrade header found in 101 response"
@@ -455,11 +512,13 @@ where
 
             match upgrade_protocol {
                 HttpUpgradeToken::Websocket => {
+                    // WebSocket：把响应侧头存入 ws_notes，目标稍后从 Host 解析
                     let mut ws_notes = WebSocketNotes::new(self.req.uri.clone());
                     ws_notes.append_response_headers(rsp.end_to_end_headers.drain());
                     self.ws_notes = Some(ws_notes);
                 }
                 HttpUpgradeToken::ConnectUdp => {
+                    // extended CONNECT (RFC 8441)：权威目标由 :authority 伪等价信息解析
                     let upstream = self
                         .req
                         .uri
@@ -470,6 +529,7 @@ where
                 _ => {}
             }
 
+            // 其余协议（WebSocket、h2c 等）：请求的 Host 即权威目标地址
             let upstream = self
                 .req
                 .host
@@ -479,6 +539,7 @@ where
                 ))?;
             Ok(Some((upgrade_protocol, upstream)))
         } else if let Some(body_type) = rsp.body_type(&self.req.method) {
+            // 非 101 且有响应体（如鉴权 407）：透传错误体后返回 None
             self.send_response_body(rsp_io, body_type).await?;
             Ok(None)
         } else {
@@ -486,6 +547,9 @@ where
         }
     }
 
+    /// 切换失败时把上游响应体拷贝给客户端。
+    /// 拷贝循环中周期性检查：空闲计数超限（区分"读上游停滞"与"写客户端停滞"）、
+    /// 用户被封禁、服务器强制退出——三类都会中断拷贝并返回对应错误。
     async fn send_response_body<CW, UR, UW>(
         &mut self,
         rsp_io: &mut HttpResponseIo<CW, UR, UW>,
@@ -518,10 +582,11 @@ where
                 r = &mut ups_to_clt => {
                     return match r {
                         Ok(_) => {
-                            // clt_w is already flushed
+                            // clt_w is already flushed（拷贝结束时客户端写端已 flush，无需再刷）
                             Ok(())
                         }
                         Err(StreamCopyError::ReadFailed(e)) => {
+                            // 读失败也要把已缓冲的数据送达客户端再报错
                             let _ = ups_to_clt.write_flush().await;
                             Err(ServerTaskError::UpstreamReadFailed(e))
                         }
@@ -533,8 +598,10 @@ where
                         idle_count += n;
                         if idle_count >= self.ctx.max_idle_count {
                             return if ups_to_clt.no_cached_data() {
+                                // 上游不再吐数据：判定为上游空闲超时
                                 Err(ServerTaskError::UpstreamAppTimeout("idle while reading response body"))
                             } else {
+                                // 还有数据积压未写出：客户端消费不动，判定为客户端空闲超时
                                 Err(ServerTaskError::ClientAppTimeout("idle while sending response body"))
                             };
                         }
@@ -557,6 +624,11 @@ where
         }
     }
 
+    /// 切换完成后构造下一层检测状态机：检测深度 +1，按切换协议分发——
+    /// 升级到 HTTP/2 交给 H2 拦截对象；WebSocket 附带收集的双侧头部交给
+    /// WebSocket 拦截对象；残留的 h2-over-TLS 或 tls ALPN 切换不受支持，报
+    /// [`H1InterceptionError::InvalidUpgradeProtocol`]；其它未知协议按原始隧道流处理
+    /// （如策略需要可在下游禁止）。
     pub(super) fn into_upgrade(
         mut self,
         req_io: HttpRequestIo<BoxAsyncRead>,
@@ -581,6 +653,7 @@ where
                 Ok(StreamInspection::H2(h2_obj))
             }
             HttpUpgradeToken::Http(_) | HttpUpgradeToken::Tls(_, _) => {
+                // 101 后切回 HTTP/1.x 或声明 TLS：本代理不支持作为下一层检测入口
                 Err(H1InterceptionError::InvalidUpgradeProtocol(protocol))
             }
             HttpUpgradeToken::Websocket => {

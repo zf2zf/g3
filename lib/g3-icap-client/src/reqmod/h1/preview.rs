@@ -303,6 +303,8 @@ impl<I: IdleCheck> HttpRequestAdapter<I> {
             }
             206 => Err(H1ReqmodAdaptationError::NotImplemented("ICAP-REQMOD-206")),
             n if (200..300).contains(&n) => {
+                // ICAP 没要完整 body（未回 100）就直接给了改写结果：
+                // 剩余客户端 body 不再上报，后续按 Encapsulated 载荷类型处理
                 // FIXME we should stop send the pending HTTP body to ICAP server?
                 self.icap_connection.mark_writer_finished();
                 match rsp.payload {
@@ -343,6 +345,8 @@ impl<I: IdleCheck> HttpRequestAdapter<I> {
                 }
             }
             _ => {
+                // 其它响应码（3xx/4xx/5xx）：不代理转发，直接按错误上抛，
+                // 由调用方决定 bypass 还是把 ICAP 错误回给客户端
                 self.icap_connection.mark_writer_finished();
                 if rsp.payload == IcapReqmodResponsePayload::NoPayload {
                     self.icap_connection.mark_reader_finished();
@@ -359,6 +363,14 @@ impl<I: IdleCheck> HttpRequestAdapter<I> {
         }
     }
 
+    /// 从客户端 body 读最多 `max_size` 字节作为 preview。
+    ///
+    /// 用 `read` 循环而非 `read_exact`：客户端可能提前 EOF（此时返回已读到的部分，
+    /// 由调用方判断"body 其实很小"）。`biased;` 让 IO 分支优先于定时器，
+    /// 避免在数据持续到达时白白消耗空闲计数。
+    /// `is_active` 语义：只在"这一轮 interval 内一个字节都没读到"时才累加 idle_count，
+    /// 一旦有活动就清零；`check_quit` 决定是否因超时结束任务，
+    /// `check_force_quit` 则是外部（如整体超时/主动取消）无条件要求退出。
     async fn read_preview_data<R>(
         &mut self,
         reader: &mut R,
@@ -410,10 +422,17 @@ impl<I: IdleCheck> HttpRequestAdapter<I> {
             }
         }
 
+        // 客户端提前 EOF 时截断到实际读到的长度
         buf.truncate(read_offset);
         Ok(buf)
     }
 
+    /// 把 preview 数据包成 ICAP 请求写出去（一次 vectored 写，减少系统调用）。
+    ///
+    /// 线格式：ICAP 头 + 封装的 HTTP 头 + 单个 chunk（preview 数据）+ 结束块
+    /// `0\r\n\r\n`。这里以 `data.len()`（实际读到的长度）而不是协商的
+    /// `preview_size` 作为 `Preview:` 值与 chunk 长度，两者必须一致，
+    /// 否则 ICAP 服务会按错误长度等待数据。
     async fn send_preview_data<H>(
         &mut self,
         http_request: &H,
@@ -423,6 +442,7 @@ impl<I: IdleCheck> HttpRequestAdapter<I> {
         H: HttpRequestForAdaptation,
     {
         let http_header = http_request.serialize_for_adapter();
+        // 其长度即 req-body 偏移，必须与 Encapsulated 头里的值一致
         let header_len = http_header.len();
         let icap_header = self.build_preview_request(header_len, data.len());
 
@@ -445,6 +465,12 @@ impl<I: IdleCheck> HttpRequestAdapter<I> {
             .map_err(H1ReqmodAdaptationError::IcapServerWriteFailed)
     }
 
+    /// 204 放行后，把非 chunked（定长/读到结束）的原样 body 转给上游。
+    ///
+    /// 先补写已缓存的 preview 数据，再把客户端剩余部分用 StreamCopy 流式拷贝，
+    /// 全程受 idle_checker 保护；ICAP 连接在此已无用，按 keep_alive 立即回池。
+    /// `no_cached_data()` 为真说明缓冲区无待写数据（卡在读客户端），
+    /// 否则是数据堆在缓冲区写不出去（卡在上游写侧），据此返回更准确的 idle 错误。
     async fn send_original_plain_body_to_upstream<CR, UW>(
         self,
         icap_rsp: ReqmodResponse,
@@ -461,6 +487,7 @@ impl<I: IdleCheck> HttpRequestAdapter<I> {
             self.icap_client.save_connection(self.icap_connection);
         }
 
+        // preview 已离开客户端连接，必须在这里补回给上游，否则 body 会缺前 N 字节
         ups_writer
             .write_all(&preview_buf)
             .await
@@ -510,6 +537,11 @@ impl<I: IdleCheck> HttpRequestAdapter<I> {
         }
     }
 
+    /// 204 放行后，把 chunked 的原样 body 转给上游（重新按 chunked 编码）。
+    ///
+    /// preview 阶段已把客户端 chunked 解码成裸数据，这里要为它重新生成一个
+    /// chunk 头（`{:x}\r\n` 为十六进制长度），再让传输器从 `left_chunk_size`
+    /// 处继续解码剩余数据并重编为 chunk，保证上游看到合法的 chunked 流。
     async fn send_original_chunked_body_to_upstream<CR, UW>(
         self,
         icap_rsp: ReqmodResponse,
