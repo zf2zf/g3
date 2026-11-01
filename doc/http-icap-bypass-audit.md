@@ -1,0 +1,187 @@
+# HTTP 旁路上传审计（ICAP bypass upload audit）
+
+面向运维与二线支持：说明 HTTP/HTTPS 上传审计到底审计什么、什么情况下会不审计、
+出问题时看哪些日志字段，以及在部署环境怎么把它验一遍。
+
+相关代码：
+
+- `lib/g3-icap-client/src/reqmod/bypass/` —— 协议无关的旁路审计管线（FTP、HTTP/1、HTTP/2 共用）
+- `g3proxy/src/serve/http_proxy/task/forward/task.rs` —— 明文 HTTP 正向代理上传
+- `g3proxy/src/inspect/http/v1/forward/mod.rs` —— TLS 拦截后的 HTTP/1 上传
+- `g3proxy/src/inspect/http/v2/forward/mod.rs` —— TLS 拦截后的 HTTP/2 上传
+- `g3proxy/src/serve/audit_bridge.rs` —— 审计结束状态统一落日志（`log_bypass_audit_end`）
+
+---
+
+## 1. 这套审计做什么、不做什么
+
+**只做采集，不做拦截。** 代理把请求头和请求体原样复制一份送给 ICAP，REQMOD 请求里
+带 `Allow: 204`，意思是"你只需回一个 204 放行，不必返回改写后的报文"。ICAP 的响应
+在后台读取，读完就把连接还给连接池；代理不会因为等 ICAP 的结论而卡住转发。
+
+由此推出几条硬性质，排查问题时可以当作已知条件：
+
+- ICAP 侧任何失败（连不上、写不进、判决慢、判决读不到）都**不会**让上传失败，
+  最多是这一次上传少一份审计数据。
+- 只有**带请求体**的请求才送检。GET / HEAD / 空体请求完全不碰 ICAP，不占用审计名额。
+- **不审计下载方向**（响应体），也不做"只有请求头"的上报；那类通路已删除。
+- CONNECT 隧道仍走原来的 reqmod 适配通路，行为未变。
+
+## 2. 三个入口与协议来源标签
+
+ICAP 侧用 `X-Transformed-From` 区分被采集的原始协议，取值只有三种：
+
+| 入口 | `X-Transformed-From` |
+|------|----------------------|
+| 明文 HTTP 正向代理上传（`serve/http_proxy`） | `HTTP/1.0` |
+| TLS 拦截 HTTP/1 上传（`inspect/http/v1`） | `HTTP/1.0` |
+| TLS 拦截 HTTP/2 上传（`inspect/http/v2`） | `HTTP/2.0` |
+| FTP/FTPS STOR 上传（改造后共用同一管线） | `FTP` |
+
+HTTP/2 送出去的请求头是**伪 HTTP/1.1 报文头**：由 `:method` / `:path` 还原请求行，
+`Host` 缺失时用 URI 的 authority 补齐，`TE` 一类的逐跳（hop-by-hop）头剔除。这样做是
+为了兼容只认 HTTP/1.x 封装格式的 ICAP 检测模块。
+
+## 3. 一笔请求是否被审计：开关链
+
+按代码里的实际判定顺序：
+
+1. auditor 配置里有 `icap_reqmod_service`（没有则整条链路不启用）。
+2. 请求带请求体。
+3. 若 `h1_interception.req_hasbody: true`，`Content-Length` 小于
+   `req_body_min_size` 的小请求体跳过送检。这是沿用既有阈值，本次改造没有新增阈值。
+4. 取并发名额 `upload_audit_max_concurrency`（默认 64，`0` 表示不设限）。
+   **名额用尽时不排队**：本笔请求直接走无审计直通转发，并在任务日志里记一次跳过。
+5. 从 ICAP 连接池取连接（池空则新建）。取不到 / 建连失败：打一条 warn 日志，
+   本笔走无审计直通转发。注意这条路径**不计入跳过数**——跳过数只统计名额耗尽。
+6. 进入旁路管线：同一份数据一边写给源站、一边重新分块送给 ICAP。
+
+## 4. ICAP 服务端会收到什么
+
+一次上报的 ICAP 请求形如（示例来自仓库内的线格式断言测试）：
+
+```
+REQMOD icap://<icap-host>:1344/<service> ICAP/1.0
+Host: <icap-host>
+Allow: 204
+X-Transformed-From: HTTP/2.0
+X-Client-IP: 203.0.113.7
+X-Client-Port: 5555
+X-Client-Username: alice
+X-Authenticated-User: TG9jYWw6Ly9hbGljZQ==
+X-Proxy-IP: 192.0.2.1
+X-Proxy-PORT: 8080
+X-Remote-IP: 198.51.100.9
+X-Remote-PORT: 21
+X-Proto-P: 6
+X-TLS-SERVER_RANDOM: <hex>
+X-TLS-CLIENT_RANDOM: <hex> <hex>
+Encapsulated: req-hdr=0, req-body=<offset>
+
+<原始请求头字节，以 \r\n\r\n 结尾>
+<hex 长度>\r\n<请求体裸字节>\r\n
+...
+0\r\n\r\n
+```
+
+字段含义：
+
+- `X-Client-IP` / `X-Client-Port`：发起上传的客户端地址。
+- `X-Client-Username` 明文用户名；`X-Authenticated-User` 是
+  base64(`Local://<用户名>`)，沿用 Squid 系 ICAP 生态的惯例，有些检测模块只认后者。
+- `X-Proxy-IP` / `X-Proxy-PORT` / `X-Remote-IP` / `X-Remote-PORT` / `X-Proto-P`：
+  连接四元组（代理侧地址与远端地址、协议号，TCP=6），供审计侧关联 repid。
+- `X-TLS-*`：TLS 会话的 keylog 与 server_random，审计服务用它解密对应会话。
+  只有开启 `tls_keylog` 且该会话产生了 keylog 时才有。
+- `Encapsulated:` 的 `req-body` 偏移 = 封装请求头的字节数；请求体是**解码后的裸内容**
+  （gzip 之类的内容编码在这里已被还原成原始字节），再按 ICAP 要求的分块格式重新封装，
+  结尾固定 `0\r\n\r\n`。
+
+## 5. 失败面：每种失败代理怎么处理
+
+| 现象 | 代理行为 | 转发是否受影响 |
+|------|----------|----------------|
+| ICAP 连不上 / 建连失败 | warn 日志 + 无审计直通转发 | 否 |
+| 审计名额用尽 | 直通转发，`upload_audit_skipped: true`，累计计数 +1 | 否 |
+| 写 ICAP 头 / 体失败 | 停止本笔审计，数据继续送源站 | 否 |
+| ICAP 判决慢 | 数据已送完即返回，判决交后台任务读取并回收连接 | 否 |
+| 判决读不到 / 报文异常 | 只影响审计日志字段，不回头阻断 | 否 |
+| 客户端请求体半程被掐断（空闲看门狗、流被 reset） | 不给源站发结束标记，本条流以错误终止 | **是**（源头数据不完整，不能假装传完） |
+| 用户被封禁 / 服务强制退出 | 下一个空闲 tick 掐断本流 | 是（策略行为，与审计无关） |
+
+最后一行是唯一的例外：**请求体本身不完整时转发会终止**。因为 HTTP 请求体的结束由
+报文自身的标记（`Content-Length` 用完 / END_STREAM / TRAILERS）表示，代理没有能力
+"替客户端编一个结束"。半程掐断只能重置这条流。
+
+## 6. 日志字段与跳过计数
+
+HTTP 转发任务日志里与旁路上报相关的字段：
+
+- `upload_audit_skipped`：本笔请求是否因名额耗尽而没审计（布尔）。
+- `upload_audit_skipped_total`：该审计器累计跳过笔数。
+- `upload_audit_bytes`：本笔实际送给 ICAP 的字节数。
+- `dur_req_send_all`：请求体全部送达源站的耗时（回填自管线的 `dur_ups_send_all`）。
+
+判断"是不是 ICAP 拖了后腿"：
+
+- `upload_audit_skipped_total` 持续增长、而 `upload_audit_bytes` 不再增长 → 名额不足，
+  调大 `upload_audit_max_concurrency`，或扩容 / 排查 ICAP 服务处理能力。
+- 大量 `bypass ICAP adapter creation failed, forward without audit: ...` → ICAP 不可达
+  或连接池耗尽，此时上传照常，但审计数据在缺失。
+- 上传延迟本身不会因为 ICAP 变慢而升高：管线是全量转发后再后台读判决。
+
+## 7. 在部署环境把链路验一遍
+
+前置：ICAP 服务可用（例如 c-icap `icap://127.0.0.1:1344/echo`）、代理 auditor 里
+`icap_reqmod_service` 指向它、客户端信任代理的拦截 CA。抓 ICAP 侧报文：
+`sudo tcpdump -i lo0 port 1344 -w audit.pcap`。
+
+四组上传场景，四组都应当成功，ICAP 侧都应收到 REQMOD 且 `X-Transformed-From` 正确：
+
+```sh
+# 1) 明文 HTTP/1，带 Content-Length 的请求体          -> HTTP/1.0
+curl -x 127.0.0.1:10087 --data-binary @file http://origin.example/upload
+# 2) 明文 HTTP/1，分块请求体                          -> HTTP/1.0
+curl -x 127.0.0.1:10087 -H 'Transfer-Encoding: chunked' --data-binary @file http://origin.example/upload
+# 3) TLS 拦截的 HTTP/1 POST                           -> HTTP/1.0
+curl -x 127.0.0.1:10087 --cacert proxy-ca.pem --data-binary @file https://origin.example/upload
+# 4) TLS 拦截的 HTTP/2 PUT（h2 上传）                 -> HTTP/2.0
+curl -x 127.0.0.1:10087 --http2 --cacert proxy-ca.pem -T file https://origin.example/put
+```
+
+对照检查：封装区里的请求头字节应与客户端实际发出的请求头一致（h2 是伪 HTTP/1.1 形式），
+`req-body` 偏移与请求头长度一致，重组后的分块内容长度应等于上传文件长度。
+
+fail-open 验证：停掉 ICAP（例如 `sudo pkill c-icap`）再跑上面四条。四条都应当照常成功，
+代理日志里只出现 warn，且这些请求**不计入** `upload_audit_skipped_total`。
+
+跳过计数验证：把 auditor 配置改成 `upload_audit_max_concurrency: 1` 并重启，并发两笔上传：
+
+```sh
+curl -x 127.0.0.1:10087 --data-binary @file http://origin.example/upload &
+curl -x 127.0.0.1:10087 --data-binary @file http://origin.example/upload &
+wait
+```
+
+两笔都应成功返回；日志里其中一笔 `upload_audit_skipped: true`，`upload_audit_skipped_total` 加一。
+
+FTP 回归：按原 FTP 场景跑一次 STOR 上传，ICAP 侧报文应与改造前一致
+（`X-Transformed-From: FTP`、同样的四元组与 keylog 头、同样的分块请求体）。
+
+## 8. 仓库内已有的自动化证据
+
+以下行为由单元测试固定，改动这块代码后用这三条命令回归：
+
+```sh
+cargo test -p g3-icap-client --lib      # 旁路管线：204 采集、四元组/keylog/用户名头、
+                                        # Encapsulated 偏移、chunked 重编码、fail-open 兜底、
+                                        # 客户端半程 EOF、慢判决后台化、上游半关闭可关
+cargo test -p g3-h2 --lib              # HTTP/2 体收发：TRAILERS 与 END_STREAM 收尾、
+                                        # 截断体判定为 Incomplete、送检请求头字节
+cargo test -p g3proxy --features vendored-c-ares --lib   # 审计器配置（含
+                                        # upload_audit_max_concurrency 默认 64 / 0 不设限 /
+                                        # 非法值报错）、名额耗尽跳过计数、日志字段
+```
+
+§7 里需要真实 ICAP 服务与拦截证书链的部分（四组 curl、kill ICAP、FTP 实传）属于部署环境
+复核项，开发沙箱内没有执行；其上表覆盖的是同一批语义在库层面的等价断言。

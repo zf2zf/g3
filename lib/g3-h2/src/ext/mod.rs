@@ -8,3 +8,6 @@ pub use request::RequestExt;
 
 mod response;
 pub use response::ResponseExt;
+
+#[cfg(test)]
+mod tests;

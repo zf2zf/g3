@@ -1108,6 +1108,30 @@ mod tests {
         hay.windows(needle.len()).any(|w| w == needle)
     }
 
+    /// 测试侧的分块解码：把封装区里 req-body 的 chunked 线格式还原成裸内容，
+    /// 用于断言"上报的是解码后的原始字节流、只是重新分了块"。
+    fn decode_chunked(data: &[u8]) -> Vec<u8> {
+        let mut rest = data;
+        let mut out = Vec::new();
+        loop {
+            let pos = rest
+                .windows(2)
+                .position(|w| w == b"\r\n")
+                .expect("chunk-size line must end with CRLF");
+            let line = String::from_utf8_lossy(&rest[..pos]);
+            let size = usize::from_str_radix(line.trim(), 16).expect("hex chunk size");
+            rest = &rest[pos + 2..];
+            if size == 0 {
+                return out;
+            }
+            assert!(rest.len() >= size, "chunk body shorter than its size");
+            out.extend_from_slice(&rest[..size]);
+            rest = &rest[size..];
+            assert_eq!(&rest[..2], b"\r\n", "chunk body must be followed by CRLF");
+            rest = &rest[2..];
+        }
+    }
+
     /// 读一个完整的 ICAP 请求头（到 \r\n\r\n）。
     async fn read_icap_head<R: AsyncRead + Unpin>(r: &mut R) -> Option<Vec<u8>> {
         let mut head = Vec::new();
@@ -1205,6 +1229,69 @@ mod tests {
             }
         });
         (addr, saw_terminator, task)
+    }
+
+    /// 捕获版 mock：把 REQMOD 的 ICAP 头区与其后的封装区原样留存，
+    /// 供"审计字段是否真的上了线"这类线格式断言使用。语义同 Normal204：
+    /// 收完分块终止标记后回 204。
+    async fn start_mock_capture() -> (
+        SocketAddr,
+        Arc<std::sync::Mutex<Vec<u8>>>,
+        Arc<std::sync::Mutex<Vec<u8>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let new_cap = || Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let head = new_cap();
+        let encapsulated = new_cap();
+        let (head_task, enc_task) = (Arc::clone(&head), Arc::clone(&encapsulated));
+        let task = tokio::spawn(async move {
+            while let Ok((stream, _addr)) = listener.accept().await {
+                tokio::spawn(serve_capture(
+                    stream,
+                    Arc::clone(&head_task),
+                    Arc::clone(&enc_task),
+                ));
+            }
+        });
+        (addr, head, encapsulated, task)
+    }
+
+    async fn serve_capture(
+        mut stream: TcpStream,
+        head: Arc<std::sync::Mutex<Vec<u8>>>,
+        encapsulated: Arc<std::sync::Mutex<Vec<u8>>>,
+    ) {
+        loop {
+            let req_head = match read_icap_head(&mut stream).await {
+                Some(h) => h,
+                None => return,
+            };
+            if req_head.windows(7).any(|w| w == b"OPTIONS") {
+                if stream.write_all(OPTIONS_OK).await.is_err() {
+                    return;
+                }
+                continue;
+            }
+            // 只留 REQMOD 那一次的头区：管线可能先做过 OPTIONS 探测
+            head.lock().unwrap().extend_from_slice(&req_head);
+            let mut buf = vec![0u8; 4096];
+            let mut acc = Vec::new();
+            while let Ok(n) = stream.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+                acc.extend_from_slice(&buf[..n]);
+                encapsulated.lock().unwrap().extend_from_slice(&buf[..n]);
+                if find_seq(&acc, b"0\r\n\r\n") {
+                    break;
+                }
+                acc.drain(..acc.len().saturating_sub(16));
+            }
+            let _ = stream.write_all(RSP_204).await;
+            return;
+        }
     }
 
     async fn reqmod_client_to(addr: SocketAddr) -> IcapReqmodClient {
@@ -1313,7 +1400,7 @@ mod tests {
         let body = test_body(16 * 1024);
 
         // 默认（FTP 数据通道语义）：请求体送达后半关闭上游写侧
-        let mut adapter = client
+        let adapter = client
             .bypass_adapter(StreamCopyConfig::default(), idle_check())
             .await
             .unwrap();
@@ -1515,11 +1602,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_tuple_keylog_username_extended_headers_present() {
-        // framing/元数据是否真的进了 ICAP 头区：用一个把请求头原样存下来的 mock 场景，
-        // 由 serve_conn 的 head 捕获扩展（见 Normal204 handler 对 head 的断言钩子）。
-        // 该断言在 Task 1 实现阶段补充（需要暴露最近一次 head 到测试共享状态）。
-        // 先写为 pending 断言：捕获到的请求头字节包含三组扩展头。
-        let (addr, _term, _mock) = start_mock(Scenario::Normal204).await;
+        // 审计字段是否真的上了线：用捕获版 mock 把 ICAP 头区与封装区原样存下来，
+        // 再逐行断言扩展头、Encapsulated 偏移与封装的请求头字节。
+        let (addr, head_cap, enc_cap, _mock) = start_mock_capture().await;
         let client = reqmod_client_to(addr).await;
         let mut adapter = client
             .bypass_adapter(StreamCopyConfig::default(), idle_check())
@@ -1532,19 +1617,87 @@ mod tests {
             remote_addr: "198.51.100.9:21".parse().unwrap(),
             protocol: ConnectionProtocol::Tcp,
         });
-        // 本测试只做 smoke：确认 setter 存在且转发完成后状态正确
-        let body = test_body(1024);
+        let keylog = Arc::new(g3_types::net::TlsKeyLogBuffer::new_empty());
+        let server_random = "aa".repeat(32);
+        let client_random = "bb".repeat(32);
+        let secret = "cc".repeat(32);
+        keylog.set_server_random(server_random.clone());
+        assert!(keylog.add(
+            "CLIENT_RANDOM".to_string(),
+            client_random.clone(),
+            secret.clone(),
+        ));
+        adapter.set_keylog_buffer(Arc::clone(&keylog));
+
+        let req_hdr = b"POST /upload HTTP/1.1\r\nHost: example.org\r\nContent-Length: 4\r\n\r\n";
+        let framing = BypassFraming {
+            req_hdr: req_hdr.to_vec(),
+            transformed_from: "HTTP/2.0",
+        };
+        let body = test_body(2048);
         let mut clt_r = Cursor::new(body.clone());
         let (mut ups_w, ups_sink) = CollectingWriter::new_pair();
         let mut state = new_run_state();
         let end = adapter
-            .audit_and_forward(&mut state, test_framing(), &mut clt_r, &mut ups_w)
+            .audit_and_forward(&mut state, framing, &mut clt_r, &mut ups_w)
             .await;
-        assert!(matches!(
-            end,
-            BypassEndState::OriginalTransferredInBackground { .. }
-        ));
+        assert!(
+            matches!(end, BypassEndState::OriginalTransferredInBackground { .. }),
+            "{end:?}"
+        );
         assert_eq!(ups_sink.lock().unwrap().len(), body.len());
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            if find_seq(&enc_cap.lock().unwrap(), b"0\r\n\r\n") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let head = String::from_utf8_lossy(&head_cap.lock().unwrap()).into_owned();
+        assert!(
+            head.starts_with("REQMOD icap://"),
+            "ICAP 请求行是 `REQMOD <uri> ICAP/1.0`：{head}"
+        );
+        for expect in [
+            "REQMOD icap://",
+            "Allow: 204\r\n",
+            "X-Transformed-From: HTTP/2.0\r\n",
+            "X-Client-IP: 203.0.113.7\r\n",
+            "X-Client-Port: 5555\r\n",
+            "X-Client-Username: alice\r\n",
+            "X-Authenticated-User: TG9jYWw6Ly9hbGljZQ==\r\n",
+            "X-Proxy-IP: 192.0.2.1\r\n",
+            "X-Proxy-PORT: 8080\r\n",
+            "X-Remote-IP: 198.51.100.9\r\n",
+            "X-Remote-PORT: 21\r\n",
+            "X-Proto-P: 6\r\n",
+            &format!("X-TLS-SERVER_RANDOM: {server_random}\r\n"),
+            &format!("X-TLS-CLIENT_RANDOM: {client_random} {secret}\r\n"),
+            &format!("Encapsulated: req-hdr=0, req-body={}\r\n", req_hdr.len()),
+        ] {
+            assert!(
+                head.contains(expect),
+                "missing {expect:?} in ICAP head:\n{head}"
+            );
+        }
+
+        let enc = enc_cap.lock().unwrap().clone();
+        assert!(
+            enc.starts_with(req_hdr),
+            "the encapsulated region must begin with the framing req-hdr: {:?}",
+            String::from_utf8_lossy(&enc[..enc.len().min(64)])
+        );
+        assert!(
+            find_seq(&enc, b"0\r\n\r\n"),
+            "the ICAP request must be terminated by the chunk terminator"
+        );
+        assert_eq!(
+            decode_chunked(&enc[req_hdr.len()..]),
+            body,
+            "the audited body must arrive as the raw stream re-framed in chunks"
+        );
     }
 
     #[tokio::test]
