@@ -395,6 +395,7 @@ impl<'a, SC: ServerConfig> H1ForwardTask<'a, SC> {
             .boxed();
 
         let mut rsp_head: Option<(HttpTransparentResponse, Bytes)> = None;
+        let mut idle_interval = self.ctx.idle_wheel.register();
         loop {
             tokio::select! {
                 biased;
@@ -425,20 +426,33 @@ impl<'a, SC: ServerConfig> H1ForwardTask<'a, SC> {
                     log_bypass_audit_end(r);
                     break;
                 }
+                _ = idle_interval.tick() => {
+                    // 空闲超限与退出由管线的 idle_checker 负责，这里补上直通路径
+                    // 同有的策略检查：用户被封锁或服务强制退出时掐断本次上传
+                    if self.ctx.belongs_to_blocked_user() {
+                        return Err(ServerTaskError::CanceledAsUserBlocked);
+                    }
+
+                    if self.ctx.server_force_quit() {
+                        return Err(ServerTaskError::CanceledAsServerQuit);
+                    }
+                }
             }
         }
         drop(adaptation_fut);
+        drop(idle_interval);
+
+        // 请求体没有完整搬给上游（客户端截断、半途停住、上游抢先应答）时
+        // 必须结束这次拦截会话：残留的请求体会破坏下一个请求的解析，
+        // 而只写了一半的请求体留在连接上，会让源站把下一个请求当成续文
+        if !adaptation_state.clt_read_finished || !adaptation_state.ups_write_finished {
+            self.should_close = true;
+        }
 
         // 若循环因上游提前响应而退出，rsp_head 已备好；否则在这里带超时地
         // 等待最终响应头（跳过所有 100/103 临时响应）
         let rsp_head = match rsp_head {
-            Some(header) => {
-                if !adaptation_state.clt_read_finished || !adaptation_state.ups_write_finished {
-                    // not all client data transferred, drop the connection
-                    self.should_close = true;
-                }
-                header
-            }
+            Some(header) => header,
             None => {
                 match tokio::time::timeout(
                     self.ctx.h1_rsp_hdr_recv_timeout(),

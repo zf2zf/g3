@@ -1044,6 +1044,7 @@ impl<'a> HttpProxyForwardTask<'a> {
             .boxed();
 
         let mut log_interval = self.ctx.get_log_interval();
+        let mut idle_interval = self.ctx.idle_wheel.register();
 
         // 记录进入本函数时客户端已读字节数，用于判断请求是否尚未向外发送（决定能否重试）
         let clt_read_size = self.task_stats.clt.read.get_bytes();
@@ -1094,18 +1095,32 @@ impl<'a> HttpProxyForwardTask<'a> {
                         log_ctx.log_periodic();
                     }
                 }
+                _ = idle_interval.tick() => {
+                    // 空闲超限与退出由管线的 idle_checker 负责，这里补上直通路径
+                    // 同有的策略检查：用户被封锁或服务强制退出时掐断本次上传
+                    if let Some(user_ctx) = self.task_notes.user_ctx()
+                        && user_ctx.user().is_blocked()
+                    {
+                        return Err(ServerTaskError::CanceledAsUserBlocked);
+                    }
+
+                    if self.ctx.server_quit_policy.force_quit() {
+                        return Err(ServerTaskError::CanceledAsServerQuit);
+                    }
+                }
             }
         }
         drop(adaptation_fut);
+        drop(idle_interval);
+
+        // 请求体没有全部读入（客户端截断、半途停住、上游抢先应答）时
+        // 必须断开客户端：残留的请求体会破坏下一个请求的解析
+        if !adaptation_state.clt_read_finished {
+            self.should_close = true;
+        }
 
         let mut rsp_header = match rsp_header {
-            Some(header) => {
-                if !adaptation_state.clt_read_finished {
-                    // not all client data read in, drop the client connection
-                    self.should_close = true;
-                }
-                header
-            }
+            Some(header) => header,
             None => {
                 // 请求已全部交给上游但尚未读到响应头：带超时等待最终响应（跳过中间 1xx）
                 match tokio::time::timeout(

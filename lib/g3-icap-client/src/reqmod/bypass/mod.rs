@@ -296,17 +296,16 @@ impl<I: IdleCheck> BypassAdapter<I> {
         // 第二步：边读客户端边双写（上游 + ICAP 后台写任务）。
         // Err(bytes) 表示"上游写失败"——这是唯一需要终止上传的错误面，
         // 此时 ICAP 侧已写入的数据不再等待判决，直接如实上报。
-        let (total_bytes, icap_ok, icap_handle) = match self.run_relay_loop(clt_r, ups_w).await {
-            Ok((bytes, ok, handle)) => (bytes, ok, handle),
-            Err(bytes) => {
-                return BypassEndState::OriginalTransferredAfterFallback {
-                    bytes,
-                    icap_error: "upstream write failed".to_string(),
-                };
-            }
-        };
-
-        state.clt_read_finished = true;
+        let (total_bytes, icap_ok, icap_handle, clt_body_complete) =
+            match self.run_relay_loop(clt_r, ups_w).await {
+                Ok(outcome) => outcome,
+                Err(bytes) => {
+                    return BypassEndState::OriginalTransferredAfterFallback {
+                        bytes,
+                        icap_error: "upstream write failed".to_string(),
+                    };
+                }
+            };
 
         // 客户端 EOF：把上游已缓冲的数据冲出去；只在调用方要求时才半关闭写侧
         // （FTP 靠 EOF 信令，HTTP 的请求体成帧自带结束标记）。
@@ -314,7 +313,13 @@ impl<I: IdleCheck> BypassAdapter<I> {
         if self.upstream_half_close {
             let _ = ups_w.shutdown().await;
         }
-        state.mark_ups_send_all();
+        // 半途而废（客户端读错误、被空闲看门狗掐断）不许汇报成"请求体已搬完"：
+        // 调用方靠这两个标志决定是否把仍然可用的上游连接放回 keep-alive 池，
+        // 残 body 复用会让源站把下一个请求当成上一段的续文（请求走私）
+        if clt_body_complete {
+            state.clt_read_finished = true;
+            state.mark_ups_send_all();
+        }
 
         // icap_ok=false 表示中继期间 ICAP 写通道已断开/被慢速背压掐掉：
         // 回收后台任务（拿回连接资源）后如实汇报"转发成功、审计失败"。
@@ -446,7 +451,8 @@ impl<I: IdleCheck> BypassAdapter<I> {
     }
 
     /// 中继主循环：从客户端读一块数据，先写上游、再复制一份投递给
-    /// ICAP 后台写任务；返回 (总字节数, ICAP 写侧是否存活, 后台任务句柄)。
+    /// ICAP 后台写任务；返回 (总字节数, ICAP 写侧是否存活, 后台任务句柄,
+    /// 客户端请求体是否干净收尾)。
     /// Err(总字节数) 专门表示上游写失败（唯一必须终止上传的错误面）。
     async fn run_relay_loop<CR, UW>(
         &mut self,
@@ -462,6 +468,7 @@ impl<I: IdleCheck> BypassAdapter<I> {
                 IcapClientReader,
                 Vec<u8>,
             )>,
+            bool,
         ),
         u64,
     >
@@ -645,6 +652,9 @@ impl<I: IdleCheck> BypassAdapter<I> {
         });
 
         let mut icap_alive = true;
+        // 只有客户端自己把请求体送完（读到 EOF）才算"搬完了"；读错误与空闲
+        // 看门狗掐断都是半途而废，调用方要靠这个区分决定上游连接能否复用
+        let mut clt_body_complete = false;
 
         // 主中继循环：客户端数据是最高优先级（biased），空闲计时仅用于
         // 看门狗（长时间无数据时按 IdleCheck 策略强制退出）。
@@ -654,7 +664,10 @@ impl<I: IdleCheck> BypassAdapter<I> {
                 res = clt_r.read(&mut buf) => {
                     match res {
                         // 客户端 EOF：上传数据全部送达，正常结束
-                        Ok(0) => break,
+                        Ok(0) => {
+                            clt_body_complete = true;
+                            break;
+                        }
                         Ok(n) => {
                             idle_count = 0;
                             total_bytes += n as u64;
@@ -698,7 +711,7 @@ impl<I: IdleCheck> BypassAdapter<I> {
 
         // 结束投递：drop 发送端使后台写任务看到 None 从而收尾
         drop(chunk_tx);
-        Ok((total_bytes, icap_alive, icap_handle))
+        Ok((total_bytes, icap_alive, icap_handle, clt_body_complete))
     }
 
     /// audit-only 模式：数据只送 ICAP 不上送上游——调用方（如 HTTP CONNECT
@@ -886,12 +899,16 @@ impl<I: IdleCheck> BypassAdapter<I> {
         let mut idle_interval = self.idle_checker.interval_timer();
 
         // 纯转发循环：没有任何 ICAP 分支，任一方向出错/空闲即停
+        let mut clt_body_complete = false;
         loop {
             tokio::select! {
                 biased;
                 n = clt_r.read(&mut buf) => {
                     match n {
-                        Ok(0) => break,
+                        Ok(0) => {
+                            clt_body_complete = true;
+                            break;
+                        }
                         Ok(n) => {
                             total_bytes += n as u64;
                             if ups_w.write_all(&buf[..n]).await.is_err() {
@@ -906,8 +923,11 @@ impl<I: IdleCheck> BypassAdapter<I> {
         }
 
         let _ = ups_w.flush().await;
-        state.clt_read_finished = true;
-        state.mark_ups_send_all();
+        // 与中继循环同一套判断：只有请求体确实搬完了才允许调用方复用上游连接
+        if clt_body_complete {
+            state.clt_read_finished = true;
+            state.mark_ups_send_all();
+        }
 
         // 无论转发是否完整，都如实带上字节数与首个 ICAP 错误，
         // 由调用方决定如何向客户端汇报结果
@@ -1087,6 +1107,90 @@ mod tests {
                 sink,
             )
         }
+    }
+
+    /// 客户端读端：先交出 `data` 里的全部字节，之后每次读取都返回 UnexpectedEof，
+    /// 模拟 Content-Length 没收满、或 chunked 迟迟等不到终止块的截断请求体。
+    struct TruncatingReader {
+        data: Vec<u8>,
+        pos: usize,
+    }
+
+    impl TruncatingReader {
+        fn new(data: Vec<u8>) -> Self {
+            TruncatingReader { data, pos: 0 }
+        }
+    }
+
+    impl AsyncRead for TruncatingReader {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            let this = self.get_mut();
+            if this.pos >= this.data.len() {
+                return std::task::Poll::Ready(Err(io::Error::from(io::ErrorKind::UnexpectedEof)));
+            }
+            let n = std::cmp::min(this.data.len() - this.pos, buf.remaining());
+            buf.initialize_unfilled_to(n)
+                .copy_from_slice(&this.data[this.pos..this.pos + n]);
+            buf.advance(n);
+            this.pos += n;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// 空闲看门狗到点就要求退出的检查器：用于模拟客户端半途停住不再发送。
+    struct StallQuitCheck {
+        wheel: Arc<IdleWheel>,
+    }
+
+    impl IdleCheck for StallQuitCheck {
+        fn interval_timer(&self) -> IdleInterval {
+            self.wheel.register()
+        }
+        fn check_quit(&self, idle_count: usize) -> bool {
+            idle_count >= 1
+        }
+        fn check_force_quit(&self) -> Option<IdleForceQuitReason> {
+            None
+        }
+    }
+
+    /// 造一个"ICAP 请求头首发即写失败"的适配器，确定性走兜底纯转发分支。
+    fn broken_icap_adapter(client: &IcapReqmodClient) -> BypassAdapter<NoIdleCheck> {
+        struct BrokenWriter;
+        impl AsyncWrite for BrokenWriter {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                _: &[u8],
+            ) -> std::task::Poll<io::Result<usize>> {
+                std::task::Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)))
+            }
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<io::Result<()>> {
+                std::task::Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)))
+            }
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        let mut conn = crate::service::IcapClientConnection::placeholder();
+        conn.writer = Box::new(BrokenWriter);
+        conn.reader = BufReader::new(Box::new(tokio::io::empty()));
+        BypassAdapter::with_connection(
+            client.service_client().clone(),
+            conn,
+            StreamCopyConfig::default(),
+            idle_check(),
+        )
     }
 
     const OPTIONS_OK: &[u8] =
@@ -1463,6 +1567,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_client_read_error_does_not_mark_request_complete() {
+        // 截断的请求体绝不能被汇报成"已收满"：调用方据此决定是否把仍然开着的
+        // 上游连接放回 keep-alive 池，误判会让下一个请求被源站当成残体的续文。
+        let (addr, _terminator, _mock) = start_mock(Scenario::Normal204).await;
+        let client = reqmod_client_to(addr).await;
+        let adapter = client
+            .bypass_adapter(StreamCopyConfig::default(), idle_check())
+            .await
+            .unwrap();
+
+        let body = test_body(16 * 1024);
+        let mut clt_r = TruncatingReader::new(body.clone());
+        let (mut ups_w, ups_sink) = CollectingWriter::new_pair();
+        let mut state = new_run_state();
+
+        let end = adapter
+            .audit_and_forward(&mut state, test_framing(), &mut clt_r, &mut ups_w)
+            .await;
+        // fail-open：源头断了不改变转发结果，已收到的部分照常交给上游
+        assert!(matches!(
+            end,
+            BypassEndState::OriginalTransferredInBackground { .. }
+        ));
+        assert_eq!(ups_sink.lock().unwrap().len(), body.len());
+        assert!(
+            !state.clt_read_finished,
+            "a client read error is not a complete request body"
+        );
+        assert!(
+            !state.ups_write_finished,
+            "a half-written body must not make the upstream connection reusable"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_idle_timeout_does_not_mark_request_complete() {
+        // 客户端半途停住（连接还活着）被看门狗掐掉：同样是未搬完的请求体
+        let (addr, _terminator, _mock) = start_mock(Scenario::Normal204).await;
+        let client = reqmod_client_to(addr).await;
+        let adapter = client
+            .bypass_adapter(
+                StreamCopyConfig::default(),
+                StallQuitCheck {
+                    wheel: IdleWheel::spawn(Duration::from_millis(50)),
+                },
+            )
+            .await
+            .unwrap();
+
+        let (mut keeper, mut clt_r) = tokio::io::duplex(4096);
+        keeper.write_all(b"partial-body").await.unwrap();
+        let (mut ups_w, ups_sink) = CollectingWriter::new_pair();
+        let mut state = new_run_state();
+
+        let end = adapter
+            .audit_and_forward(&mut state, test_framing(), &mut clt_r, &mut ups_w)
+            .await;
+        drop(keeper);
+
+        assert!(matches!(
+            end,
+            BypassEndState::OriginalTransferredInBackground { .. }
+        ));
+        assert_eq!(ups_sink.lock().unwrap().as_slice(), b"partial-body");
+        assert!(
+            !state.clt_read_finished,
+            "a stalled client never finished the body"
+        );
+        assert!(!state.ups_write_finished);
+    }
+
+    #[tokio::test]
+    async fn test_fallback_forward_on_client_error_does_not_mark_complete() {
+        // ICAP 不可达时走兜底纯转发：这条路径同样是"审计降级"，
+        // 但请求体完整性判断不能因此失真（源头截断时依旧不许复用上游连接）
+        let client = reqmod_client_to("127.0.0.1:1".parse().unwrap()).await;
+        let adapter = broken_icap_adapter(&client);
+
+        let body = test_body(4096);
+        let mut clt_r = TruncatingReader::new(body.clone());
+        let (mut ups_w, ups_sink) = CollectingWriter::new_pair();
+        let mut state = new_run_state();
+
+        let end = adapter
+            .audit_and_forward(&mut state, test_framing(), &mut clt_r, &mut ups_w)
+            .await;
+        assert!(matches!(
+            end,
+            BypassEndState::OriginalTransferredAfterFallback { .. }
+        ));
+        assert_eq!(ups_sink.lock().unwrap().len(), body.len());
+        assert!(!state.clt_read_finished);
+        assert!(!state.ups_write_finished);
+    }
+
+    #[tokio::test]
     async fn test_echo_service_concurrent_drain() {
         // 模拟"不等请求收完就抢先回响应"的 ICAP 服务（echo 型服务的最坏时机）：
         // 后台写任务必须边写边排空读侧并捕获响应头，主流程不死锁、字节计数正确。
@@ -1549,38 +1749,7 @@ mod tests {
     async fn test_header_send_failure_falls_back_to_forward_only() {
         // 用确定性写失败的 writer 制造 ICAP 头首发即断连。
         let client = reqmod_client_to("127.0.0.1:1".parse().unwrap()).await;
-        // 端口 1 连不上，绕过 fetch_connection 手工组装 adapter（同模块可见私有字段）。
-        struct BrokenWriter;
-        impl AsyncWrite for BrokenWriter {
-            fn poll_write(
-                self: std::pin::Pin<&mut Self>,
-                _: &mut std::task::Context<'_>,
-                _: &[u8],
-            ) -> std::task::Poll<io::Result<usize>> {
-                std::task::Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)))
-            }
-            fn poll_flush(
-                self: std::pin::Pin<&mut Self>,
-                _: &mut std::task::Context<'_>,
-            ) -> std::task::Poll<io::Result<()>> {
-                std::task::Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)))
-            }
-            fn poll_shutdown(
-                self: std::pin::Pin<&mut Self>,
-                _: &mut std::task::Context<'_>,
-            ) -> std::task::Poll<io::Result<()>> {
-                std::task::Poll::Ready(Ok(()))
-            }
-        }
-        let mut conn = crate::service::IcapClientConnection::placeholder();
-        conn.writer = Box::new(BrokenWriter);
-        conn.reader = BufReader::new(Box::new(tokio::io::empty()));
-        let adapter = BypassAdapter::with_connection(
-            client.service_client().clone(),
-            conn,
-            StreamCopyConfig::default(),
-            idle_check(),
-        );
+        let adapter = broken_icap_adapter(&client);
 
         let body = test_body(4096);
         let mut clt_r = Cursor::new(body.clone());

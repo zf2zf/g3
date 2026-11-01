@@ -93,9 +93,11 @@ Encapsulated: req-hdr=0, req-body=<offset>
   连接四元组（代理侧地址与远端地址、协议号，TCP=6），供审计侧关联 repid。
 - `X-TLS-*`：TLS 会话的 keylog 与 server_random，审计服务用它解密对应会话。
   只有开启 `tls_keylog` 且该会话产生了 keylog 时才有。
-- `Encapsulated:` 的 `req-body` 偏移 = 封装请求头的字节数；请求体是**解码后的裸内容**
-  （gzip 之类的内容编码在这里已被还原成原始字节），再按 ICAP 要求的分块格式重新封装，
-  结尾固定 `0\r\n\r\n`。
+- `Encapsulated:` 的 `req-body` 偏移 = 封装请求头的字节数；请求体是**代理转发给源站的
+  同一份字节**（不解包内容编码：上传的是 gzip 就仍是 gzip；客户端用 `Transfer-Encoding:
+  chunked` 时分块帧也会原样保留），再按 ICAP 要求的分块格式重新封装一层，结尾固定
+  `0\r\n\r\n`。也就是说 ICAP 侧读到的是"线格式"，审计模块如需文件原文，要自己再做一次
+  分块解码与内容解码。FTP 通路没有这个问题：它拿到的是数据通道上的裸文件字节。
 
 ## 5. 失败面：每种失败代理怎么处理
 
