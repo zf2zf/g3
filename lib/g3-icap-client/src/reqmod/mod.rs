@@ -59,6 +59,9 @@ pub mod mail;
 
 // FTP 控制/数据通道请求修改适配器
 pub mod ftp;
+
+// 协议无关的旁路（fail-open）上传审计管线
+pub mod bypass;
 pub mod imap;
 pub mod smtp;
 
