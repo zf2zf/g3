@@ -4,6 +4,7 @@
  */
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use slog::Logger;
 
@@ -13,6 +14,7 @@ use g3_dpi::{
 };
 use g3_icap_client::reqmod::IcapReqmodClient;
 use g3_icap_client::respmod::IcapRespmodClient;
+use g3_types::limit::{GaugeSemaphore, GaugeSemaphorePermit};
 
 use super::Auditor;
 #[cfg(feature = "quic")]
@@ -44,6 +46,10 @@ pub(crate) struct AuditHandle {
     pub(crate) websocket_inspect_policy: ProtocolInspectPolicy,
     pub(crate) smtp_inspect_policy: ProtocolInspectPolicy,
     pub(crate) imap_inspect_policy: ProtocolInspectPolicy,
+    /// 上传旁路审计并发闸门：上限取自 auditor 配置，0 表示不设限
+    upload_audit_sem: GaugeSemaphore,
+    /// 因并发达到上限而跳过审计的次数累计
+    upload_audit_skipped: AtomicU64,
 }
 
 impl AuditHandle {
@@ -75,6 +81,10 @@ impl AuditHandle {
             websocket_inspect_policy: auditor.config.websocket_inspect_policy.build(),
             smtp_inspect_policy: auditor.config.smtp_inspect_policy.build(),
             imap_inspect_policy: auditor.config.imap_inspect_policy.build(),
+            upload_audit_sem: GaugeSemaphore::new(
+                auditor.config.upload_audit_max_concurrency,
+            ),
+            upload_audit_skipped: AtomicU64::new(0),
         }
     }
 
@@ -187,5 +197,85 @@ impl AuditHandle {
     #[inline]
     pub(crate) fn tls_keylog_max_entries(&self) -> usize {
         self.auditor_config.tls_keylog.max_entries
+    }
+
+    /// 尝试占用一个上传旁路审计名额。
+    /// 名额用尽时返回 None，调用方应跳过审计直接转发（绝不排队等待）；
+    /// 配置为 0 表示不设限，恒返回 Some。返回的 permit 析构时自动归还名额。
+    pub(crate) fn try_upload_audit_permit(&self) -> Option<GaugeSemaphorePermit> {
+        self.upload_audit_sem.try_acquire().ok()
+    }
+
+    /// 累计一次“因名额不足跳过审计”，供指标上报。
+    #[inline]
+    pub(crate) fn mark_upload_audit_skipped(&self) {
+        self.upload_audit_skipped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 读取累计的跳过次数。
+    #[inline]
+    pub(crate) fn upload_audit_skipped(&self) -> u64 {
+        self.upload_audit_skipped.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use yaml_rust::YamlLoader;
+
+    use super::{AuditHandle, Auditor, AuditorConfig};
+
+    fn handle_with(doc: &str) -> AuditHandle {
+        let value = YamlLoader::load_from_str(doc).unwrap().remove(0);
+        let map = value.as_hash().expect("yaml root should be a hash");
+        let mut config = AuditorConfig::new(None);
+        config.parse(map).expect("valid auditor yaml");
+        let auditor = Auditor {
+            config: Arc::new(config),
+            server_tcp_portmap: Arc::new(g3_dpi::ProtocolPortMap::tcp_server()),
+            client_tcp_portmap: Arc::new(g3_dpi::ProtocolPortMap::tcp_client()),
+            tls_rolling_ticketer: None,
+            icap_reqmod_service: None,
+            icap_respmod_service: None,
+            #[cfg(feature = "quic")]
+            stream_detour_service: None,
+        };
+        AuditHandle::new(&auditor)
+    }
+
+    #[test]
+    fn test_permit_exhaustion_skips_audit() {
+        let handle = handle_with(
+            r#"
+                name: test-auditor
+                upload_audit_max_concurrency: 1
+            "#,
+        );
+        let first = handle
+            .try_upload_audit_permit()
+            .expect("first permit should be available");
+        assert!(handle.try_upload_audit_permit().is_none());
+        drop(first);
+        assert!(handle.try_upload_audit_permit().is_some());
+
+        handle.mark_upload_audit_skipped();
+        handle.mark_upload_audit_skipped();
+        assert_eq!(handle.upload_audit_skipped(), 2);
+    }
+
+    #[test]
+    fn test_zero_max_concurrency_never_blocks() {
+        let handle = handle_with(
+            r#"
+                name: test-auditor
+                upload_audit_max_concurrency: 0
+            "#,
+        );
+        let a = handle.try_upload_audit_permit().expect("0 means unlimited");
+        let b = handle.try_upload_audit_permit().expect("0 means unlimited");
+        assert!(handle.upload_audit_skipped() == 0);
+        drop((a, b));
     }
 }

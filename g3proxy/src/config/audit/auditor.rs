@@ -28,6 +28,7 @@ use g3_yaml::YamlDocPosition;
 use super::AuditStreamDetourConfig;
 
 const DEFAULT_MAX_KEYLOG_ENTRIES: usize = 128;
+const DEFAULT_UPLOAD_AUDIT_MAX_CONCURRENCY: usize = 64;
 
 #[derive(Clone, Debug)]
 pub(crate) struct TlsKeylogConfig {
@@ -110,6 +111,8 @@ pub(crate) struct AuditorConfig {
     #[cfg(feature = "quic")]
     pub(crate) stream_detour_service: Option<Arc<AuditStreamDetourConfig>>,
     pub(crate) task_audit_ratio: Bernoulli,
+    /// 同时进行的上传旁路审计上限；0 表示不设限
+    pub(crate) upload_audit_max_concurrency: usize,
 }
 
 impl AuditorConfig {
@@ -148,6 +151,7 @@ impl AuditorConfig {
             #[cfg(feature = "quic")]
             stream_detour_service: None,
             task_audit_ratio: Bernoulli::new(1.0).unwrap(),
+            upload_audit_max_concurrency: DEFAULT_UPLOAD_AUDIT_MAX_CONCURRENCY,
         }
     }
 
@@ -315,7 +319,82 @@ impl AuditorConfig {
                     .context(format!("invalid tls keylog config value for key {k}"))?;
                 Ok(())
             }
+            "upload_audit_max_concurrency" => {
+                self.upload_audit_max_concurrency = g3_yaml::value::as_usize(v)
+                    .context(format!("invalid usize value for key {k}"))?;
+                Ok(())
+            }
             _ => Err(anyhow!("invalid key {k}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use yaml_rust::YamlLoader;
+
+    fn parse_config(doc: &str) -> anyhow::Result<AuditorConfig> {
+        let value = YamlLoader::load_from_str(doc).unwrap().remove(0);
+        let mut config = AuditorConfig::new(None);
+        let map = value
+            .as_hash()
+            .ok_or_else(|| anyhow!("yaml root should be a hash"))?;
+        config.parse(map)?;
+        Ok(config)
+    }
+
+    #[test]
+    fn upload_audit_max_concurrency_default_is_64() {
+        let config = parse_config(
+            r#"
+                name: test-auditor
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.upload_audit_max_concurrency, 64);
+    }
+
+    #[test]
+    fn upload_audit_max_concurrency_parsed() {
+        let config = parse_config(
+            r#"
+                name: test-auditor
+                upload_audit_max_concurrency: 8
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.upload_audit_max_concurrency, 8);
+    }
+
+    #[test]
+    fn upload_audit_max_concurrency_zero_is_allowed_as_unlimited() {
+        let config = parse_config(
+            r#"
+                name: test-auditor
+                upload_audit_max_concurrency: 0
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.upload_audit_max_concurrency, 0);
+    }
+
+    #[test]
+    fn upload_audit_max_concurrency_invalid_value_errors() {
+        let res = parse_config(
+            r#"
+                name: test-auditor
+                upload_audit_max_concurrency: "eight"
+            "#,
+        );
+        let err = match res {
+            Ok(_) => panic!("string value should be rejected"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("upload_audit_max_concurrency") || msg.contains("invalid usize"),
+            "unexpected error: {msg}"
+        );
     }
 }
