@@ -1,0 +1,27 @@
+[Unit]
+Description=G3 Proxy (run package under @PREFIX@)
+Documentation=file://@PREFIX@/README.md
+After=syslog.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+# 控制套接字目录：systemd 负责创建，路径与 --control-dir 必须一致
+RuntimeDirectory=g3
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+ExecStart=@PREFIX@/bin/g3proxy -c @PREFIX@/conf/g3proxy.yaml --control-dir @CONTROL_DIR@ -s -G @GROUP@
+ExecReload=@PREFIX@/bin/g3proxy-ctl --control-dir @CONTROL_DIR@ -G @GROUP@ reload
+# 优雅下线：先置 offline 让在途连接收尾，再由 systemd 收进程
+ExecStop=@PREFIX@/bin/g3proxy-ctl --control-dir @CONTROL_DIR@ -G @GROUP@ -p $MAINPID offline
+KillMode=none
+Restart=on-failure
+SuccessExitStatus=SIGQUIT
+# 退出码 255 是配置/启动错误，别让它反复重启刷日志
+RestartPreventExitStatus=255
+TimeoutStartSec=10
+TimeoutStopSec=60
+LimitNOFILE=10485760
+
+[Install]
+WantedBy=multi-user.target

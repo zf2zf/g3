@@ -1,0 +1,12 @@
+---
+# MITM 证书签发服务的配置。run 包只带这一份模板，CA 证书与私钥不打进包里——
+# 请用自己的 CA，把文件放到 /opt/zf/g3/conf/ 下（或把下面的路径改成绝对路径）。
+#
+# 需要这个服务时再装：sudo ./install.sh --with-fcgen
+
+runtime:
+  thread_number: 1
+
+backend:
+  ca_certificate: myCA.crt
+  ca_private_key: myCA.key

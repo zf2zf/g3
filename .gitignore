@@ -17,3 +17,6 @@ g3proxy/service/g3proxy@.service
 g3tiles/service/g3tiles@.service
 g3keymess/service/g3keymess@.service
 
+
+# run 包产物
+dist/

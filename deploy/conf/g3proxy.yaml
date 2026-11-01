@@ -1,0 +1,25 @@
+---
+# run 包的入口配置：程序与配置都在 /opt/zf/g3 下，本文件由 install.sh 安装到
+# /opt/zf/g3/conf/g3proxy.yaml，systemd 单元用 -c 直接指向它。
+#
+# 下面 server / auditor 的值是相对本文件所在目录的路径，所以 server.d、auditor.d
+# 必须跟本文件放在同一个目录里。需要 resolver.d 或 escaper.d 时，先把目录建好
+# 再打开对应行——目录不存在会导致配置校验失败。
+
+runtime:
+  thread_number: 2
+
+# 日志走标准输出，由 systemd 收进 journald：journalctl -u g3proxy
+log: stdout
+
+controller:
+  local:
+    recv_timeout: 30
+    send_timeout: 1
+
+server: server.d/
+
+auditor: auditor.d/
+
+# resolver: resolver.d/
+# escaper: escaper.d/
