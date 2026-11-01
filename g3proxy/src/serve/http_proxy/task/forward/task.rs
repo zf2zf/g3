@@ -968,6 +968,9 @@ impl<'a> HttpProxyForwardTask<'a> {
             }
         };
         adapter.set_client_addr(self.ctx.client_addr());
+        // HTTP 请求体成帧自带结束标记，不需要靠半关闭上游写侧来信令传输结束；
+        // 关掉才能把上游连接留给 keep-alive / 流水线上的下一个请求
+        adapter.set_upstream_half_close(false);
         if let Some(name) = self.task_notes.raw_user_name() {
             adapter.set_client_username(name.clone());
         }
@@ -1167,10 +1170,14 @@ impl<'a> HttpProxyForwardTask<'a> {
             .await?;
 
         self.task_notes.stage = ServerTaskStage::Finished;
-        // 旁路管线在请求体送达后会关闭上游写侧（半关闭）；若上游提前响应，
-        // 请求体也没发完。两种情况下这条上游连接都不能再放回连接池复用。
-        let _ = ups_w.shutdown().await;
-        Ok(None)
+        // 请求体全部交给上游才允许把连接放回连接池；若上游提前响应导致请求体
+        // 没发完，这条上游连接不能再复用（与普通流式转发路径同一套判断）
+        if adaptation_state.ups_write_finished {
+            Ok(Some(ups_c))
+        } else {
+            let _ = ups_w.shutdown().await;
+            Ok(None)
+        }
     }
 
     /// 普通（无 reqmod 适配）转发路径的调度：按请求是否携带 body 选择不同策略——

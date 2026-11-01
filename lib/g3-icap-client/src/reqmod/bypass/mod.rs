@@ -128,6 +128,7 @@ impl IcapReqmodClient {
             client_username: None,
             connection_tuple: None,
             keylog_buffer: None,
+            upstream_half_close: true,
         })
     }
 }
@@ -146,6 +147,9 @@ pub struct BypassAdapter<I: IdleCheck> {
     connection_tuple: Option<ConnectionTuple>,
     /* added for TLS keylog */
     keylog_buffer: Option<Arc<TlsKeyLogBuffer>>,
+    /// 客户端请求体送达后是否半关闭上游写侧。FTP 数据通道靠 EOF 信令传输
+    /// 结束，必须关闭；HTTP 请求体自带结束标记，上游连接要留给后续请求复用。
+    upstream_half_close: bool,
 }
 
 impl<I: IdleCheck> BypassAdapter<I> {
@@ -168,6 +172,7 @@ impl<I: IdleCheck> BypassAdapter<I> {
             client_username: None,
             connection_tuple: None,
             keylog_buffer: None,
+            upstream_half_close: true,
         }
     }
 
@@ -183,6 +188,13 @@ impl<I: IdleCheck> BypassAdapter<I> {
     /// 记录客户端用户名（以 X-Client-Username / X-Authenticated-User 头回传）。
     pub fn set_client_username(&mut self, user: arcstr::ArcStr) {
         self.client_username = Some(user);
+    }
+
+    /// 设置请求体送达后是否半关闭上游写侧（默认为真，即 FTP 数据通道行为）。
+    /// HTTP 调用方应关闭：请求体成帧自带结束标记，上游连接还要留给
+    /// keep-alive / 流水线上的下一个请求使用，半关闭会让它作废。
+    pub fn set_upstream_half_close(&mut self, enabled: bool) {
+        self.upstream_half_close = enabled;
     }
 
     /* added for connection tuple - data channel 5-tuple */
@@ -296,9 +308,12 @@ impl<I: IdleCheck> BypassAdapter<I> {
 
         state.clt_read_finished = true;
 
-        // 客户端 EOF：把上游已缓冲的数据冲出去并关闭写侧，上传至此完成。
+        // 客户端 EOF：把上游已缓冲的数据冲出去；只在调用方要求时才半关闭写侧
+        // （FTP 靠 EOF 信令，HTTP 的请求体成帧自带结束标记）。
         let _ = ups_w.flush().await;
-        let _ = ups_w.shutdown().await;
+        if self.upstream_half_close {
+            let _ = ups_w.shutdown().await;
+        }
         state.mark_ups_send_all();
 
         // icap_ok=false 表示中继期间 ICAP 写通道已断开/被慢速背压掐掉：
@@ -987,7 +1002,7 @@ mod tests {
     use std::io::{self, Cursor};
     use std::net::SocketAddr;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -1018,7 +1033,11 @@ mod tests {
     }
 
     /// 收集写入字节的 AsyncWrite，用于断言上游收到的内容。
-    struct CollectingWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+    /// `shutdowns` 记录写侧被关闭（半关闭）的次数。
+    struct CollectingWriter {
+        sink: Arc<std::sync::Mutex<Vec<u8>>>,
+        shutdowns: Arc<AtomicUsize>,
+    }
 
     impl AsyncWrite for CollectingWriter {
         fn poll_write(
@@ -1027,7 +1046,7 @@ mod tests {
             buf: &[u8],
         ) -> std::task::Poll<io::Result<usize>> {
             let _ = cx;
-            self.0.lock().unwrap().extend_from_slice(buf);
+            self.sink.lock().unwrap().extend_from_slice(buf);
             std::task::Poll::Ready(Ok(buf.len()))
         }
         fn poll_flush(
@@ -1040,14 +1059,33 @@ mod tests {
             self: std::pin::Pin<&mut Self>,
             _cx: &mut std::task::Context<'_>,
         ) -> std::task::Poll<io::Result<()>> {
+            self.shutdowns.fetch_add(1, Ordering::SeqCst);
             std::task::Poll::Ready(Ok(()))
         }
     }
 
     impl CollectingWriter {
+        fn new_counting_pair() -> (Self, Arc<AtomicUsize>) {
+            let sink = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let shutdowns = Arc::new(AtomicUsize::new(0));
+            (
+                CollectingWriter {
+                    sink: Arc::clone(&sink),
+                    shutdowns: Arc::clone(&shutdowns),
+                },
+                shutdowns,
+            )
+        }
+
         fn new_pair() -> (Self, Arc<std::sync::Mutex<Vec<u8>>>) {
             let sink = Arc::new(std::sync::Mutex::new(Vec::new()));
-            (CollectingWriter(Arc::clone(&sink)), sink)
+            (
+                CollectingWriter {
+                    sink: Arc::clone(&sink),
+                    shutdowns: Arc::new(AtomicUsize::new(0)),
+                },
+                sink,
+            )
         }
     }
 
@@ -1266,6 +1304,49 @@ mod tests {
         // 调用方靠这两个字段回填"请求体整体发送耗时"等任务日志指标
         assert!(state.ups_write_finished);
         assert!(state.dur_ups_send_all.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_upstream_half_close_is_optional() {
+        let (addr, _terminator, _mock) = start_mock(Scenario::Normal204).await;
+        let client = reqmod_client_to(addr).await;
+        let body = test_body(16 * 1024);
+
+        // 默认（FTP 数据通道语义）：请求体送达后半关闭上游写侧
+        let mut adapter = client
+            .bypass_adapter(StreamCopyConfig::default(), idle_check())
+            .await
+            .unwrap();
+        let mut clt_r = Cursor::new(body.clone());
+        let (mut ups_w, shutdowns) = CollectingWriter::new_counting_pair();
+        let mut state = new_run_state();
+        let _ = adapter
+            .audit_and_forward(&mut state, test_framing(), &mut clt_r, &mut ups_w)
+            .await;
+        assert_eq!(
+            shutdowns.load(Ordering::SeqCst),
+            1,
+            "half-close is on by default"
+        );
+
+        // 关闭后：HTTP 请求体自带结束标记，不需要 EOF 信令，
+        // 上游写侧必须留给 keep-alive / 流水线复用
+        let mut adapter = client
+            .bypass_adapter(StreamCopyConfig::default(), idle_check())
+            .await
+            .unwrap();
+        adapter.set_upstream_half_close(false);
+        let mut clt_r = Cursor::new(body.clone());
+        let (mut ups_w, shutdowns) = CollectingWriter::new_counting_pair();
+        let mut state = new_run_state();
+        let _ = adapter
+            .audit_and_forward(&mut state, test_framing(), &mut clt_r, &mut ups_w)
+            .await;
+        assert_eq!(
+            shutdowns.load(Ordering::SeqCst),
+            0,
+            "explicitly disabled half-close must not shut the upstream write side down"
+        );
     }
 
     #[tokio::test]
