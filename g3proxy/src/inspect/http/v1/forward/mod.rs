@@ -13,21 +13,17 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::anyhow;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures_util::FutureExt;
 use http::header;
-use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite};
 use tokio::time::Instant;
 
 use g3_http::client::HttpTransparentResponse;
 use g3_http::server::HttpTransparentRequest;
 use g3_http::{HttpBodyReader, HttpBodyType};
-use g3_icap_client::reqmod::h1::{
-    HttpAdapterErrorResponse, HttpRequestAdapter, ReqmodAdaptationEndState,
-    ReqmodAdaptationRunState, ReqmodRecvHttpResponseBody,
-};
+use g3_icap_client::reqmod::bypass::{BypassAdapter, BypassFraming, BypassRunState, new_run_state};
 use g3_icap_client::reqmod::{ConnectionProtocol, ConnectionTuple, IcapReqmodClient};
 use g3_icap_client::respmod::h1::{
     HttpResponseAdapter, RespmodAdaptationEndState, RespmodAdaptationRunState,
@@ -41,10 +37,8 @@ use super::{HttpRequest, HttpRequestIo, HttpResponseIo};
 use crate::config::server::ServerConfig;
 use crate::inspect::StreamInspectContext;
 use crate::module::http_forward::HttpProxyClientResponse;
+use crate::serve::audit_bridge::log_bypass_audit_end;
 use crate::serve::{ServerIdleChecker, ServerTaskError, ServerTaskResult};
-
-mod adaptation;
-pub(crate) use adaptation::HttpRequestWriterForAdaptation;
 
 // 转发任务审计日志宏：附带方法、URI、Host、各阶段状态码与耗时。
 macro_rules! intercept_log {
@@ -227,11 +221,12 @@ impl<'a, SC: ServerConfig> H1ForwardTask<'a, SC> {
         }
     }
 
-    /// 经 ICAP reqmod 送检并转发带请求体的请求。
-    /// 流程：创建 adapter（注入客户端地址、用户名、连接五元组、TLS keylog）→
-    /// 运行送检 → 用适配器的实测耗时回填审计字段；客户端数据未读完或上游
-    /// 未写全时强制关闭连接（残留字节会破坏流水线上的下一个请求）。
-    /// adapter 创建失败且配置了 bypass 时降级为普通转发。
+    /// 经 ICAP 旁路审计转发带请求体的请求。
+    /// 流程：取并发名额 → 创建旁路适配器（注入客户端地址、用户名、连接五元组、
+    /// TLS keylog）→ 边转发请求体边旁路上报 → 用管线的实测耗时回填审计字段；
+    /// 客户端数据未读完或上游未写全时强制关闭连接（残留字节会破坏流水线上的下一个请求）。
+    /// 无请求体的请求完全不送检；名额用尽或 ICAP 连接建立失败都只跳过审计，
+    /// 转发照常（fail-open）。
     pub(super) async fn adapt_with_io<CR, CW, UR, UW>(
         &mut self,
         req_io: &mut HttpRequestIo<CR>,
@@ -243,55 +238,72 @@ impl<'a, SC: ServerConfig> H1ForwardTask<'a, SC> {
         UR: AsyncRead + Unpin,
         UW: AsyncWrite + Send + Unpin,
     {
-        let adapter = match reqmod_client
-            .h1_adapter(
+        // 旁路审计只针对有请求体的请求：无体请求直接普通转发
+        let Some(body_type) = self.req.body_type() else {
+            self.forward_with_io(req_io, rsp_io).await;
+            return;
+        };
+
+        // 名额用尽：跳过审计，绝不排队等待
+        let Some(_permit) = self.ctx.audit_handle.try_upload_audit_permit() else {
+            self.ctx.audit_handle.mark_upload_audit_skipped();
+            self.forward_with_io(req_io, rsp_io).await;
+            return;
+        };
+
+        let mut adapter = match reqmod_client
+            .bypass_adapter(
                 self.ctx.server_config.limited_copy_config(),
-                self.ctx.h1_interception().body_line_max_len,
-                true,
                 self.ctx.idle_checker(),
             )
             .await
         {
-            Ok(mut adapter) => {
-                adapter.set_client_addr(self.ctx.task_notes.client_addr);
-                if let Some(username) = self.ctx.raw_user_name() {
-                    adapter.set_client_username(username.clone());
-                }
-                /* added by wming for repid audit */
-                // 注入真实连接五元组，便于 ICAP 服务端按会话做审计/改写决策
-                let tuple = ConnectionTuple {
-                    server_addr: self.ctx.connect_notes.client_addr,
-                    remote_addr: self.ctx.connect_notes.server_addr,
-                    protocol: ConnectionProtocol::Tcp,
-                };
-                adapter.set_connection_tuple(tuple);
-                if let Some(ref keylog) = self.keylog_buffer {
-                    adapter.set_keylog_buffer(keylog.clone());
-                }
-
-                adapter
-            }
+            Ok(adapter) => adapter,
             Err(e) => {
-                if reqmod_client.bypass() {
-                    self.forward_with_io(req_io, rsp_io).await;
-                } else {
-                    let e = ServerTaskError::InternalAdapterError(e);
-                    self.reply_task_err(&e, &mut rsp_io.clt_w).await;
-                    intercept_log!(self, "{e:?}");
-                }
+                // ICAP 侧连不上：审计让位给正常转发
+                log::warn!("bypass ICAP adapter creation failed, forward without audit: {e}");
+                self.forward_with_io(req_io, rsp_io).await;
                 return;
             }
         };
+        adapter.set_client_addr(self.ctx.task_notes.client_addr);
+        if let Some(username) = self.ctx.raw_user_name() {
+            adapter.set_client_username(username.clone());
+        }
+        /* added by wming for repid audit */
+        // 注入真实连接五元组，便于审计侧按会话还原收发两端
+        let tuple = ConnectionTuple {
+            server_addr: self.ctx.connect_notes.client_addr,
+            remote_addr: self.ctx.connect_notes.server_addr,
+            protocol: ConnectionProtocol::Tcp,
+        };
+        adapter.set_connection_tuple(tuple);
+        if let Some(ref keylog) = self.keylog_buffer {
+            adapter.set_keylog_buffer(keylog.clone());
+        }
+        // HTTP 请求体成帧自带结束标记，不靠 EOF 信令；这条上游连接还要留给
+        // 同一拦截会话（keep-alive / 流水线）的下一个请求，不能半关闭
+        adapter.set_upstream_half_close(false);
 
-        let mut adaptation_state = ReqmodAdaptationRunState::new(self.http_notes.receive_ins);
+        // 封装区请求头用面向源站的透明序列化形式，与发给上游的字节一致
+        let framing = BypassFraming {
+            req_hdr: self.req.serialize_for_adapter(),
+            transformed_from: "HTTP/1.0",
+        };
+
+        let mut adaptation_state = new_run_state();
         let r = self
-            .run_with_adaptation(req_io, rsp_io, adapter, &mut adaptation_state)
+            .run_with_adaptation(
+                req_io,
+                rsp_io,
+                adapter,
+                framing,
+                body_type,
+                &mut adaptation_state,
+            )
             .await;
 
-        // 送检路径下请求头/体的实际发送耗时由适配器统计，回填到审计快照
-        if let Some(dur) = adaptation_state.dur_ups_send_header {
-            self.http_notes.dur_req_send_hdr = dur;
-        }
+        // 送检路径下请求体的实际发送耗时由旁路管线统计，回填到审计快照
         if let Some(dur) = adaptation_state.dur_ups_send_all {
             self.http_notes.dur_req_send_all = dur;
         }
@@ -342,18 +354,19 @@ impl<'a, SC: ServerConfig> H1ForwardTask<'a, SC> {
         }
     }
 
-    /// ICAP reqmod 送检的核心循环：并发执行"适配器搬运请求（客户端→ICAP→上游）"
+    /// 旁路审计转发的核心循环：并发执行"请求体双写（客户端→上游、客户端→ICAP）"
     /// 与"探测上游响应"两路任务。
-    /// 上游提前返回响应（常见于鉴权 401 或请求被拒）时：临时响应（100/103）直接
-    /// 透传后继续等待；最终响应到达则提前 break——此时请求体可能未搬完，
-    /// 之后据 clt_read_finished/ups_write_finished 决定是否断连。
-    /// 适配器若返回错误响应（阻断），则直接把它回给客户端并结束。
+    /// 请求头先按普通转发的方式发给上游；上游提前返回响应（常见于鉴权 401 或请求被拒）
+    /// 时：临时响应（100/103）直接透传后继续等待，最终响应到达则提前 break——
+    /// 此时请求体可能未搬完，之后据 clt_read_finished/ups_write_finished 决定是否断连。
     async fn run_with_adaptation<CR, CW, UR, UW>(
         &mut self,
         req_io: &mut HttpRequestIo<CR>,
         rsp_io: &mut HttpResponseIo<CW, UR, UW>,
-        icap_adapter: HttpRequestAdapter<ServerIdleChecker>,
-        adaptation_state: &mut ReqmodAdaptationRunState,
+        bypass: BypassAdapter<ServerIdleChecker>,
+        framing: BypassFraming,
+        body_type: HttpBodyType,
+        adaptation_state: &mut BypassRunState,
     ) -> ServerTaskResult<()>
     where
         CR: AsyncRead + Send + Unpin,
@@ -361,15 +374,23 @@ impl<'a, SC: ServerConfig> H1ForwardTask<'a, SC> {
         UR: AsyncRead + Unpin,
         UW: AsyncWrite + Send + Unpin,
     {
-        let mut ups_w_adaptation = HttpRequestWriterForAdaptation {
-            inner: &mut rsp_io.ups_w,
-        };
-        let mut adaptation_fut = icap_adapter
-            .xfer(
+        self.send_request_header(&mut rsp_io.ups_w).await?;
+
+        // 请求体读端沿用普通转发路径的 HttpBodyReader：它保留客户端的原始成帧
+        // （chunked 的分块行原样输出、定长按 Content-Length 取满），
+        // 因此双写到上游的字节在任意上游连接上都是合法的 HTTP 报文
+        let mut clt_body_reader = HttpBodyReader::new(
+            &mut req_io.clt_r,
+            body_type,
+            self.ctx.h1_interception().body_line_max_len,
+        );
+
+        let mut adaptation_fut = bypass
+            .audit_and_forward(
                 adaptation_state,
-                self.req,
-                Some(&mut req_io.clt_r),
-                &mut ups_w_adaptation,
+                framing,
+                &mut clt_body_reader,
+                &mut rsp_io.ups_w,
             )
             .boxed();
 
@@ -399,20 +420,10 @@ impl<'a, SC: ServerConfig> H1ForwardTask<'a, SC> {
                     }
                 }
                 r = &mut adaptation_fut => {
-                    match r {
-                        Ok(ReqmodAdaptationEndState::OriginalTransferred) => {
-                            // 请求原样搬运完毕，等待上游最终响应
-                            break;
-                        }
-                        Ok(ReqmodAdaptationEndState::AdaptedTransferred(_r)) => {
-                            // TODO add log for adapted request?
-                            break;
-                        }
-                        Ok(ReqmodAdaptationEndState::HttpErrResponse(rsp, rsp_recv_body)) => {
-                            return self.send_adaptation_error_response(&mut rsp_io.clt_w, rsp, rsp_recv_body).await;
-                        }
-                        Err(e) => return Err(e.into()),
-                    }
+                    // 旁路审计只汇报"转发到了哪一步"，任何结局都不改变本次转发的结果；
+                    // 判决的读取与连接回收都在管线的后台任务里完成
+                    log_bypass_audit_end(r);
+                    break;
                 }
             }
         }
@@ -447,59 +458,11 @@ impl<'a, SC: ServerConfig> H1ForwardTask<'a, SC> {
         };
 
         self.send_response(
-            rsp_head.0,
-            rsp_head.1,
-            rsp_io,
-            // 把 reqmod 阶段 ICAP 附加的共享响应头带入 respmod 送检
-            adaptation_state.take_respond_shared_headers(),
+            rsp_head.0, rsp_head.1, rsp_io,
+            // reqmod 侧是旁路审计，判决在后台读取，这里没有可带入 respmod 的共享头
+            None,
         )
         .await?;
-
-        Ok(())
-    }
-
-    /// 把 ICAP 适配器返回的错误响应（阻断页）透传给客户端。
-    /// 响应头写出后禁止再发代理层错误响应；错误响应体若存在则流式拷贝后
-    /// 归还 ICAP 连接到连接池。整个连接此后必须关闭。
-    async fn send_adaptation_error_response<W>(
-        &mut self,
-        clt_w: &mut W,
-        rsp: HttpAdapterErrorResponse,
-        rsp_recv_body: Option<ReqmodRecvHttpResponseBody>,
-    ) -> ServerTaskResult<()>
-    where
-        W: AsyncWrite + Unpin,
-    {
-        self.should_close = true;
-
-        let buf = rsp.serialize(self.should_close);
-        self.send_error_response = false;
-        clt_w
-            .write_all(buf.as_ref())
-            .await
-            .map_err(ServerTaskError::ClientTcpWriteFailed)?;
-        self.http_notes.rsp_status = rsp.status.as_u16();
-
-        if let Some(mut recv_body) = rsp_recv_body {
-            let mut body_reader = recv_body.body_reader();
-            let copy_to_clt = StreamCopy::new(
-                &mut body_reader,
-                clt_w,
-                &self.ctx.server_config.limited_copy_config(),
-            );
-            copy_to_clt.await.map_err(|e| match e {
-                StreamCopyError::ReadFailed(e) => ServerTaskError::InternalAdapterError(anyhow!(
-                    "read http error response from adapter failed: {e:?}"
-                )),
-                StreamCopyError::WriteFailed(e) => ServerTaskError::ClientTcpWriteFailed(e),
-            })?;
-            recv_body.save_connection().await;
-        } else {
-            clt_w
-                .flush()
-                .await
-                .map_err(ServerTaskError::ClientTcpWriteFailed)?;
-        }
 
         Ok(())
     }

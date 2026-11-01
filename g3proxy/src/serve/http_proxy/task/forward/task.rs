@@ -15,9 +15,7 @@ use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, AsyncWriteExt};
 use g3_http::client::HttpForwardRemoteResponse;
 use g3_http::server::HttpProxyClientRequest;
 use g3_http::{HttpBodyReader, HttpBodyType};
-use g3_icap_client::reqmod::bypass::{
-    BypassAdapter, BypassEndState, BypassFraming, BypassRunState,
-};
+use g3_icap_client::reqmod::bypass::{BypassAdapter, BypassFraming, BypassRunState};
 use g3_icap_client::respmod::h1::{
     HttpResponseAdapter, RespmodAdaptationEndState, RespmodAdaptationRunState,
 };
@@ -45,6 +43,7 @@ use crate::module::http_header;
 use crate::module::tcp_connect::{
     TcpConnectError, TcpConnectTaskConf, TcpConnectTaskNotes, TlsConnectTaskConf,
 };
+use crate::serve::audit_bridge::log_bypass_audit_end;
 use crate::serve::http_proxy::HttpForwardTaskAliveGuard;
 use crate::serve::{
     ServerIdleChecker, ServerStats, ServerTaskError, ServerTaskForbiddenError, ServerTaskNotes,
@@ -981,43 +980,6 @@ impl<'a> HttpProxyForwardTask<'a> {
         Some((adapter, permit, framing))
     }
 
-    /// 把旁路审计的结束态折算成已审计字节数，并按实际结局落日志。
-    /// 任何结局都只影响可观测性，不改变本次转发的结果 —— 审计是 fail-open 的。
-    fn log_bypass_audit_end(end: BypassEndState) -> u64 {
-        match end {
-            BypassEndState::OriginalTransferred {
-                icap_status_code,
-                icap_reason,
-                bytes,
-            } => {
-                log::debug!(
-                    "bypass upload audit done: icap {icap_status_code} {icap_reason}, bytes {bytes}"
-                );
-                bytes
-            }
-            BypassEndState::OriginalTransferredAfterFallback { bytes, icap_error } => {
-                log::warn!(
-                    "bypass upload audit fell back to forward-only: {icap_error}, bytes {bytes}"
-                );
-                bytes
-            }
-            BypassEndState::OriginalTransferredInBackground { bytes } => {
-                log::debug!("bypass upload audit verdict left in background: bytes {bytes}");
-                bytes
-            }
-            BypassEndState::AuditOnly {
-                icap_status_code,
-                icap_reason,
-                bytes,
-            } => {
-                log::debug!(
-                    "bypass upload audit-only done: icap {icap_status_code} {icap_reason}, bytes {bytes}"
-                );
-                bytes
-            }
-        }
-    }
-
     /// 等待上游响应头的超时：用户级配置优先，否则服务器级配置。
     fn rsp_hdr_recv_timeout(&self) -> Duration {
         self.task_notes
@@ -1124,7 +1086,7 @@ impl<'a> HttpProxyForwardTask<'a> {
                 r = &mut adaptation_fut => {
                     // 旁路审计只汇报"转发到了哪一步"，任何结局都不改变本次请求的转发结果；
                     // 审计字节数计入任务统计，ICAP 侧异常只记日志
-                    self.task_stats.add_upload_audit_bytes(Self::log_bypass_audit_end(r));
+                    self.task_stats.add_upload_audit_bytes(log_bypass_audit_end(r));
                     break;
                 }
                 _ = log_interval.tick() => {

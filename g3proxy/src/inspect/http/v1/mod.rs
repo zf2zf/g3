@@ -313,7 +313,8 @@ where
                         if use_icap {
                             if let Some(reqmod_client) = self.ctx.audit_handle.icap_reqmod_client()
                             {
-                                // 请求体流经 ICAP reqmod 改写后再转发
+                                // 请求体在转发的同时旁路送 ICAP 审计（不改写、不阻断）；
+                                // 无请求体或审计名额用尽时降级为普通转发
                                 forward_task
                                     .adapt_with_io(&mut req_io, &mut rsp_io, reqmod_client)
                                     .await;

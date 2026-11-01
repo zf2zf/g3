@@ -39,7 +39,7 @@ use log::warn;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinHandle;
 
-use g3_icap_client::reqmod::bypass::{new_run_state, BypassEndState, BypassFraming};
+use g3_icap_client::reqmod::bypass::{BypassEndState, BypassFraming, new_run_state};
 use g3_io_ext::{IdleCheck, IdleInterval, IdleWheel, StreamCopyConfig};
 use g3_types::net::TlsKeyLogBuffer;
 
@@ -345,6 +345,43 @@ where
     Some(total)
 }
 
+/// 把旁路审计的结束态折算成已审计字节数，并按实际结局落日志。
+/// 任何结局都只影响可观测性，不改变本次转发的结果 —— 审计是 fail-open 的。
+pub(crate) fn log_bypass_audit_end(end: BypassEndState) -> u64 {
+    match end {
+        BypassEndState::OriginalTransferred {
+            icap_status_code,
+            icap_reason,
+            bytes,
+        } => {
+            log::debug!(
+                "bypass upload audit done: icap {icap_status_code} {icap_reason}, bytes {bytes}"
+            );
+            bytes
+        }
+        BypassEndState::OriginalTransferredAfterFallback { bytes, icap_error } => {
+            log::warn!(
+                "bypass upload audit fell back to forward-only: {icap_error}, bytes {bytes}"
+            );
+            bytes
+        }
+        BypassEndState::OriginalTransferredInBackground { bytes } => {
+            log::debug!("bypass upload audit verdict left in background: bytes {bytes}");
+            bytes
+        }
+        BypassEndState::AuditOnly {
+            icap_status_code,
+            icap_reason,
+            bytes,
+        } => {
+            log::debug!(
+                "bypass upload audit-only done: icap {icap_status_code} {icap_reason}, bytes {bytes}"
+            );
+            bytes
+        }
+    }
+}
+
 /// 审计 + 转发的核心路径：把上传流的字节同时交给 ICAP 适配器和上游连接。
 /// 适配器创建失败时退化为纯转发，保证上传不受审计链路故障影响。
 async fn audit_and_forward<CR, UW>(
@@ -405,14 +442,8 @@ where
 
     // 各类结束状态都返回已转发的字节数，由上层统一收尾；
     // 是否被 ICAP 判定为“阻断”由适配器内部处理，此处不再干预上传结果。
-    match end_state {
-        BypassEndState::OriginalTransferred { bytes, .. }
-        | BypassEndState::OriginalTransferredAfterFallback { bytes, .. }
-        | BypassEndState::OriginalTransferredInBackground { bytes }
-        | BypassEndState::AuditOnly { bytes, .. } => {
-            let _ = ups_w.flush().await;
-            let _ = ups_w.shutdown().await;
-            Some(bytes)
-        }
-    }
+    let bytes = log_bypass_audit_end(end_state);
+    let _ = ups_w.flush().await;
+    let _ = ups_w.shutdown().await;
+    Some(bytes)
 }

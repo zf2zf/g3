@@ -196,10 +196,13 @@ where
                             req.disable_keep_alive();
                         }
 
-                        // 决定是否移交读端：需要 ICAP 送检或请求不适合流水线
-                        // （带体/非幂等/Upgrade）时移交；否则本任务继续解析下一个请求，
-                        // 实现真正的流水线并行读取
-                        let recv_req = if self.ctx.audit_handle.icap_reqmod_client().is_some() {
+                        // 决定是否移交读端：需要旁路上传审计（配置了 reqmod 且请求带体）
+                        // 或请求不适合流水线（带体/非幂等/Upgrade）时移交；否则本任务继续解析
+                        // 下一个请求，实现真正的流水线并行读取。
+                        // 无请求体的请求不送 ICAP，因此不必为了审计移交读端。
+                        let recv_req = if self.ctx.audit_handle.icap_reqmod_client().is_some()
+                            && req.body_type().is_some()
+                        {
                             HttpRecvRequest::RequestWithIO(
                                 HttpRequest {
                                     inner: req,
