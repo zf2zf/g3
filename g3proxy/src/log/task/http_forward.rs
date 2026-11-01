@@ -26,6 +26,12 @@ pub(crate) struct TaskLogForHttpForward<'a> {
     pub(crate) client_wr_bytes: u64,
     pub(crate) remote_rd_bytes: u64,
     pub(crate) remote_wr_bytes: u64,
+    /// 上传审计因并发名额用尽被跳过
+    pub(crate) upload_audit_skipped: bool,
+    /// 本审计器累计因名额用尽被跳过的次数（判断 ICAP 并发上限是否长期不足）
+    pub(crate) upload_audit_skipped_total: u64,
+    /// 旁路审计上报的请求体字节数
+    pub(crate) upload_audit_bytes: u64,
 }
 
 impl TaskLogForHttpForward<'_> {
@@ -130,6 +136,9 @@ impl TaskLogForHttpForward<'_> {
             "c_wr_bytes" => self.client_wr_bytes,
             "r_rd_bytes" => self.remote_rd_bytes,
             "r_wr_bytes" => self.remote_wr_bytes,
+            "upload_audit_skipped" => self.upload_audit_skipped,
+            "upload_audit_skipped_total" => self.upload_audit_skipped_total,
+            "upload_audit_bytes" => self.upload_audit_bytes,
         )
     }
 
@@ -176,6 +185,9 @@ impl TaskLogForHttpForward<'_> {
             "c_wr_bytes" => self.client_wr_bytes,
             "r_rd_bytes" => self.remote_rd_bytes,
             "r_wr_bytes" => self.remote_wr_bytes,
+            "upload_audit_skipped" => self.upload_audit_skipped,
+            "upload_audit_skipped_total" => self.upload_audit_skipped_total,
+            "upload_audit_bytes" => self.upload_audit_bytes,
         )
     }
 }

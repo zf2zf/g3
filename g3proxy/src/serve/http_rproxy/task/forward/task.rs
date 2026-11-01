@@ -213,6 +213,10 @@ impl<'a> HttpRProxyForwardTask<'a> {
             client_wr_bytes: self.task_stats.clt.write.get_bytes(),
             remote_rd_bytes: self.task_stats.ups.read.get_bytes(),
             remote_wr_bytes: self.task_stats.ups.write.get_bytes(),
+            // 反向代理路径不接入 ICAP 上传审计
+            upload_audit_skipped: false,
+            upload_audit_skipped_total: 0,
+            upload_audit_bytes: 0,
         })
     }
 

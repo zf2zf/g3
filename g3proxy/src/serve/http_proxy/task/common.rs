@@ -11,7 +11,6 @@ use slog::Logger;
 use tokio::time::Instant;
 
 use g3_daemon::server::ClientConnectionInfo;
-use g3_icap_client::reqmod::h1::HttpAdapterErrorResponse;
 use g3_io_ext::{IdleWheel, OptionalInterval};
 use g3_types::acl::AclAction;
 use g3_types::acl_set::AclDstHostRuleSet;
@@ -126,39 +125,6 @@ impl CommonTaskContext {
 
             if let Some(addr) = tcp_notes.chained.outgoing_addr {
                 rsp.set_outgoing_ip(addr.ip());
-            }
-        }
-    }
-
-    /// 与 set_custom_header_for_local_reply 相同的信息，但写入 ICAP 适配错误回复的头部
-    pub(crate) fn set_custom_header_for_adaptation_error_reply(
-        &self,
-        tcp_notes: &TcpConnectTaskNotes,
-        rsp: &mut HttpAdapterErrorResponse,
-    ) {
-        if let Some(server_id) = &self.server_config.server_id {
-            // 直接把链路信息写入 ICAP 错误回复的 header 集合
-            http_header::set_remote_connection_info(
-                &mut rsp.headers,
-                server_id,
-                tcp_notes.bind.ip(),
-                tcp_notes.local,
-                tcp_notes.next,
-                &tcp_notes.expire,
-            );
-
-            if let Some(egress_info) = &tcp_notes.egress {
-                http_header::set_dynamic_egress_info(&mut rsp.headers, server_id, egress_info);
-            }
-        }
-
-        if self.server_config.echo_chained_info {
-            if let Some(addr) = tcp_notes.chained.target_addr {
-                http_header::set_upstream_addr(&mut rsp.headers, addr);
-            }
-
-            if let Some(addr) = tcp_notes.chained.outgoing_addr {
-                http_header::set_outgoing_ip(&mut rsp.headers, addr);
             }
         }
     }

@@ -161,9 +161,7 @@ impl<I: IdleCheck> BypassAdapter<I> {
         BypassAdapter {
             icap_client,
             icap_connection,
-            icap_options: Arc::new(IcapServiceOptions::new_expired(
-                crate::IcapMethod::Reqmod,
-            )),
+            icap_options: Arc::new(IcapServiceOptions::new_expired(crate::IcapMethod::Reqmod)),
             copy_config,
             idle_checker,
             client_addr: None,
@@ -263,14 +261,14 @@ impl<I: IdleCheck> BypassAdapter<I> {
     /// 内存模型：读-复制-写循环全程复用一块固定缓冲，堆占用与数据量无关。
     pub async fn audit_and_forward<CR, UW>(
         mut self,
-        state: &mut ReqmodAdaptationRunState,
+        state: &mut BypassRunState,
         framing: BypassFraming,
         clt_r: &mut CR,
         ups_w: &mut UW,
     ) -> BypassEndState
     where
-        CR: AsyncRead + Send + Sync + Unpin,
-        UW: AsyncWrite + Send + Sync + Unpin,
+        CR: AsyncRead + Send + Unpin,
+        UW: AsyncWrite + Send + Unpin,
     {
         // 第一步：发送 ICAP 请求头 + 封装区请求头。
         // 若这里就失败（连接已死），ICAP 完全无法参与——直接退化为
@@ -301,6 +299,7 @@ impl<I: IdleCheck> BypassAdapter<I> {
         // 客户端 EOF：把上游已缓冲的数据冲出去并关闭写侧，上传至此完成。
         let _ = ups_w.flush().await;
         let _ = ups_w.shutdown().await;
+        state.mark_ups_send_all();
 
         // icap_ok=false 表示中继期间 ICAP 写通道已断开/被慢速背压掐掉：
         // 回收后台任务（拿回连接资源）后如实汇报"转发成功、审计失败"。
@@ -452,8 +451,8 @@ impl<I: IdleCheck> BypassAdapter<I> {
         u64,
     >
     where
-        CR: AsyncRead + Send + Sync + Unpin,
-        UW: AsyncWrite + Send + Sync + Unpin,
+        CR: AsyncRead + Send + Unpin,
+        UW: AsyncWrite + Send + Unpin,
     {
         // Use a 256 KiB buffer to cut the number of syscalls for large
         // files (1 GiB would otherwise need 65536 x 16 KiB copies).
@@ -693,12 +692,12 @@ impl<I: IdleCheck> BypassAdapter<I> {
     /// （没有"不能阻断上传"的转发路径可兜底，失败时同样只汇报不抛错）。
     pub async fn audit_only<CR>(
         mut self,
-        state: &mut ReqmodAdaptationRunState,
+        state: &mut BypassRunState,
         framing: BypassFraming,
         clt_r: &mut CR,
     ) -> BypassEndState
     where
-        CR: AsyncRead + Send + Sync + Unpin,
+        CR: AsyncRead + Send + Unpin,
     {
         let total_bytes;
         if let Err(e) = self.send_icap_header(&framing).await {
@@ -855,12 +854,12 @@ impl<I: IdleCheck> BypassAdapter<I> {
         self,
         clt_r: &mut CR,
         ups_w: &mut UW,
-        state: &mut ReqmodAdaptationRunState,
+        state: &mut BypassRunState,
         first_err: io::Error,
     ) -> BypassEndState
     where
-        CR: AsyncRead + Send + Sync + Unpin,
-        UW: AsyncWrite + Send + Sync + Unpin,
+        CR: AsyncRead + Send + Unpin,
+        UW: AsyncWrite + Send + Unpin,
     {
         // The ICAP connection is effectively dead - just drop it.
         // ICAP 连接已不可信：drop 即关闭 TCP，不回收进连接池
@@ -893,6 +892,7 @@ impl<I: IdleCheck> BypassAdapter<I> {
 
         let _ = ups_w.flush().await;
         state.clt_read_finished = true;
+        state.mark_ups_send_all();
 
         // 无论转发是否完整，都如实带上字节数与首个 ICAP 错误，
         // 由调用方决定如何向客户端汇报结果
@@ -968,6 +968,12 @@ async fn write_icap_chunk<W: AsyncWrite + Unpin>(
     writer.write_all(buf).await
 }
 
+/// 旁路管线一轮上报的运行状态类型。
+///
+/// 直接复用 REQMOD 邮件侧那份通用运行状态（只记录收发是否结束与各阶段耗时，
+/// 不含任何邮件语义），协议调用方在管线结束后读取这些字段回填自己的任务日志。
+pub type BypassRunState = ReqmodAdaptationRunState;
+
 /// A cheap builder/helper for creating a [`ReqmodAdaptationRunState`]
 /// in bypass callers that don't have a mail module state tracker.
 /// 便捷构造：调用方没有邮件模块那套状态跟踪器时，用这个直接建一个
@@ -1041,10 +1047,7 @@ mod tests {
     impl CollectingWriter {
         fn new_pair() -> (Self, Arc<std::sync::Mutex<Vec<u8>>>) {
             let sink = Arc::new(std::sync::Mutex::new(Vec::new()));
-            (
-                CollectingWriter(Arc::clone(&sink)),
-                sink,
-            )
+            (CollectingWriter(Arc::clone(&sink)), sink)
         }
     }
 
@@ -1086,7 +1089,11 @@ mod tests {
         }
     }
 
-    async fn serve_conn(mut stream: TcpStream, scenario: Scenario, saw_terminator: Arc<AtomicBool>) {
+    async fn serve_conn(
+        mut stream: TcpStream,
+        scenario: Scenario,
+        saw_terminator: Arc<AtomicBool>,
+    ) {
         loop {
             let head = match read_icap_head(&mut stream).await {
                 Some(h) => h,
@@ -1141,7 +1148,9 @@ mod tests {
         }
     }
 
-    async fn start_mock(scenario: Scenario) -> (SocketAddr, Arc<AtomicBool>, tokio::task::JoinHandle<()>) {
+    async fn start_mock(
+        scenario: Scenario,
+    ) -> (SocketAddr, Arc<AtomicBool>, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let saw_terminator = Arc::new(AtomicBool::new(false));
@@ -1227,7 +1236,36 @@ mod tests {
         }
         assert_eq!(ups_sink.lock().unwrap().len(), body.len());
         assert!(state.clt_read_finished);
-        assert!(poll_flag(&terminator, Duration::from_secs(3)).await, "server must observe chunk terminator");
+        assert!(
+            poll_flag(&terminator, Duration::from_secs(3)).await,
+            "server must observe chunk terminator"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_state_marks_upstream_send_complete() {
+        let (addr, _terminator, _mock) = start_mock(Scenario::Normal204).await;
+        let client = reqmod_client_to(addr).await;
+        let adapter = client
+            .bypass_adapter(StreamCopyConfig::default(), idle_check())
+            .await
+            .unwrap();
+
+        let body = test_body(16 * 1024);
+        let mut clt_r = Cursor::new(body.clone());
+        let (mut ups_w, _ups_sink) = CollectingWriter::new_pair();
+        let mut state = new_run_state();
+
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            adapter.audit_and_forward(&mut state, test_framing(), &mut clt_r, &mut ups_w),
+        )
+        .await
+        .expect("no deadlock");
+
+        // 调用方靠这两个字段回填"请求体整体发送耗时"等任务日志指标
+        assert!(state.ups_write_finished);
+        assert!(state.dur_ups_send_all.is_some());
     }
 
     #[tokio::test]
@@ -1247,7 +1285,10 @@ mod tests {
         let end = adapter
             .audit_and_forward(&mut state, test_framing(), &mut clt_r, &mut ups_w)
             .await;
-        assert!(matches!(end, BypassEndState::OriginalTransferredInBackground { .. }));
+        assert!(matches!(
+            end,
+            BypassEndState::OriginalTransferredInBackground { .. }
+        ));
         assert_eq!(ups_sink.lock().unwrap().len(), body.len());
         // Cursor 读完即 EOF：管线仍须把 0\r\n\r\n 终止标记写给 ICAP
         assert!(poll_flag(&terminator, Duration::from_secs(3)).await);
@@ -1303,8 +1344,14 @@ mod tests {
             .audit_and_forward(&mut state, test_framing(), &mut clt_r, &mut ups_w)
             .await;
         let elapsed = t0.elapsed();
-        assert!(matches!(end, BypassEndState::OriginalTransferredInBackground { .. }));
-        assert!(elapsed < Duration::from_millis(800), "2s verdict must not block the transfer, got {elapsed:?}");
+        assert!(matches!(
+            end,
+            BypassEndState::OriginalTransferredInBackground { .. }
+        ));
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "2s verdict must not block the transfer, got {elapsed:?}"
+        );
         assert_eq!(ups_sink.lock().unwrap().len(), body.len());
 
         // 判决在后台完成并回收连接后，同一客户端应能立即取到复用连接。
@@ -1324,7 +1371,10 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
-        assert!(reused, "background verdict should reclaim the ICAP connection into the pool");
+        assert!(
+            reused,
+            "background verdict should reclaim the ICAP connection into the pool"
+        );
     }
 
     #[tokio::test]
@@ -1334,13 +1384,23 @@ mod tests {
         // 端口 1 连不上，绕过 fetch_connection 手工组装 adapter（同模块可见私有字段）。
         struct BrokenWriter;
         impl AsyncWrite for BrokenWriter {
-            fn poll_write(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>, _: &[u8]) -> std::task::Poll<io::Result<usize>> {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                _: &[u8],
+            ) -> std::task::Poll<io::Result<usize>> {
                 std::task::Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)))
             }
-            fn poll_flush(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<io::Result<()>> {
                 std::task::Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)))
             }
-            fn poll_shutdown(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<io::Result<()>> {
                 std::task::Poll::Ready(Ok(()))
             }
         }
@@ -1396,8 +1456,13 @@ mod tests {
         let mut clt_r = Cursor::new(body.clone());
         let (mut ups_w, ups_sink) = CollectingWriter::new_pair();
         let mut state = new_run_state();
-        let end = adapter.audit_and_forward(&mut state, test_framing(), &mut clt_r, &mut ups_w).await;
-        assert!(matches!(end, BypassEndState::OriginalTransferredInBackground { .. }));
+        let end = adapter
+            .audit_and_forward(&mut state, test_framing(), &mut clt_r, &mut ups_w)
+            .await;
+        assert!(matches!(
+            end,
+            BypassEndState::OriginalTransferredInBackground { .. }
+        ));
         assert_eq!(ups_sink.lock().unwrap().len(), body.len());
     }
 
@@ -1413,9 +1478,15 @@ mod tests {
         let body = test_body(4096);
         let mut clt_r = Cursor::new(body.clone());
         let mut state = new_run_state();
-        let end = adapter.audit_only(&mut state, test_framing(), &mut clt_r).await;
+        let end = adapter
+            .audit_only(&mut state, test_framing(), &mut clt_r)
+            .await;
         match end {
-            BypassEndState::AuditOnly { icap_status_code, bytes, .. } => {
+            BypassEndState::AuditOnly {
+                icap_status_code,
+                bytes,
+                ..
+            } => {
                 assert_eq!(icap_status_code, 204);
                 assert_eq!(bytes, body.len() as u64);
             }
