@@ -186,3 +186,9 @@ diff /opt/zf/g3/conf/server.d/default.yaml{,.new}
   端口并写 `/run/g3`，若要降权请自行加 `User=`/`AmbientCapabilities=` 并验证。
 - `uninstall --purge` 会 `rm -rf` 整个安装前缀，配置全在里面，执行前确认没有唯一副本。
 - `install.sh` 只在目标机本地读写，不联网、不外发任何数据。
+
+## 9. 设计与跟踪
+
+- 设计（含方案取舍与遗留待决策项）：`docs/superpowers/specs/2026-11-02-g3-run-package-deploy-design.md`
+- 实施与验证清单（真实 Linux 目标机上待补的 V1–V7 在未勾选区）：
+  `docs/superpowers/plans/2026-11-02-g3-run-package-deploy.md`

@@ -1,5 +1,12 @@
 # HTTP ICAP 旁路上传审计 Implementation Plan
 
+> **执行状态（2026-11-02 回写）**：Task 1–10 全部完成，落在 `186f1e61..df2d6e66`（10 个提交，
+> 含最终评审修复 `df2d6e66`：客户端断流/空闲超时不再把未收尾的请求体上报为完整）。全分支新鲜视角
+> 评审已做过，Critical/Important 均已修复并有 RED→GREEN 测试。下方步骤勾选框是执行时未逐步回写，
+> 以 `git log` 与 `doc/http-icap-bypass-audit.md` 为准。一处计划步骤在本机不可执行：全 workspace
+> `cargo build/test`（macOS 上 c-ares-sys 缺系统库、`g3-journal` 用 Linux 独有 `memfd_*`），
+> 实际验证范围为 `cargo test -p g3-icap-client` 与 `cargo build|test -p g3proxy --features vendored-c-ares`。
+
 **Goal:** 把 FTP 的 fail-open ICAP 旁路审计语义推广到 HTTP/1 与 HTTP/2：下沉协议无关旁路管线与共享审计桥，并在三个 HTTP 接入点替换旧 REQMOD 拦截通路。
 
 **Architecture:** `g3-icap-client` 新增 `reqmod::bypass` 通用管线（FTP 逻辑平移，协议差异收敛为 `BypassFraming`）；`g3proxy` 层把 `serve/ftp_proxy/audit_bridge.rs` 泛化下沉为 `serve/audit_bridge.rs`；三个 HTTP 接入点（serve/http_proxy forward h1、inspect/http v1 forward、inspect/http v2 forward）改走旁路管线，并发许可与跳过计数挂在 `AuditHandle`。
