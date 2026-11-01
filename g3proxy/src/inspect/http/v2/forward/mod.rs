@@ -14,7 +14,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::anyhow;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use h2::client::SendRequest;
@@ -23,13 +22,11 @@ use h2::{Reason, RecvStream, StreamId};
 use http::{Method, Request, Response, StatusCode, Uri, Version};
 use tokio::time::Instant;
 
-use g3_h2::{H2StreamBodyTransferError, H2StreamFromChunkedTransferError, RequestExt};
-use g3_icap_client::reqmod::{ConnectionProtocol, ConnectionTuple};
-
-use g3_icap_client::reqmod::h2::{
-    H2RequestAdapter, HttpAdapterErrorResponse, ReqmodAdaptationEndState, ReqmodAdaptationRunState,
-    ReqmodRecvHttpResponseBody,
+use g3_h2::{
+    H2StreamBodyEnd, H2StreamBodyTransferError, H2StreamReader, H2StreamWriter, RequestExt,
 };
+use g3_icap_client::reqmod::bypass::{BypassAdapter, BypassFraming, BypassRunState, new_run_state};
+use g3_icap_client::reqmod::{ConnectionProtocol, ConnectionTuple, IcapReqmodClient};
 use g3_icap_client::respmod::h2::{
     H2ResponseAdapter, RespmodAdaptationEndState, RespmodAdaptationRunState,
 };
@@ -40,6 +37,7 @@ use super::{H2BodyTransfer, H2StreamTransferError};
 use crate::config::server::ServerConfig;
 use crate::inspect::StreamInspectContext;
 use crate::serve::ServerIdleChecker;
+use crate::serve::audit_bridge::log_bypass_audit_end;
 
 /// 以 "H2StreamForward" 为拦截类型输出单流转发的全生命周期日志，附带
 /// 方法/URI、两侧流 ID 与各阶段耗时。未配置检测日志器时不输出。
@@ -291,199 +289,220 @@ where
         self.send_error_response = true;
         let ups_req = Request::from_parts(parts, ());
 
-        // 配置了 ICAP 请求修改服务时进入适配分支；适配器启动失败按 bypass
-        // 配置决定报错终止还是退化为直通
+        // 配置了 ICAP 请求侧审计时走旁路管线：只送带请求体的流，且任何
+        // ICAP 侧失败都只降级审计、绝不阻断转发
         if let Some(reqmod) = self.ctx.audit_handle.icap_reqmod_client() {
-            match reqmod
-                .h2_adapter(
-                    self.ctx.server_config.limited_copy_config(),
-                    self.ctx.h1_interception().body_line_max_len,
-                    self.ctx.h2_interception().max_header_list_size as usize,
-                    self.ctx.h2_rsp_hdr_recv_timeout(),
-                    true,
-                    self.ctx.idle_checker(),
-                )
-                .await
-            {
-                Ok(mut adapter) => {
-                    let mut adaptation_state =
-                        ReqmodAdaptationRunState::new(self.http_notes.started_ins);
-                    adapter.set_client_addr(self.ctx.task_notes.client_addr);
-                    if let Some(username) = self.ctx.raw_user_name() {
-                        adapter.set_client_username(username.clone());
-                    }
+            let cfg = self.ctx.h1_interception();
 
-                    /* added by wming for repid audit */
-                    // 把客户端-代理连接四元组告知 ICAP，便于其审计日志关联 repid
-                    let tuple = ConnectionTuple {
-                        server_addr: self.ctx.connect_notes.client_addr,
-                        remote_addr: self.ctx.connect_notes.server_addr,
-                        protocol: ConnectionProtocol::Tcp,
+            // 无请求体的流（GET/HEAD 等）完全不碰 ICAP；req_hasbody 配置下，
+            // 小于既有阈值的请求体同样跳过（不引入新阈值）
+            let use_icap = !clt_body.is_end_stream()
+                && !(cfg.req_hasbody
+                    && content_length.is_some_and(|cl| cl < cfg.req_body_min_size as u64));
+
+            if use_icap {
+                // 并发名额用尽时不排队：本流退化为直通转发并计入跳过数。
+                // permit 持有到旁路转发结束，审计名额才与实际并发一致。
+                let permit = self.ctx.audit_handle.try_upload_audit_permit();
+                let bypass = if permit.is_some() {
+                    self.new_bypass_adapter(reqmod).await
+                } else {
+                    self.ctx.audit_handle.mark_upload_audit_skipped();
+                    None
+                };
+
+                if let Some(mut bypass) = bypass {
+                    // 请求体成帧自带结束标记，上游 h2 连接还要留给别的流复用，
+                    // 因此不能像 FTP 数据通道那样半关闭写侧
+                    bypass.set_upstream_half_close(false);
+
+                    let framing = BypassFraming {
+                        req_hdr: ups_req.serialize_for_adapter(),
+                        transformed_from: "HTTP/2.0",
                     };
-                    adapter.set_connection_tuple(tuple);
-
-                    // 附带 TLS 密钥日志，ICAP 可解密内层 TLS 流量做内容审计
-                    if let Some(ref keylog) = self.keylog_buffer {
-                        adapter.set_keylog_buffer(keylog.clone());
+                    let mut adaptation_state = new_run_state();
+                    let r = self
+                        .forward_with_adaptation(
+                            ups_send_req,
+                            ups_req,
+                            clt_body,
+                            clt_send_rsp,
+                            bypass,
+                            framing,
+                            &mut adaptation_state,
+                        )
+                        .await;
+                    // 管线记录了请求体全部送达的时刻，回填到本任务日志表
+                    if let Some(dur) = adaptation_state.dur_ups_send_all {
+                        self.http_notes.dur_req_send_all = dur;
                     }
-
-                    let cfg = self.ctx.h1_interception();
-
-                    let mut use_icap = true;
-
-                    // 按请求策略裁剪无须送检的请求：req_hasbody 时，空体或
-                    // 小于阈值的请求体直接跳过 ICAP，减少小请求的适配开销
-                    if cfg.req_hasbody {
-                        if clt_body.is_end_stream() {
-                            use_icap = false;
-                        } else if let Some(cl) = content_length
-                            && (cl < cfg.req_body_min_size as u64)
-                        {
-                            use_icap = false;
-                        }
-                    }
-
-                    if use_icap {
-                        let r = self
-                            .forward_with_adaptation(
-                                ups_send_req,
-                                ups_req,
-                                clt_body,
-                                clt_send_rsp,
-                                adapter,
-                                &mut adaptation_state,
-                            )
-                            .await;
-                        // 适配器内部记录了更精确的阶段耗时，回填到本任务日志表
-                        if let Some(dur) = adaptation_state.dur_ups_send_header {
-                            self.http_notes.dur_req_send_hdr = dur;
-                        }
-                        if let Some(dur) = adaptation_state.dur_ups_send_all {
-                            self.http_notes.dur_req_send_all = dur;
-                        }
-                        if let Some(dur) = adaptation_state.dur_ups_recv_header {
-                            self.http_notes.dur_rsp_recv_hdr = dur;
-                        }
-                        return r;
-                    }
-                }
-                Err(e) => {
-                    if !reqmod.bypass() {
-                        return Err(H2StreamTransferError::InternalAdapterError(e));
-                    }
+                    return r;
                 }
             }
         }
 
-        // 未配置 ICAP、被 bypass 或请求太小：直通转发
+        // 未配置 ICAP、请求不送检或审计器不可用：直通转发
         self.forward_without_adaptation(ups_send_req, ups_req, clt_body, clt_send_rsp)
             .await
     }
 
-    /// 经 ICAP reqmod 改编后完成整条流的转发：适配终态若是"原始/改编后请求
-    /// 已转发完成"则继续处理响应；若是适配器直接给出的错误响应则原样回客户端。
+    /// 占用一条 ICAP 连接构造旁路审计器，并把本流的审计上下文（客户端地址、
+    /// 用户名、连接四元组、TLS keylog）填进去。建连失败只降级为"不审计"，
+    /// 返回 None 由调用方走直通转发。
+    async fn new_bypass_adapter(
+        &self,
+        reqmod: &IcapReqmodClient,
+    ) -> Option<BypassAdapter<ServerIdleChecker>> {
+        let mut bypass = match reqmod
+            .bypass_adapter(
+                self.ctx.server_config.limited_copy_config(),
+                self.ctx.idle_checker(),
+            )
+            .await
+        {
+            Ok(bypass) => bypass,
+            Err(e) => {
+                log::warn!("bypass ICAP adapter creation failed, forward without audit: {e}");
+                return None;
+            }
+        };
+
+        bypass.set_client_addr(self.ctx.task_notes.client_addr);
+        if let Some(username) = self.ctx.raw_user_name() {
+            bypass.set_client_username(username.clone());
+        }
+
+        /* added by wming for repid audit */
+        // 把客户端-代理连接四元组告知 ICAP，便于其审计日志关联 repid
+        let tuple = ConnectionTuple {
+            server_addr: self.ctx.connect_notes.client_addr,
+            remote_addr: self.ctx.connect_notes.server_addr,
+            protocol: ConnectionProtocol::Tcp,
+        };
+        bypass.set_connection_tuple(tuple);
+
+        // 附带 TLS 密钥日志，ICAP 可解密内层 TLS 流量做内容审计
+        if let Some(ref keylog) = self.keylog_buffer {
+            bypass.set_keylog_buffer(keylog.clone());
+        }
+
+        Some(bypass)
+    }
+
+    /// 旁路审计转发：请求头先发往源站，请求体在转发的同时复制给 ICAP 审计，
+    /// 并与等待响应头并发进行——源站提前应答（如 413）时不必等请求体传完。
+    /// 审计的成败只影响日志，不改变转发结果。
     async fn forward_with_adaptation(
         &mut self,
-        ups_send_req: SendRequest<Bytes>,
+        mut ups_send_req: SendRequest<Bytes>,
         ups_req: Request<()>,
         clt_body: RecvStream,
         clt_send_rsp: &mut SendResponse<Bytes>,
-        icap_adapter: H2RequestAdapter<ServerIdleChecker>,
-        adaptation_state: &mut ReqmodAdaptationRunState,
+        bypass: BypassAdapter<ServerIdleChecker>,
+        framing: BypassFraming,
+        adaptation_state: &mut BypassRunState,
     ) -> Result<(), H2StreamTransferError> {
         // 保留原始请求头的副本：respmod 适配与日志都需要"客户端原请求"
         let orig_req = ups_req.clone_header();
 
-        // reqmod 全程代理"客户端体->ICAP->源站"的请求转发，返回响应头后再走
-        // 本地响应处理；respond_shared_headers 让 respmod 复用 reqmod 会话信息
-        match icap_adapter
-            .xfer(adaptation_state, ups_req, clt_body, ups_send_req)
+        let (mut ups_rsp_fut, ups_send_stream) = ups_send_req
+            .send_request(ups_req, false)
+            .map_err(H2StreamTransferError::RequestHeadSendFailed)?; // do not send REFUSED_STREAM, use the default rst in h2
+        self.ups_stream_id = Some(ups_rsp_fut.stream_id());
+        self.http_notes.mark_req_send_hdr();
+
+        // h2 流接进通用读写接口：读侧带 TRAILERS 采集，写侧由本函数收尾
+        let mut clt_body_reader = H2StreamReader::new(clt_body);
+        let mut ups_body_writer = H2StreamWriter::new(ups_send_stream);
+
+        let mut adaptation_fut = Box::pin(bypass.audit_and_forward(
+            adaptation_state,
+            framing,
+            &mut clt_body_reader,
+            &mut ups_body_writer,
+        ));
+
+        // 记录是否已提前收到响应头，用于循环结束后分流
+        let mut ups_rsp: Option<Response<RecvStream>> = None;
+        let mut idle_interval = self.ctx.idle_wheel.register();
+
+        loop {
+            tokio::select! {
+                biased;
+
+                // 体转发优先：与响应头同批就绪时，先把请求体收尾发完再处理响应
+                end = &mut adaptation_fut => {
+                    log_bypass_audit_end(end);
+                    break;
+                }
+                r = &mut ups_rsp_fut => {
+                    match r {
+                        Ok(rsp) => {
+                            // 源站提前应答：停止等待体传完，直接进响应处理
+                            self.http_notes.mark_rsp_recv_hdr();
+                            ups_rsp = Some(rsp);
+                            break;
+                        }
+                        Err(e) => {
+                            return Err(H2StreamTransferError::ResponseHeadRecvFailed(e));
+                        }
+                    }
+                }
+                _ = idle_interval.tick() => {
+                    // 空闲超限与中止由管线的 idle_checker 负责，这里补上直通
+                    // 路径同有的策略检查：用户被封锁或服务强制退出时掐断本流
+                    if self.ctx.belongs_to_blocked_user() {
+                        return Err(H2StreamTransferError::CanceledAsUserBlocked);
+                    }
+
+                    if self.ctx.server_force_quit() {
+                        return Err(H2StreamTransferError::CanceledAsServerQuit);
+                    }
+                }
+            }
+        }
+
+        // 提前应答时请求体还没传完：丢弃管线连带丢弃上游写流，
+        // h2 会对这条未结束的请求流发 RST_STREAM（与直通路径一致）
+        drop(adaptation_fut);
+
+        if let Some(ups_rsp) = ups_rsp {
+            return self
+                .send_response(orig_req, ups_rsp, clt_send_rsp, None)
+                .await;
+        }
+
+        // 请求体完整送达才收尾：有 TRAILERS 就转发 TRAILERS 帧，否则补一个
+        // END_STREAM；半程被掐断的请求体不能假装发完，直接终止本流
+        let trailers = match clt_body_reader.body_end().await {
+            H2StreamBodyEnd::EndOfStream => None,
+            H2StreamBodyEnd::Trailers(trailers) => Some(trailers),
+            H2StreamBodyEnd::Incomplete => {
+                return Err(H2StreamTransferError::HttpClientReadIdle);
+            }
+        };
+        let sent_trailers = trailers.is_some();
+        ups_body_writer.finish(trailers).map_err(|e| {
+            H2StreamTransferError::RequestBodyTransferFailed(if sent_trailers {
+                H2StreamBodyTransferError::SendTrailersFailed(e)
+            } else {
+                H2StreamBodyTransferError::GracefulCloseError(e)
+            })
+        })?;
+        self.http_notes.mark_req_send_all();
+
+        let ups_rsp =
+            match tokio::time::timeout(self.ctx.h2_rsp_hdr_recv_timeout(), ups_rsp_fut).await {
+                Ok(Ok(d)) => {
+                    self.http_notes.mark_rsp_recv_hdr();
+                    d
+                }
+                Ok(Err(e)) => return Err(H2StreamTransferError::ResponseHeadRecvFailed(e)),
+                Err(_) => return Err(H2StreamTransferError::ResponseHeadRecvTimeout),
+            };
+
+        self.send_response(orig_req, ups_rsp, clt_send_rsp, None)
             .await
-        {
-            Ok(ReqmodAdaptationEndState::OriginalTransferred(ups_rsp)) => {
-                self.send_response(
-                    orig_req,
-                    ups_rsp,
-                    clt_send_rsp,
-                    adaptation_state.take_respond_shared_headers(),
-                )
-                .await
-            }
-            Ok(ReqmodAdaptationEndState::AdaptedTransferred(_http_req, ups_rsp)) => {
-                self.send_response(
-                    orig_req,
-                    ups_rsp,
-                    clt_send_rsp,
-                    adaptation_state.take_respond_shared_headers(),
-                )
-                .await
-            }
-            // 适配器直接给出错误响应：请求未发往源站，响应就地回给客户端
-            Ok(ReqmodAdaptationEndState::HttpErrResponse(err_rsp, recv_body)) => {
-                self.send_adaptation_error_response(clt_send_rsp, err_rsp, recv_body)
-                    .await
-            }
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    /// 把 ICAP 适配器生成的错误响应以 h2 响应的形式发给客户端：带体时逐块
-    /// 转发并把 ICAP 连接归还连接池（save_connection），无体时直接 end_stream。
-    async fn send_adaptation_error_response(
-        &mut self,
-        clt_send_rsp: &mut SendResponse<Bytes>,
-        rsp: HttpAdapterErrorResponse,
-        rsp_recv_body: Option<ReqmodRecvHttpResponseBody>,
-    ) -> Result<(), H2StreamTransferError> {
-        let response = Response::new(());
-        let (mut parts, _) = response.into_parts();
-        parts.version = Version::HTTP_2;
-        parts.status = rsp.status;
-        parts.headers = rsp.headers.into();
-        let response = Response::from_parts(parts, ());
-
-        // 响应即将由本函数发出，属于已应答，不能再被 reply_task_err 二次改写
-        self.send_error_response = false;
-        let rsp_status = response.status().as_u16();
-        if let Some(mut recv_body) = rsp_recv_body {
-            let mut clt_send_stream = clt_send_rsp
-                .send_response(response, false)
-                .map_err(H2StreamTransferError::ResponseHeadSendFailed)?;
-            self.http_notes.rsp_status = rsp_status;
-
-            let body_transfer = recv_body.body_transfer(&mut clt_send_stream);
-            body_transfer.await.map_err(|e| match e {
-                H2StreamFromChunkedTransferError::ReadError(e) => {
-                    H2StreamTransferError::InternalAdapterError(anyhow!(
-                        "read http error response from adapter failed: {e:?}"
-                    ))
-                }
-                H2StreamFromChunkedTransferError::SendDataFailed(e) => {
-                    H2StreamTransferError::ResponseBodyTransferFailed(
-                        H2StreamBodyTransferError::SendDataFailed(e),
-                    )
-                }
-                H2StreamFromChunkedTransferError::SendTrailerFailed(e) => {
-                    H2StreamTransferError::ResponseBodyTransferFailed(
-                        H2StreamBodyTransferError::SendTrailersFailed(e),
-                    )
-                }
-                H2StreamFromChunkedTransferError::SenderNotInSendState => {
-                    H2StreamTransferError::ResponseBodyTransferFailed(
-                        H2StreamBodyTransferError::SenderNotInSendState,
-                    )
-                }
-            })?;
-
-            recv_body.save_connection().await;
-        } else {
-            clt_send_rsp
-                .send_response(response, true)
-                .map_err(H2StreamTransferError::ResponseHeadSendFailed)?;
-            self.http_notes.rsp_status = rsp_status;
-        }
-
-        Ok(())
     }
 
     /// 直通（无 ICAP）转发：按客户端请求流是否还带数据选择无体/有体路径。

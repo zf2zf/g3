@@ -9,6 +9,7 @@ use std::task::{Context, Poll, ready};
 
 use bytes::Bytes;
 use h2::SendStream;
+use http::HeaderMap;
 use tokio::io::AsyncWrite;
 
 pub struct H2StreamWriter {
@@ -19,6 +20,16 @@ impl H2StreamWriter {
     pub fn new(stream: SendStream<Bytes>) -> Self {
         H2StreamWriter {
             send_stream: stream,
+        }
+    }
+
+    /// 结束请求体：带 TRAILERS 时只发 TRAILERS 帧（END_STREAM 由它携带），
+    /// 否则发一个 END_STREAM 的空 DATA 帧。h2 不允许在 END_STREAM 之后再发
+    /// TRAILERS，所以收尾必须二选一，不能走 [`AsyncWrite::poll_shutdown`]。
+    pub fn finish(&mut self, trailers: Option<HeaderMap>) -> Result<(), h2::Error> {
+        match trailers {
+            Some(trailers) => self.send_stream.send_trailers(trailers),
+            None => self.send_stream.send_data(Bytes::new(), true),
         }
     }
 }

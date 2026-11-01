@@ -9,7 +9,9 @@
 //! 空闲、被封锁等），由 `H2InterceptObject::intercept` 返回并转换为服务器任务
 //! 错误；[`H2StreamTransferError`] 描述单个逻辑流转发过程中的失败，并可通过
 //! [`H2StreamTransferError::build_reply`] 决定能否给客户端合成一个 HTTP 响应。
-//! 两个 From impl 负责把 ICAP reqmod/respmod 适配层错误映射为流级错误。
+//! 两个 From impl 负责把 ICAP reqmod/respmod 适配层错误映射为流级错误：
+//! reqmod 那一条现在只服务 CONNECT 隧道通路，普通请求上传已改为 fail-open
+//! 的旁路审计，其失败不进入本流的错误面。
 
 use std::io;
 use std::time::Duration;

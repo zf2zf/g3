@@ -15,7 +15,7 @@ pub use encoder::{
 };
 
 mod reader;
-pub use reader::H2StreamReader;
+pub use reader::{H2StreamBodyEnd, H2StreamReader};
 
 mod writer;
 pub use writer::H2StreamWriter;
@@ -28,3 +28,6 @@ pub use from_chunked_transfer::{H2StreamFromChunkedTransfer, H2StreamFromChunked
 
 mod preview;
 pub use preview::{H2PreviewData, H2PreviewError};
+
+#[cfg(test)]
+mod tests;

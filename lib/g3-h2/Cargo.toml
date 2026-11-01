@@ -15,3 +15,6 @@ http.workspace = true
 tokio = { workspace = true, features = ["macros", "time"] }
 g3-http.workspace = true
 g3-io-ext.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "io-util"] }
