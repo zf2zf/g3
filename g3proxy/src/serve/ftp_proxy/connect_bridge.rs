@@ -11,7 +11,7 @@
 //!   2. detects STOR/STOU/APPE commands and copies the data channel
 //!      through the shared ICAP REQMOD audit pipeline.
 //!
-//! This bridges reuses the same `run_ftp_upload_audit_or_relay`
+//! This bridges reuses the same `run_upload_audit_or_relay`
 //! function used by the native FTP proxy — keeping the audit path
 //! consistent across both proxy modes.
 //!
@@ -21,7 +21,7 @@
 //!   1. 拦截控制通道，识别 PASV/EPSV 应答并改写成本机绑定的数据监听地址；
 //!   2. 识别 STOR/STOU/APPE 命令，把数据通道送进共用的 ICAP REQMOD 审计链路。
 //!
-//! 这里复用原生 FTP 代理的 `run_ftp_upload_audit_or_relay`，
+//! 这里复用原生 FTP 代理的 `run_upload_audit_or_relay`，
 //! 使两种代理模式的审计行为保持一致。
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -34,7 +34,6 @@ use tokio::net::{TcpListener, TcpStream};
 use g3_daemon::server::ClientConnectionInfo;
 use g3_io_ext::IdleWheel;
 
-use super::audit_bridge::{FtpUploadAuditContext, run_ftp_upload_audit_or_relay};
 use super::ctl_common::{
     is_data_channel_command, is_epsv_command, is_pasv_command, is_upload_command,
     parse_pasv_response, read_ftp_response, rewrite_epsv_response, rewrite_pasv_response,
@@ -44,6 +43,7 @@ use crate::audit::AuditContext;
 use crate::config::server::ServerConfig;
 use crate::config::server::ftp_proxy::FtpProxyServerConfig;
 use crate::serve::ServerTaskNotes;
+use crate::serve::audit_bridge::{UploadAuditContext, run_upload_audit_or_relay};
 
 /// FTP-over-CONNECT 桥接实例。
 ///
@@ -264,19 +264,22 @@ impl FtpOverConnectBridge {
         let audit_ctx = self
             .icap_client
             .as_ref()
-            .map(|client| FtpUploadAuditContext {
+            .map(|client| UploadAuditContext {
                 icap_client: client.clone(),
                 idle_wheel: self.idle_wheel.clone(),
                 max_idle_count: 60, // 60 ticks × 1s interval = 60s idle timeout
                 copy_config: self.server_config.limited_copy_config(),
                 client_addr: Some(self.cc_info.client_addr()),
-                ftp_command: "STOR".to_string(),
-                ftp_path: "ftp-over-connect".to_string(),
+                username: None,
+                framing: g3_icap_client::reqmod::ftp::build_ftp_framing(
+                    "STOR",
+                    "ftp-over-connect",
+                ),
                 data_channel_tuple: None,
                 keylog_buffer: None,
             });
 
-        let _ = run_ftp_upload_audit_or_relay(
+        let _ = run_upload_audit_or_relay(
             &mut clt_conn,
             &mut ups_conn,
             &self.idle_wheel,

@@ -29,6 +29,7 @@ mod idle_check;
 pub(crate) use idle_check::ServerIdleChecker;
 
 mod dummy_close;
+pub(crate) mod audit_bridge;
 pub(crate) mod ftp_proxy;
 mod intelli_proxy;
 mod native_tls_port;

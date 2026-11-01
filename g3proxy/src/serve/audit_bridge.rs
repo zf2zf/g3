@@ -3,11 +3,11 @@
  * Copyright 2023-2025 ByteDance and/or its affiliates.
  */
 
-//! ICAP REQMOD audit bridge for FTP uploads.
+//! Protocol-agnostic ICAP REQMOD bypass audit bridge.
 //!
-//! When `audit_upload` is enabled, every byte sent by the FTP client on
-//! a data channel (STOR, APPE, STOU) is simultaneously:
-//!   * forwarded to the upstream FTP server — verbatim,
+//! When upload auditing is enabled, every byte sent by the client on an
+//! upload channel is simultaneously:
+//!   * forwarded to the upstream server — verbatim,
 //!   * sent to the ICAP server — wrapped inside a synthesized HTTP
 //!     REQMOD body with chunked transfer encoding.
 //!
@@ -15,15 +15,22 @@
 //! connection drops or times out, the upstream transfer continues
 //! without audit data.
 //!
-//! FTP 上传的 ICAP REQMOD 审计桥接。
+//! The protocol specifics live entirely in [`BypassFraming`]: FTP builds
+//! a pseudo-HTTP request header via `build_ftp_framing`, HTTP callers
+//! serialize the real request header. Everything below the framing stays
+//! shared.
 //!
-//! 开启 `audit_upload` 后，FTP 客户端在数据通道（STOR / APPE / STOU）上发出的
-//! 每一个字节都会同时被：
-//!   * 原样转发给上游 FTP 服务器；
+//! 协议无关的 ICAP REQMOD 旁路审计桥接。
+//!
+//! 开启上传审计后，客户端在上传通道上发出的每一个字节都会同时被：
+//!   * 原样转发给上游服务器；
 //!   * 包装成一个合成的 HTTP REQMOD 请求体（chunked 分块编码）发送给 ICAP 服务器。
 //!
 //! 该桥接绝不会因为 ICAP 故障而阻塞上传：ICAP 连接断开或超时时，
 //! 上游传输照常继续，只是不再产生审计数据。
+//!
+//! 协议差异全部收敛在 [`BypassFraming`] 里：FTP 用 `build_ftp_framing`
+//! 合成伪 HTTP 请求头，HTTP 调用方序列化真实请求头。此桥接层以下完全共享。
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -32,10 +39,9 @@ use log::warn;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinHandle;
 
+use g3_icap_client::reqmod::bypass::{new_run_state, BypassEndState, BypassFraming};
 use g3_io_ext::{IdleCheck, IdleInterval, IdleWheel, StreamCopyConfig};
 use g3_types::net::TlsKeyLogBuffer;
-
-use crate::config::server::ServerConfig;
 
 /// 简化的空闲检查器：按“连续空闲 tick 次数”判断是否超时。
 /// 供 ICAP 适配器内部的两段拷贝复用同样的空闲语义。
@@ -59,50 +65,51 @@ impl IdleCheck for CountingIdleChecker {
     }
 }
 
-/// Context needed to perform ICAP audit of a single FTP upload data
-/// channel. Built by `handle_upload_data_channel` in `task.rs` from
-/// server-level `CommonTaskContext` and the parsed FTP command.
-/// 对单条 FTP 上传数据通道做 ICAP 审计所需的上下文。
-/// 由 `task.rs` 中的 `handle_upload_data_channel` 从服务器级的
-/// `CommonTaskContext` 加上解析出的 FTP 命令拼装而来。
-pub(crate) struct FtpUploadAuditContext {
+/// Context needed to perform ICAP bypass audit of a single upload stream.
+/// FTP callers build it in `serve/ftp_proxy/task.rs` (see
+/// `build_audit_context`); HTTP callers fill the same shape with the real
+/// request framing and the task's username.
+/// 对单条上传流做 ICAP 旁路审计所需的上下文。
+/// FTP 调用方在 `serve/ftp_proxy/task.rs` 的 `build_audit_context` 中拼装；
+/// HTTP 调用方以同样的形状填入真实请求 framing 与任务用户名。
+pub(crate) struct UploadAuditContext {
     /// ICAP REQMOD 客户端
     pub(crate) icap_client: Arc<g3_icap_client::reqmod::IcapReqmodClient>,
-    pub(crate) idle_wheel: Arc<g3_io_ext::IdleWheel>,
+    pub(crate) idle_wheel: Arc<IdleWheel>,
     /// 允许连续空闲的 tick 次数
     pub(crate) max_idle_count: usize,
     /// 流拷贝的速率/大小限制配置
     pub(crate) copy_config: StreamCopyConfig,
     pub(crate) client_addr: Option<SocketAddr>,
-    /// FTP 命令名（STOR/APPE/STOU），作为 ICAP 头信息上报
-    pub(crate) ftp_command: String,
-    /// 上传路径，作为 ICAP 请求的 URI 信息上报
-    pub(crate) ftp_path: String,
-    /// Data channel 5-tuple: (g3proxy local addr, FTP server addr)
-    /// 数据通道五元组：(g3proxy 本地地址, FTP 服务器地址)
+    /// 任务用户名，随审计头一并上报
+    pub(crate) username: Option<arcstr::ArcStr>,
+    /// 协议封装：合成请求头字节 + 协议来源标签
+    pub(crate) framing: BypassFraming,
+    /// Data channel 5-tuple: (g3proxy local addr, upstream server addr)
+    /// 数据通道五元组：(g3proxy 本地地址, 上游服务器地址)
     pub(crate) data_channel_tuple: Option<g3_icap_client::reqmod::ConnectionTuple>,
     /// TLS keylog buffer for the upstream TLS connection
-    /// 上游 TLS 连接的密钥日志，供审计侧解密 FTPS 流量
+    /// 上游 TLS 连接的密钥日志，供审计侧解密 TLS 流量
     pub(crate) keylog_buffer: Option<Arc<TlsKeyLogBuffer>>,
 }
 
-/// Entry point for all FTP upload data channels.
+/// Entry point for all upload data channels (single-direction transfer).
 ///
-/// * If `audit_ctx` is `Some`, build an `FtpUploadAdapter` and stream
+/// * If `audit_ctx` is `Some`, build a `BypassAdapter` and stream
 ///   through it (upload + ICAP audit simultaneously).
 /// * If `audit_ctx` is `None`, fall back to a plain copy loop — no
 ///   extra allocations, no overhead.
-/// 所有 FTP 上传数据通道的统一入口。
+/// 所有上传数据通道的统一入口（单向转发）。
 ///
-/// * `audit_ctx` 为 `Some` 时：构建 `FtpUploadAdapter`，在同一条流上完成
+/// * `audit_ctx` 为 `Some` 时：构建 `BypassAdapter`，在同一条流上完成
 ///   “上传转发 + ICAP 审计”。
 /// * `audit_ctx` 为 `None` 时：退化为普通拷贝循环，无额外分配、无审计开销。
-pub(crate) async fn run_ftp_upload_audit_or_relay<CR, UW>(
+pub(crate) async fn run_upload_audit_or_relay<CR, UW>(
     clt_r: &mut CR,
     ups_w: &mut UW,
     idle_wheel: &Arc<IdleWheel>,
     max_idle_count: usize,
-    audit_ctx: Option<FtpUploadAuditContext>,
+    audit_ctx: Option<UploadAuditContext>,
 ) -> Option<u64>
 where
     CR: AsyncRead + Send + Sync + Unpin,
@@ -118,14 +125,14 @@ where
 /// Handles upload audit on client→upstream direction, while doing plain copy on upstream→client.
 /// HTTP CONNECT 隧道模式的双向转发。
 /// 客户端 -> 上游方向做上传审计，上游 -> 客户端方向只做普通拷贝。
-pub(crate) async fn run_ftp_upload_audit_or_relay_bidi<CR, CW, UR, UW>(
+pub(crate) async fn run_upload_audit_or_relay_bidi<CR, CW, UR, UW>(
     clt_r: CR,
     clt_w: CW,
     ups_r: UR,
     ups_w: UW,
     idle_wheel: Arc<IdleWheel>,
     max_idle_count: usize,
-    audit_ctx: Option<FtpUploadAuditContext>,
+    audit_ctx: Option<UploadAuditContext>,
 ) -> Option<u64>
 where
     CR: AsyncRead + Send + Sync + Unpin + 'static,
@@ -196,7 +203,7 @@ async fn bidi_half_relay_with_idle<R, W>(
     // socket send buffer would block the await, the client read would
     // stop, the kernel recv buffer on the client side would fill, and
     // the client kernel would advertise TCP ZeroWindow. With large
-    // FTP uploads (>1 GiB) the client then stalled, retransmitted,
+    // uploads (>1 GiB) the client then stalled, retransmitted,
     // and looped forever.
     //
     // 把 `r.read` 与 `w.write_all` 拆到两个任务，使上游对 `w` 的反压不会拖住读端。
@@ -338,12 +345,12 @@ where
     Some(total)
 }
 
-/// 审计 + 转发的核心路径：把数据通道的字节同时交给 ICAP 适配器和上游连接。
+/// 审计 + 转发的核心路径：把上传流的字节同时交给 ICAP 适配器和上游连接。
 /// 适配器创建失败时退化为纯转发，保证上传不受审计链路故障影响。
 async fn audit_and_forward<CR, UW>(
     clt_r: &mut CR,
     ups_w: &mut UW,
-    audit_ctx: FtpUploadAuditContext,
+    audit_ctx: UploadAuditContext,
 ) -> Option<u64>
 where
     CR: AsyncRead + Send + Sync + Unpin,
@@ -355,16 +362,16 @@ where
     };
     let mut adapter = match audit_ctx
         .icap_client
-        .ftp_upload_audit_adapter(audit_ctx.copy_config, idle_checker)
+        .bypass_adapter(audit_ctx.copy_config, idle_checker)
         .await
     {
         Ok(a) => a,
         Err(e) => {
             warn!(
-                "FTP ICAP adapter creation failed, fallback to forward-only: {}",
+                "bypass ICAP adapter creation failed, fallback to forward-only: {}",
                 e
             );
-            // ICAP 不可用：放弃审计，仍然把文件传上去
+            // ICAP 不可用：放弃审计，仍然把数据传上去
             return raw_forward_with_idle(
                 clt_r,
                 ups_w,
@@ -377,72 +384,35 @@ where
     if let Some(addr) = audit_ctx.client_addr {
         adapter.set_client_addr(addr);
     }
+    if let Some(username) = audit_ctx.username {
+        adapter.set_client_username(username);
+    }
     /* added for connection tuple - data channel 5-tuple */
     // 数据通道五元组，便于审计侧还原真实收发端
     if let Some(tuple) = audit_ctx.data_channel_tuple {
         adapter.set_connection_tuple(tuple);
     }
     /* added for TLS keylog */
-    // 密钥日志，使审计侧具备解密 FTPS 数据的能力
+    // 密钥日志，使审计侧具备解密上游 TLS 数据的能力
     if let Some(keylog) = audit_ctx.keylog_buffer {
         adapter.set_keylog_buffer(keylog);
     }
 
-    let mut state = g3_icap_client::reqmod::ftp::new_adaptation_run_state();
+    let mut state = new_run_state();
     let end_state = adapter
-        .audit_and_forward(
-            &mut state,
-            clt_r,
-            ups_w,
-            &audit_ctx.ftp_command,
-            &audit_ctx.ftp_path,
-        )
+        .audit_and_forward(&mut state, audit_ctx.framing, clt_r, ups_w)
         .await;
 
     // 各类结束状态都返回已转发的字节数，由上层统一收尾；
     // 是否被 ICAP 判定为“阻断”由适配器内部处理，此处不再干预上传结果。
     match end_state {
-        g3_icap_client::reqmod::ftp::FtpAdaptationEndState::OriginalTransferred {
-            bytes, ..
-        }
-        | g3_icap_client::reqmod::ftp::FtpAdaptationEndState::OriginalTransferredAfterFallback {
-            bytes,
-            ..
-        }
-        | g3_icap_client::reqmod::ftp::FtpAdaptationEndState::OriginalTransferredInBackground {
-            bytes,
-        }
-        | g3_icap_client::reqmod::ftp::FtpAdaptationEndState::AuditOnly { bytes, .. } => {
+        BypassEndState::OriginalTransferred { bytes, .. }
+        | BypassEndState::OriginalTransferredAfterFallback { bytes, .. }
+        | BypassEndState::OriginalTransferredInBackground { bytes }
+        | BypassEndState::AuditOnly { bytes, .. } => {
             let _ = ups_w.flush().await;
             let _ = ups_w.shutdown().await;
             Some(bytes)
         }
     }
-}
-
-/// Convenience constructor: builds an `FtpUploadAuditContext` from the
-/// shared `CommonTaskContext` if an ICAP client is configured.
-/// 便捷构造器：从任务共用的 `CommonTaskContext` 生成一份审计上下文。
-/// 未配置 ICAP 客户端时返回 None，调用方据此退化为纯转发。
-pub(crate) fn build_audit_context(
-    ctx: &super::task::CommonTaskContext,
-    max_idle_count: usize,
-    ftp_command: &str,
-    ftp_path: &str,
-    data_channel_tuple: Option<g3_icap_client::reqmod::ConnectionTuple>,
-    keylog_buffer: Option<Arc<TlsKeyLogBuffer>>,
-) -> Option<FtpUploadAuditContext> {
-    let icap_client = ctx.icap_client.as_ref()?.clone();
-
-    Some(FtpUploadAuditContext {
-        icap_client,
-        idle_wheel: ctx.idle_wheel.clone(),
-        max_idle_count,
-        copy_config: ctx.server_config.limited_copy_config(),
-        client_addr: Some(ctx.cc_info.client_addr()),
-        ftp_command: ftp_command.to_string(),
-        ftp_path: ftp_path.to_string(),
-        data_channel_tuple,
-        keylog_buffer,
-    })
 }

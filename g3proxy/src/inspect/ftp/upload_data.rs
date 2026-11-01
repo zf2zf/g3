@@ -20,9 +20,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::config::server::ServerConfig;
 use crate::inspect::{BoxAsyncRead, BoxAsyncWrite, StreamInspectContext};
 use crate::serve::ServerTaskResult;
-use crate::serve::ftp_proxy::audit_bridge::{
-    FtpUploadAuditContext, run_ftp_upload_audit_or_relay_bidi,
-};
+use crate::serve::audit_bridge::{UploadAuditContext, run_upload_audit_or_relay_bidi};
 use crate::serve::ftp_proxy::upload_state::{PendingUploadInfo, get_ftp_upload_state};
 
 /// 数据连接的四条 IO 半端（客户端读/写、源站读/写），均为解密后的明文流。
@@ -103,7 +101,7 @@ where
             Some(client) => Arc::new(client),
             None => {
                 // 无 ICAP 服务：数据原样双向中继
-                let _ = run_ftp_upload_audit_or_relay_bidi(
+                let _ = run_upload_audit_or_relay_bidi(
                     io.clt_r,
                     io.clt_w,
                     io.ups_r,
@@ -117,19 +115,22 @@ where
             }
         };
 
-        let audit_ctx = FtpUploadAuditContext {
+        let audit_ctx = UploadAuditContext {
             icap_client,
             idle_wheel: self.ctx.idle_wheel.clone(),
             max_idle_count: self.ctx.max_idle_count,
             copy_config: self.ctx.server_config.limited_copy_config(),
             client_addr: Some(self.ctx.task_notes.client_addr),
-            ftp_command: upload_info.ftp_command,
-            ftp_path: upload_info.ftp_path,
+            username: None,
+            framing: g3_icap_client::reqmod::ftp::build_ftp_framing(
+                &upload_info.ftp_command,
+                &upload_info.ftp_path,
+            ),
             data_channel_tuple: self.data_channel_tuple,
             keylog_buffer: self.keylog_buffer.clone(),
         };
 
-        let _ = run_ftp_upload_audit_or_relay_bidi(
+        let _ = run_upload_audit_or_relay_bidi(
             io.clt_r,
             io.clt_w,
             io.ups_r,
@@ -201,7 +202,7 @@ where
                                 Some(client) => Arc::new(client),
                                 None => {
                                     // 无 ICAP：连同首块一起透明中继
-                                    let _ = run_ftp_upload_audit_or_relay_bidi(
+                                    let _ = run_upload_audit_or_relay_bidi(
                                         clt_r, clt_w, ups_r, ups_w,
                                         ctx.idle_wheel.clone(),
                                         ctx.max_idle_count,
@@ -218,19 +219,22 @@ where
                                 protocol: ConnectionProtocol::Tcp,
                             };
 
-                            let audit_ctx = FtpUploadAuditContext {
+                            let audit_ctx = UploadAuditContext {
                                 icap_client,
                                 idle_wheel: ctx.idle_wheel.clone(),
                                 max_idle_count: ctx.max_idle_count,
                                 copy_config: ctx.server_config.limited_copy_config(),
                                 client_addr: Some(ctx.task_notes.client_addr),
-                                ftp_command: upload_info.ftp_command,
-                                ftp_path: upload_info.ftp_path,
+                                username: None,
+                                framing: g3_icap_client::reqmod::ftp::build_ftp_framing(
+                                    &upload_info.ftp_command,
+                                    &upload_info.ftp_path,
+                                ),
                                 data_channel_tuple: Some(data_channel_tuple),
                                 keylog_buffer: keylog_buffer.clone(),
                             };
 
-                            let _ = run_ftp_upload_audit_or_relay_bidi(
+                            let _ = run_upload_audit_or_relay_bidi(
                                 Box::new(clt_r),
                                 clt_w,
                                 ups_r,
@@ -241,7 +245,7 @@ where
                             ).await;
                         } else {
                             // 非上传数据连接（如下载）：直接透明中继
-                            let _ = run_ftp_upload_audit_or_relay_bidi(
+                            let _ = run_upload_audit_or_relay_bidi(
                                 clt_r, clt_w, ups_r, ups_w,
                                 ctx.idle_wheel.clone(),
                                 ctx.max_idle_count,
@@ -274,7 +278,7 @@ where
                     Ok(n) => {
                         // 同样回填首块保证流连续后透明中继
                         let ups_r = io::Cursor::new(ups_buf[..n].to_vec()).chain(ups_r);
-                        let _ = run_ftp_upload_audit_or_relay_bidi(
+                        let _ = run_upload_audit_or_relay_bidi(
                             clt_r,
                             clt_w,
                             Box::new(ups_r),

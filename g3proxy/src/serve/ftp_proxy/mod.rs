@@ -17,8 +17,6 @@
 //!   * 数据通道拦截：上传内容经 ICAP REQMOD 审计后再转发给上游
 //!   * 优雅退出与运行统计
 
-/// ICAP REQMOD 上传审计桥接：把数据通道的字节同时转发与送审
-pub(crate) mod audit_bridge;
 /// FTP over HTTP CONNECT 隧道模式下的桥接实现（目前未被调用，保留待接入）
 #[allow(dead_code)]
 pub(crate) mod connect_bridge;

@@ -30,7 +30,6 @@ use g3_daemon::stat::task::TcpStreamTaskStats;
 use g3_openssl::SslConnector;
 use g3_types::net::{OpensslClientConfig, UpstreamAddr};
 
-use super::audit_bridge::{build_audit_context, run_ftp_upload_audit_or_relay};
 use super::ctl_common::{
     is_data_channel_command, is_epsv_command, is_pasv_command, is_upload_command,
     parse_pasv_response, read_ftp_response, read_line_limited, rewrite_epsv_response,
@@ -38,9 +37,11 @@ use super::ctl_common::{
 };
 use super::stats::{FtpProxyControlTaskAliveGuard, FtpProxyServerStats};
 use crate::audit::AuditContext;
+use crate::config::server::ServerConfig;
 use crate::config::server::ftp_proxy::{FtpProxyServerConfig, TlsUpstreamType};
 use crate::escape::ArcEscaper;
 use crate::module::tcp_connect::{TcpConnectTaskConf, TcpConnectTaskNotes, TlsConnectTaskConf};
+use crate::serve::audit_bridge::{run_upload_audit_or_relay, UploadAuditContext};
 use crate::serve::{ServerTaskError, ServerTaskNotes, ServerTaskStage};
 
 /// 控制任务与其派生的数据通道任务共用的上下文。
@@ -540,6 +541,31 @@ fn extract_cmd_path(line: &[u8]) -> (String, String) {
     (cmd, path)
 }
 
+/// 便捷构造器：从任务共用的 `CommonTaskContext` 生成一份 FTP 上传审计上下文。
+/// 未配置 ICAP 客户端时返回 None，调用方据此退化为纯转发。
+fn build_audit_context(
+    ctx: &CommonTaskContext,
+    max_idle_count: usize,
+    ftp_command: &str,
+    ftp_path: &str,
+    data_channel_tuple: Option<g3_icap_client::reqmod::ConnectionTuple>,
+    keylog_buffer: Option<Arc<g3_types::net::TlsKeyLogBuffer>>,
+) -> Option<UploadAuditContext> {
+    let icap_client = ctx.icap_client.as_ref()?.clone();
+
+    Some(UploadAuditContext {
+        icap_client,
+        idle_wheel: ctx.idle_wheel.clone(),
+        max_idle_count,
+        copy_config: ctx.server_config.limited_copy_config(),
+        client_addr: Some(ctx.cc_info.client_addr()),
+        username: None,
+        framing: g3_icap_client::reqmod::ftp::build_ftp_framing(ftp_command, ftp_path),
+        data_channel_tuple,
+        keylog_buffer,
+    })
+}
+
 /// Intercept an upload data channel: accept the client's PASV connection,
 /// optionally audit the bytes through ICAP, and forward everything upstream.
 /// 拦截上传数据通道：接受客户端连入本机监听，把字节边审计边转发给上游。
@@ -589,7 +615,7 @@ async fn handle_upload_data_channel<CW, UR>(
     // 未配置 ICAP 时返回 None，审计桥接会退化为纯转发
     let audit_ctx = build_audit_context(ctx, max_idle_count, &cmd, &path, Some(data_tuple), None);
 
-    let _ = run_ftp_upload_audit_or_relay(
+    let _ = run_upload_audit_or_relay(
         &mut clt_conn,
         &mut ups_conn,
         &ctx.idle_wheel,

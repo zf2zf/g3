@@ -27,9 +27,7 @@ use crate::module::http_forward::HttpProxyClientResponse;
 use crate::module::tcp_connect::{
     TcpConnectError, TcpConnectTaskConf, TcpConnectTaskNotes, TcpConnection,
 };
-use crate::serve::ftp_proxy::audit_bridge::{
-    FtpUploadAuditContext, run_ftp_upload_audit_or_relay_bidi,
-};
+use crate::serve::audit_bridge::{UploadAuditContext, run_upload_audit_or_relay_bidi};
 use crate::serve::ftp_proxy::upload_state::get_ftp_upload_state;
 use crate::serve::http_proxy::HttpConnectTaskAliveGuard;
 use crate::serve::{
@@ -633,21 +631,24 @@ impl HttpProxyConnectTask {
                     })
             });
 
-            let audit_ctx = FtpUploadAuditContext {
+            let audit_ctx = UploadAuditContext {
                 icap_client: Arc::new(icap_client),
                 idle_wheel: self.ctx.idle_wheel.clone(),
                 max_idle_count: self.ctx.server_config.task_max_idle_count(),
                 copy_config: self.ctx.server_config.limited_copy_config(),
                 client_addr: Some(self.task_notes.client_addr()),
-                ftp_command: upload_info.ftp_command,
-                ftp_path: upload_info.ftp_path,
+                username: None,
+                framing: g3_icap_client::reqmod::ftp::build_ftp_framing(
+                    &upload_info.ftp_command,
+                    &upload_info.ftp_path,
+                ),
                 data_channel_tuple,
                 keylog_buffer: None,
             };
 
             // 上行（客户端->服务器）送 ICAP 审计并转发，下行仍为普通双向转发；
             // 返回值是审计到的上传字节数，此处无需统计，故忽略
-            let _ = run_ftp_upload_audit_or_relay_bidi(
+            let _ = run_upload_audit_or_relay_bidi(
                 clt_r,
                 clt_w,
                 ups_r,
