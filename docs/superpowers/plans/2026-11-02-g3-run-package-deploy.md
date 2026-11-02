@@ -2,14 +2,26 @@
 
 > **For agentic workers：** 本计划的 Task 1–5 已实现并提交（`7ec35f59`），勾选框记录实际完成与
 > 实际验证过的内容；Task 6 起为未做完的跟踪项，按顺序推进。跟踪用 `- [ ]` 语法。
+>
+> **2026-11-02 修订二：** 需求方改定了交付形态——Task 1/2/4 的产物已被重做：交付物是
+> **自解压 `.run`**（目标机一条命令直接安装）、安装**无参数**、**g3proxy+g3fcgen 双服务默认
+> 安装启动**、CA 成为安装前置、入口配置**扁平化为单个 `g3proxy.yaml`**（无 server.d/auditor.d）、
+> 卸载脚本落在 `/opt/zf/g3/uninstall.sh`。下文 Task 1–4 的勾选记录的是初版（tar.gz 形态）的
+> 验证事实，不再逐条适用；修订后的实现与验证见 Task 8。Spec §11 的 V1–V7 以 Task 8 为准。
+>
+> **2026-11-02 修订四：** `uninstall.sh` 由"永远保留目录"改为**卸载即删除 `/opt/zf/g3`**
+> （配置与 CA 一并清除）；包内那份带守卫，在包目录里执行不会误删构建产物。V7 按新语义
+> 复测，见 Task 8。
 
-**Goal:** 一条命令在构建机产出 g3 run 包（可执行程序 + 配置 + systemd 单元 + 安装脚本），目标机
-解包后一条命令装到 `/opt/zf/g3` 并由 systemd 托管。
+**Goal:** 一条命令在构建机产出 g3 run 包（可执行程序 + 配置 + systemd 单元 + 安装/卸载脚本），
+目标机对 `.run` 直接 `sudo` 运行即装到 `/opt/zf/g3`，g3proxy 与 g3fcgen 由 systemd 托管并启动。
 
-**Architecture:** `deploy/` 下两个 POSIX sh 脚本：`build_run_package.sh` 负责 cargo 编译、feature
-判定与包组装，并在出包前用包内二进制校验包内配置；`install.sh` 复制进包，在目标机做"绝不覆盖
-配置"的安装、`-t` 前置校验、`sed` 渲染 systemd 单元模板并 `enable --now`。配置单一来源仍是
-`etc/g3proxy/http`，`deploy/conf` 只放入口配置。
+**Architecture:** `deploy/` 下三个 POSIX sh 脚本：`build_run_package.sh` 负责 cargo 编译、feature
+判定与包组装，出包前用包内二进制校验包内配置，最后把包目录打成 tar.gz 并拼装成自解压 `.run`
+（sh 头部 + 尾部负载）；`install.sh` 进包、由 `.run` 解压后调用，做 CA 前置检查、"绝不覆盖
+配置"的安装、`-t` 前置校验、`sed` 渲染 systemd 单元模板并 `enable --now` 双服务；
+`uninstall.sh` 进包、安装时复制到 `/opt/zf/g3/uninstall.sh`。配置单一来源是 `deploy/conf`
+（扁平的单文件 `g3proxy.yaml`），CA 经 `deploy/conf/myCA.*`（gitignore）随包。
 
 **Tech Stack:** POSIX sh / cargo / systemd unit 模板 / g3proxy `-c -t -s -G -C` / g3proxy-ctl
 `offline reload reload-* list -p` / g3fcgen `-c -t -s -G`。
@@ -103,5 +115,40 @@
 - [ ] L4 是否需要文件日志与轮转（当前只进 journald）
 - [ ] L5 `g3tiles`/`g3keymess` 是否进同一个 run 包
 - [ ] L6 升级自动化（备份-比对-切换）
-- [ ] L7 `--purge` 前是否需要自动备份配置目录
+- [x] L7 已定（修订四）：`uninstall.sh` 摘完单元直接删除 `/opt/zf/g3`，不做自动备份，
+  留存靠操作者卸载前自己拷走 `conf/`
 - [ ] L8 deb/rpm 与 run 包两条形态长期是否统一
+
+## Task 8: 修订二——.run 自解压形态 + 扁平配置 + g3fcgen 必装（本机实现）
+
+**Files:** 重写 `deploy/build_run_package.sh`、`deploy/install.sh`、`deploy/conf/g3proxy.yaml`；
+新增 `deploy/uninstall.sh`；`.gitignore` 加 `deploy/conf/myCA.*`；同步 Spec 与 `doc/`。
+
+- [x] Step 1：`g3proxy.yaml` 扁平化——`server:`/`auditor:` 内联数组（`HybridParser` 原生支持），
+  打包脚本删 `CONF_DIR`/`CONF_SUBDIRS`，包内不再有 `server.d`/`auditor.d`
+- [x] Step 2：`install.sh` 去掉全部参数——固定 `/opt/zf/g3`，CA 前置检查（包内或目标机成套
+  存在，否则写系统目录前中止），双服务默认 `enable --now`，g3fcgen 启动失败即安装失败；
+  `uninstall.sh` 独立成文件并安装到 `${PREFIX}/uninstall.sh`（修订四：摘单元后删除
+  `${PREFIX}`；包内那份识别到 `install.sh` 同级即知是包目录，原样保留）
+- [x] Step 3：构建脚本 CA 必带——`deploy/conf` 有成套就打进包（私钥 0600），没有则补编
+  `g3mkcert` 自动生成自签根（RSA 2048）写回 `deploy/conf` 复用；半套报错；`VERSION` 记
+  `ca bundled`、README 重写为 `.run` 一条命令流程（2026-11-02 三修：CA 从"安装时提醒"
+  改为"构建时自动生成并随包"）
+- [x] Step 4：`.run` 组装——POSIX sh 头部（包名+payload 行号占位符，`sed` 替换不动行数）+
+  `cat` 追加 tar.gz；头部拒绝一切参数；`mktemp -d` 0700 临时目录 + trap 删除；成品 `sh -n` 自检
+- [x] V1 本机 `sudo ./g3-run-<...>.run` 全链路（CA 借用 `etc/g3fcgen/ftp` 样例，仅测试）：
+  写 `/opt/zf/g3`、渲染单元、`enable --now` 双服务 active、journald 收日志
+  （2026-11-02 通过；g3fcgen 实际监听 `127.0.0.1:2999/udp`，与 auditor 默认一致）
+- [x] V2 `systemctl reload g3proxy` 不停机重载生效（MainPID 不变，ctl 返回 success）
+- [x] V3 `ExecStop` offline 优雅下线（Deactivated successfully，耗时远小于 60s）
+- [x] V4 `RuntimeDirectoryMode=0700` 下 `g3proxy-ctl` 与守护进程对 `/run/g3` 读写
+  （`list server`/`list auditor` 返回 `cds`/`https-up`）
+- [x] V5 升级：已有配置落 `*.new`、服务不受影响（重跑 `.run` PID 不变）
+- [x] V6 缺 CA：无 CA 包在全新机于写系统目录前中止、退出非 0；`.run` 拒绝一切参数
+- [x] V7（修订四复测）`uninstall.sh` 摘单元并删净 `/opt/zf/g3`；重跑 `.run` 可恢复；
+  包目录里跑包里那份只摘单元、整包保留（2026-11-02 实跑通过，收尾本机已卸净）
+- [x] 结果回写 Spec §11/§12；删除临时放进 `deploy/conf/` 的样例 CA，本机卸载并删净
+  `/opt/zf/g3`，`dist/` 重建为 `ca bundled: 0` 的干净包
+
+首轮验证修掉的两个缺陷（已进 `build_run_package.sh`）：`sh -n` 必须在追加载荷前只验头部；
+自解压头部结尾必须有显式 `exit`，否则 shell 会把 payload 首行当命令读。

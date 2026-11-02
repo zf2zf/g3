@@ -1,10 +1,7 @@
 ---
-# run 包的入口配置：程序与配置都在 /opt/zf/g3 下，本文件由 install.sh 安装到
-# /opt/zf/g3/conf/g3proxy.yaml，systemd 单元用 -c 直接指向它。
-#
-# 下面 server / auditor 的值是相对本文件所在目录的路径，所以 server.d、auditor.d
-# 必须跟本文件放在同一个目录里。需要 resolver.d 或 escaper.d 时，先把目录建好
-# 再打开对应行——目录不存在会导致配置校验失败。
+# run 包的入口配置，安装到 /opt/zf/g3/conf/g3proxy.yaml，systemd 单元用 -c
+# 直接指向它。server / auditor 全部内联在本文件里，不再依赖 server.d、
+# auditor.d 子目录——现场只看这一个文件就能改端口、ICAP 地址、审计开关。
 
 runtime:
   thread_number: 2
@@ -17,9 +14,48 @@ controller:
     recv_timeout: 30
     send_timeout: 1
 
-server: server.d/
+auditor:
+  - name: https-up
+    protocol_inspection: { }
 
-auditor: auditor.d/
+    # 中间人证书签发客户端：连接 g3fcgen（默认 127.0.0.1:2999）按 SNI 取证书，
+    # g3fcgen 持有 CA。改这里的 query_peer_addr 可以指向别机的 g3fcgen。
+    tls_cert_generator: { }
+    tls_interception_client: { } # 代理对目标地址TLS连接参数
+    tls_ticketer: { }
+
+    tls_keylog:
+      enable: true
+      max_entries: 100
+
+    h1_interception:
+      req_hasbody: true
+      req_body_min_size: 8
+
+    h2_interception: { }
+
+    application_audit_ratio: 1.0
+
+    # tls_stream_dump: { }
+    icap_reqmod_service: icap://127.0.0.1:1344/echo
+    # 同时进行的旁路上传审计条数上限（默认 64，0 表示不设限）。名额用尽时
+    # 新请求直接退化为直通转发并计入跳过数，不排队等待，因此调小只会少审计
+    # 几笔上传，绝不会变慢转发。
+    # upload_audit_max_concurrency: 64
+
+server:
+  - name: cds
+    escaper: default
+    auditor: https-up
+    type: http_proxy
+    #tls:
+    #  certificate: cert.pem
+    #  private_key: key.pem
+    listen:
+      address: "[::]:10087"
+    tcp_sock_speed_limit: 100M
+
+    tls_client: { }
 
 # resolver: resolver.d/
 # escaper: escaper.d/

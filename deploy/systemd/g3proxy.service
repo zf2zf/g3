@@ -6,6 +6,7 @@ Wants=network-online.target
 
 [Service]
 Type=exec
+@NETNS@
 # 控制套接字目录：systemd 负责创建，路径与 --control-dir 必须一致
 RuntimeDirectory=g3
 RuntimeDirectoryMode=0700
