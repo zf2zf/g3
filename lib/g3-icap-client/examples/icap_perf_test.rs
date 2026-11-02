@@ -2,9 +2,9 @@
 //!
 //! 演示的报文布局（RFC 3507，REQMOD 模式）分三段：
 //! 1. ICAP 请求头：`REQMOD icap://<server>/<service> ICAP/1.0` 状态行 +
-//!    `Host:` + 关键偏移头 `Encapsulated: req-hdr=0, req-body=170`
-//!    （消息体起点为 0；req-body=170 表示封装的 HTTP 请求头共 170 字节，
-//!    body 从其后开始——注意该数值需与实际发出的头文本长度一致）+
+//!    `Host:` + 关键偏移头 `Encapsulated: req-hdr=0, req-body=<N>`
+//!    （消息体起点为 0；req-body=N 表示封装的 HTTP 请求头共 N 字节，
+//!    body 从其后开始——该数值由程序按实际头文本长度动态计算）+
 //!    `Allow: 204` + 空行；
 //! 2. 封装的 HTTP 请求：请求行 + 头，`Transfer-Encoding: chunked`，空行；
 //! 3. chunked body：若干 `<十六进制长度>\r\n<data>\r\n` 分块，
@@ -79,23 +79,25 @@ async fn test_single_request(
         .await
         .map_err(|e| format!("connect failed: {}", e))?;
 
-    // ICAP 请求头：req-body=170 即下面 http_header 的字节长度（偏移硬编码，
-    // 若修改 http_header 内容必须同步更新该偏移）
-    let icap_header = format!(
-        "REQMOD icap://{}/{} ICAP/1.0\r\n\
-         Host: {}\r\n\
-         Encapsulated: req-hdr=0, req-body=170\r\n\
-         Allow: 204\r\n\
-         \r\n",
-        server, service, server
-    );
-
     // 封装的 HTTP 请求（req-hdr=0 起算），声明 chunked 传输编码
     let http_header = "POST /upload/test.bin HTTP/1.1\r\n\
          Host: example.com\r\n\
          Content-Type: application/octet-stream\r\n\
          Transfer-Encoding: chunked\r\n\
          \r\n";
+
+    // ICAP 请求头：req-body 即上面 http_header 的字节长度，动态计算
+    let icap_header = format!(
+        "REQMOD icap://{}/{} ICAP/1.0\r\n\
+         Host: {}\r\n\
+         Encapsulated: req-hdr=0, req-body={}\r\n\
+         Allow: 204\r\n\
+         \r\n",
+        server,
+        service,
+        server,
+        http_header.len()
+    );
 
     stream
         .write_all(icap_header.as_bytes())

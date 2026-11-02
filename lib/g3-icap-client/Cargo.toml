@@ -36,3 +36,8 @@ log.workspace = true
 [features]
 default = []
 yaml = ["dep:g3-yaml", "dep:yaml-rust"]
+
+[dev-dependencies]
+icap-rs = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
