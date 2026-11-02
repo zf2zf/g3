@@ -263,9 +263,10 @@ g3proxy 版本 ${VERSION}，git ${GIT_SHA}，构建于 $(uname -s) $(uname -m)�
     sudo ./${PKG_NAME}.run
 
 程序与配置统一落在 /opt/zf/g3：bin 放可执行程序，conf 放配置（已存在的配置绝不覆盖，
-新内容写成同名 .new 文件）。g3proxy（10087 代理）与 g3fcgen（MITM 证书签发，g3proxy
-的 TLS 拦截依赖它）都注册为 systemd 服务并立即启动。控制套接字在 /run/g3，由
-systemd 创建。
+新内容写成同名 .new 文件）。首次安装会问一行"g3proxy 监听端口"，直接回车用默认 10087，
+也可以现场填别的端口；升级时已有 g3proxy.yaml 则不再询问，端口以现网文件为准。
+g3proxy（默认 10087 代理）与 g3fcgen（MITM 证书签发，g3proxy 的 TLS 拦截依赖它）都注册为
+systemd 服务并立即启动。控制套接字在 /run/g3，由 systemd 创建。
 
 CA（myCA.crt/myCA.key）随包安装到 /opt/zf/g3/conf——构建时 deploy/conf 没有成套 CA
 的话，这份是 g3mkcert 自动生成的自签根，正式环境请换成自己的 CA 重新打包。

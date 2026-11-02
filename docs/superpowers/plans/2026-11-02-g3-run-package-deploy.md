@@ -152,3 +152,17 @@
 
 首轮验证修掉的两个缺陷（已进 `build_run_package.sh`）：`sh -n` 必须在追加载荷前只验头部；
 自解压头部结尾必须有显式 `exit`，否则 shell 会把 payload 首行当命令读。
+
+## Task 9: 修订五——首次安装交互式指定监听端口
+
+**Files:** `deploy/install.sh`（新增 `configure_listen_port`）、`deploy/build_run_package.sh`
+（README 部署段）、Spec §7、`doc/deploy-run-package.md` §3。
+
+- [x] Step 1：`install.sh` 仅在 `g3proxy.yaml` **新装**时问一行"g3proxy 监听端口
+  [模板默认 10087]："——回车/EOF 用默认，1–65535 数字 `sed` 写进新文件，非法重问；
+  默认值从模板 `"[::]:<端口>"` 现取；已有配置（未变化 / `.new`）不询问、不改动
+- [x] Step 2：交互写在校验 `-t` 之前，端口错不了还过不了校验就中止；README/文档同步
+- [x] V9a 交互输入 10088（前置 `abc`/`0`/`70000` 三次非法均重问）：`g3proxy.yaml` 落
+  `[::]:10088`，服务 active 且 `ss` 显示监听 10088（本机 NETNS=no 打包实跑，2026-11-02）
+- [x] V9b 非交互（stdin 到 EOF）：问一行后直接落默认 10087，服务监听 10087
+- [x] V9c 升级（已有 10088 配置）：不出现端口询问，模板差异只落 `.new`，MainPID 不变

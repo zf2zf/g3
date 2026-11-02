@@ -4,6 +4,9 @@
 # 都装为 systemd 服务并启动。不提供任何命令行选项——正常流程由 .run
 # 自解压安装器解压后调用本脚本。
 #
+# 全新安装（目标机上还没有 g3proxy.yaml）会交互式询问 g3proxy 的监听端口，
+# 直接回车用配置模板里的默认值；已有配置时不再询问，端口以现网文件为准。
+#
 # PREFIX / SYSTEMD_DIR 环境变量仅供测试，现场部署不要设置它们。
 
 set -eu
@@ -73,6 +76,39 @@ install_config_file() {
 	fi
 }
 
+# 监听端口交互：只在新装 g3proxy.yaml 时问一次，把端口写进刚装好的文件。
+# 默认值取自模板里的 listen address；输入非法就重问； stdin 是 EOF（非交互
+# 场景，如管道/自动化）直接落默认值，不卡住。
+configure_listen_port() {
+	dest=$1
+	default_port=$(sed -n 's/.*\[::\]:\([0-9][0-9]*\).*/\1/p' "$dest" | head -1)
+	if [ -z "$default_port" ]; then
+		echo "  没在 $dest 里找到 \"[::]:<端口>\" 形式的 listen 地址，跳过端口询问" >&2
+		return
+	fi
+	while :; do
+		printf 'g3proxy 监听端口 [%s]：' "$default_port"
+		if ! read answer; then
+			answer=''
+			echo
+		fi
+		[ -n "$answer" ] || answer=$default_port
+		case $answer in
+		*[!0-9]*)
+			echo "  端口要是 1–65535 的数字"
+			continue
+			;;
+		esac
+		[ "$answer" -ge 1 ] && [ "$answer" -le 65535 ] && break
+		echo "  端口要是 1–65535 的数字"
+	done
+	if [ "$answer" != "$default_port" ]; then
+		sed "s#\[::\]:$default_port\\\"#[::]:$answer\\\"#g" "$dest" > "$dest.tmp" \
+			&& mv "$dest.tmp" "$dest"
+		echo "  监听端口写入 $dest：[::]:$answer"
+	fi
+}
+
 echo "==> 安装可执行程序到 ${PREFIX}/bin"
 mkdir -p "$PREFIX/bin"
 for bin in "$SCRIPT_DIR"/bin/*; do
@@ -91,7 +127,14 @@ done
 
 echo "==> 安装配置到 ${PREFIX}/conf"
 mkdir -p "$PREFIX/conf"
+fresh_proxy_config=0
+[ -e "$PREFIX/conf/g3proxy.yaml" ] || fresh_proxy_config=1
 install_config_file "$SCRIPT_DIR/conf/g3proxy.yaml" "$PREFIX/conf/g3proxy.yaml"
+if [ "$fresh_proxy_config" = 1 ]; then
+	configure_listen_port "$PREFIX/conf/g3proxy.yaml"
+else
+	echo "  已有 g3proxy.yaml，监听端口沿用现配置（要改端口：编辑该文件后 systemctl restart g3proxy）"
+fi
 install_config_file "$SCRIPT_DIR/conf/g3fcgen.yaml" "$PREFIX/conf/g3fcgen.yaml"
 if [ -e "$SCRIPT_DIR/conf/myCA.crt" ]; then
 	# 现网 CA 绝不被动：与已有 CA 不同的新 CA 只会落到 *.new

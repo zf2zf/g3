@@ -149,7 +149,11 @@ sudo ./g3-run-<...>.run
 1. 检查包结构、root、systemd，再兜底检查 CA：正常构建的包必带 CA（见第 1 节），只有包被
    手工改动时才可能缺失——那时在写任何系统目录**之前**中止；
 2. `bin/*` 装到 `/opt/zf/g3/bin`（0755），`README.md`/`VERSION` 落到 `/opt/zf/g3/`；
-3. 配置装到 `/opt/zf/g3/conf`（`g3proxy.yaml`、`g3fcgen.yaml`、随包的 CA）；
+3. 配置装到 `/opt/zf/g3/conf`（`g3proxy.yaml`、`g3fcgen.yaml`、随包的 CA）。**首次安装**
+   （目标机上还没有 `g3proxy.yaml`）会问一行"g3proxy 监听端口 [10087]："：直接回车或输入
+   空行用默认，填别的数字则写进刚装好的 `g3proxy.yaml`，非法输入会重问；非交互执行
+   （stdin 到 EOF）自动落默认值。已有配置时不询问，端口以现网文件为准，改端口直接编辑
+   `/opt/zf/g3/conf/g3proxy.yaml` 再重启；
 4. 用 `/opt/zf/g3/bin/g3proxy -t -c /opt/zf/g3/conf/g3proxy.yaml` 校验配置，**失败就不装单元、不启服务**；
 5. `sed` 渲染单元里的 `@PREFIX@`/`@CONTROL_DIR@`/`@GROUP@`（`@NETNS@` 已在打包时展开掉了），写到 `/etc/systemd/system/`，`daemon-reload`；
 6. 把 `uninstall.sh` 复制到 `/opt/zf/g3/uninstall.sh`；
