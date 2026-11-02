@@ -166,3 +166,16 @@
   `[::]:10088`，服务 active 且 `ss` 显示监听 10088（本机 NETNS=no 打包实跑，2026-11-02）
 - [x] V9b 非交互（stdin 到 EOF）：问一行后直接落默认 10087，服务监听 10087
 - [x] V9c 升级（已有 10088 配置）：不出现端口询问，模板差异只落 `.new`，MainPID 不变
+
+## Task 10: 修订六——打包配置改用 --参数
+
+**Files:** `deploy/build_run_package.sh`、`doc/deploy-run-package.md` §1。
+
+- [x] `--profile/--target/--bins/--packages/--features/--build-args/--dist-dir/--netns`
+  一组 `--参数=值`，覆盖同名环境变量（环境变量降为兼容/测试后门）；`--netns=no`、
+  `--netns=yes`、`--netns=<绝对路径>` 三态；未知参数报错退出
+- [x] 实跑：`--profile=debug --netns=no` 出包，单元无 `NetworkNamespacePath`，
+  `VERSION` 记 `namespace ... off`；`--help`/未知参数行为正确（2026-11-02）
+- 背景：默认 NETNS=yes 的包装到没有 ns-vpp 的机器上，install.sh 按设计在启服务前
+  中止（单元已装但未 enable、服务未起）——现场要么 `ip netns add`，要么用
+  `--netns=no` 重打包；本次给装不上的机器重打了 `--netns=no` 的包并装好，双服务 active。

@@ -19,11 +19,11 @@ g3fcgen 是必须的服务：auditor 配置里的 `tls_cert_generator` 会在运
 ## 1. 编译 run 包
 
 ```sh
-deploy/build_run_package.sh                                    # 默认 release
-PROFILE=debug        deploy/build_run_package.sh               # 排障用的调试包
-RUN_BINS="g3proxy g3proxy-ctl" deploy/build_run_package.sh      # 精简程序集
-NETNS=no deploy/build_run_package.sh                            # g3proxy 不进网络命名空间
-NETNS_PATH=/run/netns/ns-vpp deploy/build_run_package.sh        # 指定命名空间（默认值）
+deploy/build_run_package.sh                                    # 默认 release，g3proxy 进 ns-vpp
+deploy/build_run_package.sh --profile=debug                     # 排障用的调试包
+deploy/build_run_package.sh --bins="g3proxy g3proxy-ctl"        # 精简程序集
+deploy/build_run_package.sh --netns=no                          # g3proxy 不进网络命名空间
+deploy/build_run_package.sh --netns=/run/netns/ns-other         # 指定命名空间
 ```
 
 产物在 `dist/`：
@@ -51,19 +51,18 @@ ldd dist/g3-run-*/bin/g3proxy | grep 'not found'   # 应该没有输出
 要交叉编译就设 `TARGET`（例如 `TARGET=x86_64-unknown-linux-musl`），此时包内自检会被跳过
 ——产物不能在构建机上运行，配置校验得在目标机做。
 
-可覆盖的环境变量：
+配置项用 `--参数=值`（同名环境变量仍可覆盖，仅留作兼容与测试后门）：
 
-| 变量 | 默认值 | 作用 |
-|------|--------|------|
-| `RUN_BINS` | `g3proxy g3proxy-ctl g3fcgen` | 拷进包 `bin/` 的可执行程序 |
-| `BUILD_PACKAGES` | `g3proxy g3proxy-ctl g3fcgen` | 一起编译的 workspace 包 |
-| `PROFILE` | `release` | cargo profile；`debug` 走 cargo 的 dev profile |
-| `TARGET` | 空 | cargo `--target`，非空时跳过自检 |
-| `EXTRA_FEATURES` | 空 | 追加 cargo feature |
-| `NETNS` | `yes` | 是否给 g3proxy 单元写 `NetworkNamespacePath=`；`no`/`off`/`false`/`0` 表示不进 |
-| `NETNS_PATH` | `/run/netns/ns-vpp` | g3proxy 进入的网络命名空间路径（必须是绝对路径） |
-| `G3_BUILD_ARGS` | 空 | 原样附加给 cargo 的参数（逃生口） |
-| `DIST_DIR` | `<仓库>/dist` | 产物目录 |
+| 参数 | 环境变量 | 默认值 | 作用 |
+|------|----------|--------|------|
+| `--bins=` | `RUN_BINS`+`BUILD_PACKAGES` | `g3proxy g3proxy-ctl g3fcgen` | 编译并拷进包 `bin/` 的可执行程序 |
+| `--packages=` | `BUILD_PACKAGES` | 同上 | 只改编译范围、不改 `bin/` 拷贝 |
+| `--profile=` | `PROFILE` | `release` | cargo profile；`debug` 走 cargo 的 dev profile |
+| `--target=` | `TARGET` | 空 | cargo `--target`，非空时跳过自检 |
+| `--features=` | `EXTRA_FEATURES` | 空 | 追加 cargo feature |
+| `--netns=no` / `--netns=<绝对路径>` | `NETNS`/`NETNS_PATH` | `yes`、`/run/netns/ns-vpp` | g3proxy 单元是否写 `NetworkNamespacePath=` 及路径 |
+| `--build-args=` | `G3_BUILD_ARGS` | 空 | 原样附加给 cargo 的参数（逃生口） |
+| `--dist-dir=` | `DIST_DIR` | `<仓库>/dist` | 产物目录 |
 
 脚本自己判断 c-ares：`pkg-config --atleast-version 1.18.0 libcares` 通过就用系统库，否则退回
 `vendored-c-ares`，与 `scripts/package` 里现有打包脚本的判定一致。
@@ -98,8 +97,9 @@ deploy/build_run_package.sh
 
 `deploy/systemd/g3proxy.service` 模板里有一行 `@NETNS@` 占位符，**打包时**就展开：
 
-- `NETNS=yes`（默认）→ 展开成 `NetworkNamespacePath=${NETNS_PATH}` 与 `PrivateNetwork=no`；
-- `NETNS=no` → 这一整行删掉，单元里没有任何命名空间指令。
+- 默认（或显式 `--netns=yes` / `--netns=<绝对路径>`）→ 展开成 `NetworkNamespacePath=<路径>`
+  （默认 `/run/netns/ns-vpp`）与 `PrivateNetwork=no`；
+- `--netns=no` → 这一整行删掉，单元里没有任何命名空间指令。
 
 所以进包的 `systemd/g3proxy.service` 在这一项上已经是成品，`install.sh` 只负责
 `@PREFIX@`/`@CONTROL_DIR@`/`@GROUP@` 这些目标机才知道的路径。`PrivateNetwork=no` 是
@@ -158,7 +158,7 @@ sudo ./g3-run-<...>.run
 5. `sed` 渲染单元里的 `@PREFIX@`/`@CONTROL_DIR@`/`@GROUP@`（`@NETNS@` 已在打包时展开掉了），写到 `/etc/systemd/system/`，`daemon-reload`；
 6. 把 `uninstall.sh` 复制到 `/opt/zf/g3/uninstall.sh`；
 7. 单元里写了 `NetworkNamespacePath=` 时，检查该路径在目标机存在——命名空间不存在就直接
-   失败并给出三条出路（建命名空间 / `systemctl edit` 现场置空 / `NETNS=no` 重打包），
+   失败并给出三条出路（建命名空间 / `systemctl edit` 现场置空 / `--netns=no` 重打包），
    不留一个起不来的 g3proxy 让操作者去翻 journal；
 8. `systemctl enable --now g3fcgen`（失败即整体失败退出），再 `enable --now g3proxy`。
 
@@ -257,7 +257,7 @@ diff /opt/zf/g3/conf/g3proxy.yaml{,.new}
   端口并写 `/run/g3`，若要降权请自行加 `User=`/`AmbientCapabilities=` 并验证。默认的
   `NetworkNamespacePath=` 只是把进程搬进 vpp 那侧已经存在的网络命名空间（systemd 需要
   `CAP_SYS_ADMIN`，root 服务本就有），`PrivateNetwork=no` 表示没有做网络隔离，不是安全加固；
-  要完全关掉就在打包时 `NETNS=no`。
+  要完全关掉就在打包时 `--netns=no`。
 - 带 CA 的 `.run` 含私钥：临时目录 0700、退出即删，但**文件本身的保管与分发要按私钥的
   级别来**。`deploy/conf/myCA.*` 已进 `.gitignore`，不要把私钥提交进仓库。
 - `uninstall.sh` 会 `rm -rf` 整个安装目录 `/opt/zf/g3`，配置与 CA 全在里面，执行前确认

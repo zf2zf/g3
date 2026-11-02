@@ -16,16 +16,16 @@
 # 构建时自动用 g3mkcert 生成一份自签根 CA 写回 deploy/conf（下次复用，已 gitignore）。
 # 正式环境请换成自己的 CA 再打包（带 CA 的 .run 按私钥级别分发）。
 #
-# 用法：
+# 用法（--参数 覆盖同名环境变量，环境变量只留作兼容与测试后门）：
 #   deploy/build_run_package.sh
-#   PROFILE=debug deploy/build_run_package.sh            # 排障用的调试包
-#   TARGET=x86_64-unknown-linux-musl deploy/build_run_package.sh   # 交叉编译
-#   RUN_BINS="g3proxy g3proxy-ctl" deploy/build_run_package.sh     # 精简程序集
-#   EXTRA_FEATURES=vendored-openssl deploy/build_run_package.sh    # 追加 cargo feature
-#   NETNS=no deploy/build_run_package.sh                 # g3proxy 不进网络命名空间
-#   NETNS_PATH=/run/netns/ns-other deploy/build_run_package.sh    # 换命名空间
+#   deploy/build_run_package.sh --profile=debug             # 排障用的调试包
+#   deploy/build_run_package.sh --target=x86_64-unknown-linux-musl   # 交叉编译
+#   deploy/build_run_package.sh --bins="g3proxy g3proxy-ctl"         # 精简程序集
+#   deploy/build_run_package.sh --features=vendored-openssl          # 追加 cargo feature
+#   deploy/build_run_package.sh --netns=no                  # g3proxy 不进网络命名空间
+#   deploy/build_run_package.sh --netns=/run/netns/ns-other # 换命名空间（默认 ns-vpp）
 #
-# g3proxy 默认装进网络命名空间（NETNS_PATH，默认 /run/netns/ns-vpp）：跑在 VPP 那边
+# g3proxy 默认装进网络命名空间（--netns 的路径值，默认 /run/netns/ns-vpp）：跑在 VPP 那边
 # 的网络栈里，监听地址与回环都是该命名空间的。g3fcgen 与 ICAP 服务不进——
 # 生效后进的 127.0.0.1 是 ns-vpp 的回环，g3proxy.yaml 里走回环的 g3fcgen(2999)
 # 与 ICAP(1344) 必须在里面可达，否则 TLS 拦截与审计取不到东西。
@@ -59,17 +59,53 @@ usage() {
 	awk 'NR > 2 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"
 }
 
-case "${1:-}" in
--h | --help)
-	usage
-	exit 0
-	;;
-"") ;;
-*)
-	echo "未知参数：${1}（用 -h 看用法）" >&2
-	exit 1
-	;;
-esac
+# --参数=值 形式的配置，逐个覆盖上面从环境变量取来的默认值
+while [ $# -gt 0 ]; do
+	opt=$1
+	case $opt in
+	-h | --help)
+		usage
+		exit 0
+		;;
+	--profile=*)
+		PROFILE=${opt#*=}
+		;;
+	--target=*)
+		TARGET=${opt#*=}
+		;;
+	--bins=*)
+		RUN_BINS=${opt#*=}
+		BUILD_PACKAGES=${opt#*=}
+		;;
+	--packages=*)
+		BUILD_PACKAGES=${opt#*=}
+		;;
+	--features=*)
+		EXTRA_FEATURES=${opt#*=}
+		;;
+	--build-args=*)
+		G3_BUILD_ARGS=${opt#*=}
+		;;
+	--dist-dir=*)
+		DIST_DIR=${opt#*=}
+		;;
+	--netns=no)
+		NETNS=no
+		;;
+	--netns=yes)
+		NETNS=yes
+		;;
+	--netns=/*)
+		NETNS=yes
+		NETNS_PATH=${opt#--netns=}
+		;;
+	*)
+		echo "未知参数：${opt}（用 -h 看用法）" >&2
+		exit 1
+		;;
+	esac
+	shift
+done
 
 cd "$PROJECT_DIR"
 
