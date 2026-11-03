@@ -34,6 +34,24 @@ pub(crate) fn is_upload_command(line: &[u8]) -> bool {
     matches!(upper.as_slice(), b"STOR" | b"STOU" | b"APPE")
 }
 
+/// 拆出上传命令的命令名与完整目标路径。
+///
+/// 参数必须取命令动词之后的整行余部：FTP 文件名允许含空格，按空白切分会把
+/// `STOR my report.pdf` 截成 `my`，审计记录里的文件名就是错的。
+/// 文件名也允许非 UTF-8 字节（如 GBK 客户端），故走 lossy 转换，
+/// 直接按 UTF-8 解析失败会让路径变成空串、审计记录里就没有文件了。
+pub(crate) fn parse_upload_command(line: &[u8]) -> (String, String) {
+    let text = String::from_utf8_lossy(line);
+    let trimmed = text.trim_end_matches(['\r', '\n']);
+    let end = trimmed
+        .bytes()
+        .take_while(|b| b.is_ascii_alphabetic())
+        .count();
+    let cmd_name = trimmed[..end].to_ascii_uppercase();
+    let ftp_path = trimmed[end..].trim_start().to_string();
+    (cmd_name, ftp_path)
+}
+
 /// 判断是否为被动模式协商命令：PASV 或 EPSV。
 pub(crate) fn is_pasv_command(line: &[u8]) -> bool {
     let end = line.iter().take_while(|b| b.is_ascii_alphabetic()).count();
@@ -357,6 +375,43 @@ mod tests {
         assert!(is_upload_command(b"STOR file.txt\r\n"));
         assert!(is_upload_command(b"stor file.txt\r\n"));
         assert!(is_upload_command(b"StOr file.txt\r\n"));
+    }
+
+    // =====================================================================
+    // parse_upload_command tests
+    // =====================================================================
+    #[test]
+    fn parse_upload_command_keeps_spaces_in_path() {
+        assert_eq!(
+            parse_upload_command(b"STOR my report 2026.pdf\r\n"),
+            ("STOR".to_string(), "my report 2026.pdf".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_upload_command_uppercases_verb() {
+        assert_eq!(
+            parse_upload_command("appe 中文目录/数据.txt\r\n".as_bytes()),
+            ("APPE".to_string(), "中文目录/数据.txt".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_upload_command_without_argument() {
+        assert_eq!(
+            parse_upload_command(b"STOU\r\n"),
+            ("STOU".to_string(), String::new())
+        );
+    }
+
+    #[test]
+    fn parse_upload_command_survives_non_utf8_path() {
+        // GBK 编码的"报告.txt"：按 UTF-8 硬解会整行失败，lossy 后仍保留文件与扩展名
+        let line = b"STOR \xB1\xA8\xB8\xE6.txt\r\n";
+        let (cmd, path) = parse_upload_command(line);
+        assert_eq!(cmd, "STOR");
+        assert!(path.ends_with(".txt"), "{path}");
+        assert!(!path.is_empty(), "{path}");
     }
 
     #[test]

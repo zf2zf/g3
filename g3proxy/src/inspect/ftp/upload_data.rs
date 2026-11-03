@@ -14,6 +14,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use g3_icap_client::reqmod::{ConnectionProtocol, ConnectionTuple};
+use g3_slog_types::LtUuid;
 use g3_types::net::TlsKeyLogBuffer;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -22,6 +23,29 @@ use crate::inspect::{BoxAsyncRead, BoxAsyncWrite, StreamInspectContext};
 use crate::serve::ServerTaskResult;
 use crate::serve::audit_bridge::{UploadAuditContext, run_upload_audit_or_relay_bidi};
 use crate::serve::ftp_proxy::upload_state::{PendingUploadInfo, get_ftp_upload_state};
+
+/// 记录一条 FTP 上传数据连接的拦截日志。
+///
+/// 上传审计本身只用 `log::debug!` 输出，生产日志级别（warn）下完全看不见，
+/// 因此这里补一条与 HTTP `HttpForward` 同级的 slog 记录，留下文件名与审计字节数。
+/// `audited_bytes` 为 `None` 表示审计链路未完成。
+fn log_upload_audit<SC: ServerConfig>(
+    ctx: &StreamInspectContext<SC>,
+    upload_info: &PendingUploadInfo,
+    audited_bytes: Option<u64>,
+) {
+    if let Some(logger) = ctx.intercept_logger() {
+        slog::info!(logger, "";
+            "intercept_type" => "FtpUploadData",
+            "task_id" => LtUuid(ctx.server_task_id()),
+            "depth" => ctx.inspection_depth,
+            "ftp_command" => upload_info.ftp_command.as_str(),
+            "ftp_path" => upload_info.ftp_path.as_str(),
+            "upstream_addr" => format!("{}", ctx.connect_notes.server_addr),
+            "audited_bytes" => audited_bytes.unwrap_or_default(),
+        );
+    }
+}
 
 /// 数据连接的四条 IO 半端（客户端读/写、源站读/写），均为解密后的明文流。
 struct FtpUploadDataIo {
@@ -130,7 +154,7 @@ where
             keylog_buffer: self.keylog_buffer.clone(),
         };
 
-        let _ = run_upload_audit_or_relay_bidi(
+        let audited_bytes = run_upload_audit_or_relay_bidi(
             io.clt_r,
             io.clt_w,
             io.ups_r,
@@ -140,6 +164,8 @@ where
             Some(audit_ctx),
         )
         .await;
+
+        log_upload_audit(&self.ctx, &upload_info, audited_bytes);
 
         Ok(())
     }
@@ -234,7 +260,7 @@ where
                                 keylog_buffer: keylog_buffer.clone(),
                             };
 
-                            let _ = run_upload_audit_or_relay_bidi(
+                            let audited_bytes = run_upload_audit_or_relay_bidi(
                                 Box::new(clt_r),
                                 clt_w,
                                 ups_r,
@@ -243,6 +269,8 @@ where
                                 ctx.max_idle_count,
                                 Some(audit_ctx),
                             ).await;
+
+                            log_upload_audit(&ctx, &upload_info, audited_bytes);
                         } else {
                             // 非上传数据连接（如下载）：直接透明中继
                             let _ = run_upload_audit_or_relay_bidi(

@@ -28,7 +28,7 @@ use crate::inspect::{
 };
 use crate::log::task::TaskEvent;
 use crate::serve::ftp_proxy::ctl_common::{
-    is_auth_tls_command, is_upload_command, read_ftp_response,
+    is_auth_tls_command, is_upload_command, parse_upload_command, read_ftp_response,
 };
 use crate::serve::ftp_proxy::upload_state::get_ftp_upload_state;
 use crate::serve::{ServerTaskError, ServerTaskResult};
@@ -339,14 +339,9 @@ where
                                         idle_count = 0;
 
                                         if is_upload_command(&clt_line) {
-                                            // STOR/APPE：解析命令名与路径记入全局上传状态，
+                                            // STOR/APPE：解析命令名与完整路径记入全局上传状态，
                                             // 后续该 IP 对的数据连接将触发 ICAP 上传审计
-                                            let cmd_str = std::str::from_utf8(&clt_line)
-                                                .map(str::trim)
-                                                .unwrap_or("");
-                                            let mut parts = cmd_str.split_whitespace();
-                                            let cmd_name = parts.next().unwrap_or("STOR").to_string();
-                                            let ftp_path = parts.next().unwrap_or("").to_string();
+                                            let (cmd_name, ftp_path) = parse_upload_command(&clt_line);
 
                                             get_ftp_upload_state().mark_upload(
                                                 client_ip,
