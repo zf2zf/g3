@@ -179,3 +179,30 @@
 - 背景：默认 NETNS=yes 的包装到没有 ns-vpp 的机器上，install.sh 按设计在启服务前
   中止（单元已装但未 enable、服务未起）——现场要么 `ip netns add`，要么用
   `--netns=no` 重打包；本次给装不上的机器重打了 `--netns=no` 的包并装好，双服务 active。
+
+## Task 11: 修订七——内网 FTPS 拦截握手失败（现网报障）
+
+**Files:** `deploy/conf/g3proxy.yaml`、`doc/deploy-run-package.md` §7、Spec §9。
+
+现象：浏览器 HTTP 正常，FTP 客户端（显式 FTPS）连不上；日志 `protocol: ftp_control` →
+`intercept_type: FtpConnection` → `intercept_type: StartTlsHandshake, upstream handshake failed:
+… tls_post_process_server_certificate: certificate verify failed` → `reason: InterceptionError`。
+
+- [x] 复现：脚本走 CONNECT + `AUTH TLS`（`220 (vsFTPd 3.0.2)` / `234 Proceed`）后 TLS 握手被 EOF
+  截断，代理日志同上——与报障逐字一致（curl `ftp://`+`--ssl-reqd` 会被 HTTP 代理形态吃掉、
+  `ftps://` 是隐式 990，openssl `-proxy -starttls ftp` 则挂住不发 ClientHello，三条都不合用）
+- [x] 直连源站定位到**两条独立**成因：`verify error:num=18:self-signed certificate`
+  （自签 `CN=ftp`，CA:TRUE，2026-11-03 签、一年）；`-CAfile` 修好信任后改报
+  `tls_process_ske_dhe: dh key too small`（Server Temp Key: DH 1024 位，`@SECLEVEL=0` 才通，
+  源站也支持 ECDHE prime256v1 但自己的密码顺序偏向 DHE）
+- [x] 第一版修复按台追加信任锚（`ca_certificate` 内联那张证书 + `security_level: 0`），实测可用
+  （`PBSZ 200`、`PROT P 200`、`StartTlsHandshake ok`）——但被否：内网源站不可预先枚举，逐台钉证书
+  等于每来一台自签源站就要改一次配置、源站换证书还得再改
+- [x] 最终改法：`tls_interception_client` 用 `insecure: true` + `security_level: 0`，删掉 PEM。
+  两键缺一不可（只 `insecure` 仍卡在 `dh key too small`）。现网 `-t` 通过、`restart` 后复跑脚本
+  → `PBSZ 200`、`PROT P 200`、`reason: Finished`，客户端侧证书签发者 `g3 MITM Root CA`；
+  `http=200`、`https=200` 无回归；启动日志如期出现 `Tls Insecure Mode ...`（预期说明，非故障）
+- [x] 模板与现网一致（现网那份临时文件 `conf/ftp-server.crt` 已删）
+- 安全让步已记录在 Spec §9：这份 TLS 客户端上下文整个 auditor 共用，公网 HTTPS 拦截也一并不再
+  校验源站证书。想收紧有两条路——给内网协议单开 `server:` 段（另听端口）配专用 `auditor:` 只在
+  那里 `insecure`；或改源站（内网长期 CA 签服务器证书 + 2048 位 dhparams），之后两键都能删。

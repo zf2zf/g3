@@ -248,6 +248,25 @@ diff /opt/zf/g3/conf/g3proxy.yaml{,.new}
   客户端信任 `myCA.crt` 可用仓库里的 Windows 脚本：`deploy/windows-install-ca.bat`（与
   `myCA.crt` 放同目录双击，自动提权导进本机"受信任的根证书颁发机构"并校验；Firefox 仍需
   在它自己的证书管理器里单独导入）。
+- 内网源站自己的 TLS 参数也会让拦截失败，症状同样是 `reason: InterceptionError`，但出错的是
+  g3proxy 当 TLS 客户端这一侧（`tls_interception_client`，默认只信系统根 CA、OpenSSL 安全级别 1）。
+  FTP 最典型：客户端发 `AUTH TLS` 后日志依次是 `protocol: ftp_control` → `FtpConnection` →
+  `StartTlsHandshake`，接着 `upstream handshake failed: … certificate verify failed`，HTTP 却一切正常
+  （公网站点证书是可信的）。两条成因各自独立，缺一不可：`certificate verify failed` 是源站自签，
+  `dh key too small` 是源站 dhparams 只有 1024 位。逐台 `ca_certificate` 追加信任锚不可持续
+  ——内网源站无法预先枚举，今天堵 FTP 一台自签，明天又是别台——所以入口配置直接
+  `insecure: true`（不校验源站证书）+ `security_level: 0`（放行弱参数）。只配 `insecure` 的话
+  FTP 仍连不上，握手会接着报 `dh key too small`。
+  **代价**：这一份 TLS 客户端上下文整个 auditor 共用，g3proxy→源站段从此发现不了证书被冒充或
+  降级，被拦截的公网 HTTPS 也一并不再校验源站证书；启动日志那句 `Tls Insecure Mode: Tls Peer
+  (server) cert vertification is no longer enforced` 是这件事的自述，不是故障。要收紧就单独给内网
+  协议开一个 `server:` 段（另听一个端口）配一个专用 `auditor:`，只在那个 auditor 上设 `insecure`，
+  公网流量继续走带校验的那个；或者改源站（2048 位 dhparams、`ssl_ciphers` 优先 ECDHE、内网长期
+  CA 签服务器证书），那之后两个键都可以删。
+  想先确认某台源站占了哪几条，直连探一次即可：`openssl s_client -connect 20.20.136.42:21
+  -starttls ftp` 会同时报 `verify error:num=18:self-signed certificate` 与
+  `tls_process_ske_dhe: dh key too small`。修好的标志：`StartTlsHandshake` 落 `ok`，客户端看到的
+  FTP 证书签发者变成 `g3 MITM Root CA`。
 - 上传审计相关：`auditor` 段里的 `icap_reqmod_service` 决定旁路审计发给哪个 ICAP
   服务；`upload_audit_max_concurrency`（默认 64，0 表示不设限，样例里是注释掉的）控制
   同时进行的上传审计条数，名额用尽时新上传直接退化为直通转发并计入跳过数，不排队。详见

@@ -228,9 +228,20 @@ Documentation=file://@PREFIX@/README.md
 - **一个文件就是全部现场可调面**：监听端口在 `server:` 段，ICAP 审计地址、拦截开关在
   `auditor:` 段；`tls_cert_generator: { }` 留空即连本机 `127.0.0.1:2999` 的 g3fcgen，
   指别机就在里面写 `query_peer_addr`。不再有"目录必须与 yaml 同级"的隐性约束。
-- **`resolver.d`/`escaper.d` 默认注释**：指向不存在目录的这两行会让 `-t` 失败（实测报错
-  "failed to parse value of key resolver … No such file or directory"）。要用先建目录，
-  或者直接内联。这是自检阶段暴露并被修掉的第一个真实缺陷。
+- **`tls_interception_client` 关掉源站证书校验**：g3proxy 做中间人时自己是 TLS 客户端，默认只信
+  系统根 CA、OpenSSL 安全级别 1。现网 `20.20.136.42:21`（vsftpd 3.0.2）自签 `CN=ftp` 且 dhparams
+  只有 1024 位，客户端 `AUTH TLS` 后拦截握手失败（`certificate verify failed`；信任修好后接着报
+  `dh key too small`），整条控制连接 `reason: InterceptionError`，HTTP 不受影响。逐台追加
+  `ca_certificate` 信任锚被否决：内网源站无法预先枚举，每台自签源站都要改一次配置、换一次证书
+  还要再改。最终取 `insecure: true` + `security_level: 0`，两键缺一不可（`insecure` 只管校验，
+  弱 DH 由 `security_level` 管）。这是本处唯一的安全让步，作用域是整个 auditor 共用的一份 TLS
+  客户端上下文：g3proxy→源站段不再能发现冒充或降级，被拦截的公网 HTTPS 也一并失去源站证书校验，
+  启动日志的 `Tls Insecure Mode` 即此事的自述。真要收紧有两条路：给内网协议单开一个 `server:` 段
+  （另听端口）配专用 `auditor:`，只在那里 `insecure`；或改源站（2048 位 dhparams / `ssl_ciphers`
+  优先 ECDHE / 内网长期 CA 签发），之后两键都能删。
+- **`resolver.d`/`escaper.d` 曾经指向不存在的目录**：这两行会让 `-t` 失败（实测报错
+  "failed to parse value of key resolver … No such file or directory"），是自检阶段暴露并被修掉的
+  第一个真实缺陷；现在 `resolver:`/`escaper:` 都内联在入口配置里（见本节开头），要用目录形态先建目录。
 - `deploy/conf/g3fcgen.yaml` 只有 `backend.ca_certificate: myCA.crt` / `ca_private_key: myCA.key`
   （相对配置目录）；CA 材料按 §7 的前置规则要么随包、要么已在目标机上。
 
