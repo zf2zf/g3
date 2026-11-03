@@ -34,6 +34,7 @@ use super::{
 };
 use crate::audit::AuditContext;
 use crate::config::server::ServerConfig;
+use crate::inspect::http::upload_audit::{self, UploadBodyFraming};
 use crate::log::task::http_forward::TaskLogForHttpForward;
 use crate::module::http_forward::{
     BoxHttpForwardConnection, BoxHttpForwardContext, BoxHttpForwardReader, BoxHttpForwardWriter,
@@ -897,11 +898,11 @@ impl<'a> HttpProxyForwardTask<'a> {
             };
         }
 
-        // ICAP reqmod 旁路审计：只有携带请求体的请求才送检；
+        // ICAP reqmod 旁路审计：按上行送审门限筛掉无体、小体与（配置要求的）表单请求；
         // 未配置 ICAP 或并发名额用尽时走普通转发（绝不排队等待名额）
         if audit_task
-            && self.req.body_type().is_some()
-            && let Some((bypass, permit, framing)) = self.take_upload_audit().await
+            && let Some(body_framing) = self.upload_audit_body()
+            && let Some((bypass, permit, framing)) = self.take_upload_audit(body_framing).await
         {
             let mut adaptation_state = BypassRunState::new(self.task_notes.task_created_instant());
             let r = self
@@ -926,6 +927,22 @@ impl<'a> HttpProxyForwardTask<'a> {
             .await
     }
 
+    /// 按上行审计门限判断本次请求体是否值得送 ICAP：无请求体、请求体小于阈值、
+    /// 以及配置要求跳过的 `x-www-form-urlencoded` 表单都返回 `None`，
+    /// 让请求直接走普通转发，一个 ICAP 字节也不会发出。
+    ///
+    /// 判定必须在建立 ICAP 会话之前完成——一旦占用名额再退回就只是白白连接一次。
+    fn upload_audit_body(&self) -> Option<UploadBodyFraming> {
+        let body_type = self.req.body_type()?;
+        let cfg = self.audit_ctx.handle()?.h1_interception();
+        let content_type = self
+            .req
+            .end_to_end_headers
+            .get(header::CONTENT_TYPE)
+            .map(|value| value.to_str());
+        upload_audit::h1_upload_audit(cfg, Some(body_type), content_type)
+    }
+
     /// 为本次带请求体的请求准备一轮旁路上传审计：占用并发名额、建立 ICAP 旁路适配器、
     /// 生成 ICAP 封装所需的请求头字节。
     ///
@@ -934,6 +951,7 @@ impl<'a> HttpProxyForwardTask<'a> {
     /// 无论哪种情况，调用方都退化为普通转发，请求本身不受影响。
     async fn take_upload_audit(
         &mut self,
+        body_framing: UploadBodyFraming,
     ) -> Option<(
         BypassAdapter<ServerIdleChecker>,
         GaugeSemaphorePermit,
@@ -975,7 +993,9 @@ impl<'a> HttpProxyForwardTask<'a> {
         }
         let framing = BypassFraming {
             req_hdr: self.req.serialize_for_adapter(),
-            transformed_from: "HTTP/1.0",
+            transformed_from: upload_audit::scheme_tag(self.is_https),
+            http_version: upload_audit::http_version_tag(self.req.version),
+            body_framing: Some(body_framing.as_str()),
         };
         Some((adapter, permit, framing))
     }

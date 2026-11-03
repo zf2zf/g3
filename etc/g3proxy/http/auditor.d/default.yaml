@@ -12,6 +12,9 @@ tls_keylog:
 h1_interception:
     req_hasbody: true
     req_body_min_size: 8
+    # 跳过 application/x-www-form-urlencoded 表单（登录框/搜索框）的上传审计；
+    # 浏览器文件上传的 multipart/form-data 不受影响，仍按上面的阈值送审。默认 false。
+    # req_skip_urlencoded_form: true
 	
 h2_interception: { } 
 

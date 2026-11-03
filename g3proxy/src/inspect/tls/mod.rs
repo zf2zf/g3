@@ -531,6 +531,8 @@ where
     fn prepare_ctx(&self, protocol: Protocol) -> StreamInspectContext<SC> {
         let mut ctx = self.ctx.clone();
         ctx.increase_inspection_depth();
+        // 能走到这里说明客户端侧已被中间人解密：内层协议对客户端是 TLS 承载
+        ctx.mark_over_tls();
         StreamInspectLog::new(&ctx).log(InspectSource::TlsAlpn, protocol);
         ctx
     }

@@ -19,3 +19,5 @@ pub(super) use v2::{H2InterceptObject, H2InterceptionError};
 mod v1;
 pub(crate) use v1::H1InterceptObject;
 pub(super) use v1::H1InterceptionError;
+
+pub(crate) mod upload_audit;

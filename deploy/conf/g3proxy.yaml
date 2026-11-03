@@ -48,6 +48,10 @@ auditor:
     h1_interception:
       req_hasbody: true
       req_body_min_size: 8
+      # 跳过 application/x-www-form-urlencoded 表单（登录框、搜索框）的上传审计：
+      # 这类请求体里没有文件，只按长度阈值筛会留下海量小表单。浏览器上传文件走的是
+      # multipart/form-data，不受本项影响，仍按上面的阈值送审。默认 false（不跳过）。
+      # req_skip_urlencoded_form: true
 
     h2_interception: { }
 

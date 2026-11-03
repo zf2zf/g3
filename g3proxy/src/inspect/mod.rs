@@ -189,6 +189,11 @@ pub(crate) struct StreamInspectContext<SC: ServerConfig> {
     /// 当前嵌套检测层数，初值 0；每进入一层内层检测 +1
     inspection_depth: usize,
 
+    /// 本会话的客户端侧是否为 TLS。只在 TLS 拦截对象里置真（见
+    /// `TlsInspectObject::prepare_ctx`），供审计上报区分 http / https。
+    /// 不能靠 keylog 缓冲是否存在反推——keylog 是可以单独关掉的配置。
+    over_tls: bool,
+
     /// 允许的空闲任务数上限（用户配置优先，否则取 server 配置）
     max_idle_count: usize,
 }
@@ -205,6 +210,7 @@ impl<SC: ServerConfig> Clone for StreamInspectContext<SC> {
             task_notes: self.task_notes.clone(),
             connect_notes: self.connect_notes,
             inspection_depth: self.inspection_depth,
+            over_tls: self.over_tls,
             max_idle_count: self.max_idle_count,
         }
     }
@@ -238,6 +244,7 @@ impl<SC: ServerConfig> StreamInspectContext<SC> {
             task_notes: StreamInspectTaskNotes::from(task_notes),
             connect_notes: StreamInspectConnectNotes::from(tcp_notes),
             inspection_depth: 0,
+            over_tls: false,
             max_idle_count,
         }
     }
@@ -331,6 +338,18 @@ impl<SC: ServerConfig> StreamInspectContext<SC> {
     #[inline]
     fn increase_inspection_depth(&mut self) {
         self.inspection_depth += 1;
+    }
+
+    /// 客户端侧是否走 TLS；决定审计上报里 `X-Transformed-From` 写 http 还是 https
+    #[inline]
+    pub(crate) fn over_tls(&self) -> bool {
+        self.over_tls
+    }
+
+    /// 标记本会话客户端侧为 TLS；只在 TLS 拦截对象里调用
+    #[inline]
+    fn mark_over_tls(&mut self) {
+        self.over_tls = true;
     }
 
     /// TLS 中间人拦截上下文；server 未启用 TLS 拦截时返回 `None`

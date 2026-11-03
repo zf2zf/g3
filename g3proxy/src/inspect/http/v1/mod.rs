@@ -46,7 +46,9 @@ mod upgrade;
 use upgrade::H1UpgradeTask;
 
 /* added by wming for repid audit */
-use g3_http::HttpBodyType;
+use http::header;
+
+use super::upload_audit;
 
 /// 请求侧 IO：仅持有客户端读端（带缓冲，请求体需按 body_type 逐块读取）。
 pub(crate) struct HttpRequestIo<CR: AsyncRead> {
@@ -297,32 +299,40 @@ where
 
                         let cfg = self.ctx.h1_interception();
 
-                        // 判断请求体是否"值得"送 ICAP 检测：chunked 一律待定，
-                        // 定长体则要求超过 req_body_min_size 阈值
-                        let body_pending = match r.inner.body_type() {
-                            Some(HttpBodyType::Chunked) => true,
-                            Some(HttpBodyType::ContentLength(v)) => {
-                                v > cfg.req_body_min_size as u64
-                            }
-                            _ => false,
-                        };
+                        // 送审判定（见 upload_audit）：按客户端声明的请求体长度过滤，
+                        // 分块传输没有可信长度、一律送审
+                        let body_type = r.inner.body_type();
+                        let content_type = r
+                            .inner
+                            .end_to_end_headers
+                            .get(header::CONTENT_TYPE)
+                            .map(|v| v.to_str());
+                        let audit_body = body_type.zip(
+                            upload_audit::h1_upload_audit(cfg, body_type, content_type),
+                        );
 
-                        // req_hasbody 开关决定是否允许无请求体请求绕过 ICAP 直转
-                        let use_icap = if cfg.req_hasbody { body_pending } else { true };
-
-                        if use_icap {
-                            if let Some(reqmod_client) = self.ctx.audit_handle.icap_reqmod_client()
-                            {
+                        match (audit_body, self.ctx.audit_handle.icap_reqmod_client()) {
+                            (Some((body_type, body_framing)), Some(reqmod_client)) => {
                                 // 请求体在转发的同时旁路送 ICAP 审计（不改写、不阻断）；
-                                // 无请求体或审计名额用尽时降级为普通转发
+                                // 审计名额用尽时降级为普通转发
                                 forward_task
-                                    .adapt_with_io(&mut req_io, &mut rsp_io, reqmod_client)
+                                    .adapt_with_io(
+                                        &mut req_io,
+                                        &mut rsp_io,
+                                        reqmod_client,
+                                        body_type,
+                                        body_framing,
+                                    )
                                     .await;
-                            } else {
+                            }
+                            (Some(_), None) => {
+                                // 未配置 ICAP：即便该送也无处送，直接转发
                                 forward_task.forward_with_io(&mut req_io, &mut rsp_io).await;
                             }
-                        } else {
-                            forward_task.forward_with_io(&mut req_io, &mut rsp_io).await;
+                            (None, _) => {
+                                // 无请求体、小请求体、表单：不建 ICAP 会话
+                                forward_task.forward_with_io(&mut req_io, &mut rsp_io).await;
+                            }
                         }
 
                         pipeline_stats.del_task();

@@ -41,6 +41,13 @@ pub struct H1InterceptionConfig {
     pub req_hasbody: bool,
     /// 请求体大小的下限阈值，小于它的请求不按体审计处理。
     pub req_body_min_size: usize,
+    /// 是否跳过 `application/x-www-form-urlencoded` 表单请求的上传审计。
+    ///
+    /// 这类请求体是登录框、搜索框、埋点这类键值对，没有文件内容可审；
+    /// 关掉本项则它们与文件上传一样按 `req_body_min_size` 判定。
+    /// 只影响 `x-www-form-urlencoded`：浏览器上传文件的 `multipart/form-data`
+    /// 同样是表单，但它是审计目标，不受本项影响。
+    pub req_skip_urlencoded_form: bool,
 }
 
 impl Default for H1InterceptionConfig {
@@ -60,6 +67,7 @@ impl Default for H1InterceptionConfig {
             /* added by wming for repid audit */
             req_hasbody: false,
             req_body_min_size: 0,
+            req_skip_urlencoded_form: false,
         }
     }
 }

@@ -61,13 +61,21 @@ pub enum BypassErrorKind {
 }
 
 /// 协议差异的唯一载体：封装区里的请求头字节（伪 HTTP 或真实 HTTP 报文头）
-/// + ICAP `X-Transformed-From` 协议来源标签。
+/// + ICAP `X-Transformed-From` 协议来源标签，以及 HTTP 专属的版本与成帧标记。
 #[derive(Debug)]
 pub struct BypassFraming {
     /// ICAP 封装区 req-hdr：以 `\r\n\r\n` 结尾的请求头字节
     pub req_hdr: Vec<u8>,
-    /// 写入 `X-Transformed-From` 的协议来源标签（如 "FTP" / "HTTP/1.0" / "HTTP/2.0"）
+    /// 写入 `X-Transformed-From` 的协议来源标签：HTTP 流量为 `http` / `https`，
+    /// FTP 数据通道为 `FTP`
     pub transformed_from: &'static str,
+    /// 写入 `X-Http-Version` 的协议版本（`1.0` / `1.1` / `2.0`）；
+    /// 非 HTTP 流量（如 FTP 数据通道）为 `None`，不发这个头
+    pub http_version: Option<&'static str>,
+    /// 写入 `X-Body-Framing` 的请求体成帧形态：`content-length` / `chunked` /
+    /// `stream`。取值告诉审计侧 req-body 里的字节需不需要先解客户端分块帧；
+    /// 不带请求体的上报为 `None`
+    pub body_framing: Option<&'static str>,
 }
 
 /// Final audit verdict from the ICAP server for one uploaded stream.
@@ -210,11 +218,18 @@ impl<I: IdleCheck> BypassAdapter<I> {
     }
 
     /// 追加本扩展专用的 ICAP 头：Allow: 204 告诉服务器"只回 204 放行
-    /// 就行，不需要修改后的内容"；X-Transformed-From 声明协议来源；
+    /// 就行，不需要修改后的内容"；X-Transformed-From 声明协议来源，
+    /// X-Http-Version 与 X-Body-Framing 补充 HTTP 的版本与请求体成帧形态；
     /// 其余为可选的客户端地址 / 用户名 / 五元组 / keylog 关联信息。
     fn push_extended_headers(&self, data: &mut Vec<u8>, framing: &BypassFraming) {
         data.put_slice(b"Allow: 204\r\n");
         let _ = write!(data, "X-Transformed-From: {}\r\n", framing.transformed_from);
+        if let Some(version) = framing.http_version {
+            let _ = write!(data, "X-Http-Version: {version}\r\n");
+        }
+        if let Some(body_framing) = framing.body_framing {
+            let _ = write!(data, "X-Body-Framing: {body_framing}\r\n");
+        }
         if let Some(addr) = self.client_addr {
             crate::serialize::add_client_addr(data, addr);
         }
@@ -1409,7 +1424,9 @@ mod tests {
     fn test_framing() -> BypassFraming {
         BypassFraming {
             req_hdr: b"GET /x HTTP/1.1\r\nHost: t\r\n\r\n".to_vec(),
-            transformed_from: "HTTP/1.1",
+            transformed_from: "http",
+            http_version: Some("1.1"),
+            body_framing: Some("chunked"),
         }
     }
 
@@ -1801,7 +1818,9 @@ mod tests {
         let req_hdr = b"POST /upload HTTP/1.1\r\nHost: example.org\r\nContent-Length: 4\r\n\r\n";
         let framing = BypassFraming {
             req_hdr: req_hdr.to_vec(),
-            transformed_from: "HTTP/2.0",
+            transformed_from: "https",
+            http_version: Some("2.0"),
+            body_framing: Some("content-length"),
         };
         let body = test_body(2048);
         let mut clt_r = Cursor::new(body.clone());
@@ -1832,7 +1851,9 @@ mod tests {
         for expect in [
             "REQMOD icap://",
             "Allow: 204\r\n",
-            "X-Transformed-From: HTTP/2.0\r\n",
+            "X-Transformed-From: https\r\n",
+            "X-Http-Version: 2.0\r\n",
+            "X-Body-Framing: content-length\r\n",
             "X-Client-IP: 203.0.113.7\r\n",
             "X-Client-Port: 5555\r\n",
             "X-Client-Username: alice\r\n",

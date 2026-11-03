@@ -43,6 +43,7 @@
 //! - `recv_response.rs`：ICAP 直接返回 HTTP 响应（拦截页）时的收尾分支；
 //! - `error.rs`：本模块统一错误类型 [`H2ReqmodAdaptationError`]。
 
+use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -124,6 +125,8 @@ impl IcapReqmodClient {
             /* added by wming for repid audit */
             connection_tuple: None,
             keylog_buffer: None,
+            transformed_scheme: "http",
+            http_version: Some("2.0"),
         })
     }
 }
@@ -153,6 +156,10 @@ pub struct H2RequestAdapter<I: IdleCheck> {
     connection_tuple: Option<ConnectionTuple>,
     // TLS keylog 缓冲区，序列化成 X-TLS-* 头上报（供 ICAP 侧解密审计）
     keylog_buffer: Option<Arc<TlsKeyLogBuffer>>,
+    /// `X-Transformed-From` 取值：`http` / `https`，由调用方按实际承载设置
+    transformed_scheme: &'static str,
+    /// `X-Http-Version` 取值（`2.0`）；`None` 时不发这个头
+    http_version: Option<&'static str>,
 }
 
 /// 一次上报任务的运行时状态/耗时打点，由调用方（代理任务）创建并持有。
@@ -233,17 +240,29 @@ impl<I: IdleCheck> H2RequestAdapter<I> {
         self.keylog_buffer = Some(buffer);
     }
 
+    /// 设置协议来源标签：`scheme` 为 `http` / `https`（写进 `X-Transformed-From`），
+    /// `version` 写进 `X-Http-Version`，`None` 表示不发这个头。
+    /// 不调用则按明文 HTTP/2.0 声明。
+    pub fn set_protocol_tag(&mut self, scheme: &'static str, version: Option<&'static str>) {
+        self.transformed_scheme = scheme;
+        self.http_version = version;
+    }
+
     /// 追加 ICAP 扩展头（写进 ICAP 请求头区，位于 `Encapsulated` 之前）。
     ///
-    /// 与 h1 版的差异：这里声明的是 `X-Transformed-From: HTTP/2.0`，
-    /// 且当 h2 流带 `:protocol` pseudo-header（RFC 8441 extended CONNECT，
-    /// h2 crate 以 `Protocol` 扩展形式挂在 `Extensions` 上）时，
-    /// 额外用 `X-HTTP-Upgrade` 告知 ICAP 被升级的协议名（如 `websocket`）。
+    /// `X-Transformed-From` 声明封装报文的来源（`http` / `https`），
+    /// `X-Http-Version` 给出协议版本；当 h2 流带 `:protocol` pseudo-header
+    /// （RFC 8441 extended CONNECT，h2 crate 以 `Protocol` 扩展形式挂在
+    /// `Extensions` 上）时，额外用 `X-HTTP-Upgrade` 告知 ICAP 被升级的协议名
+    /// （如 `websocket`）。
     ///
     /// `extensions` 仅在"只报头"路径（`xfer_without_body` / `xfer_connect`）
     /// 传入；带 body 的上报路径传 `None`，因为此时请求已被 body 流走开过。
     fn push_extended_headers(&self, data: &mut Vec<u8>, extensions: Option<&Extensions>) {
-        data.put_slice(b"X-Transformed-From: HTTP/2.0\r\n");
+        let _ = write!(data, "X-Transformed-From: {}\r\n", self.transformed_scheme);
+        if let Some(version) = self.http_version {
+            let _ = write!(data, "X-Http-Version: {version}\r\n");
+        }
         if let Some(addr) = self.client_addr {
             crate::serialize::add_client_addr(data, addr);
         }

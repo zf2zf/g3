@@ -36,6 +36,7 @@ use g3_types::net::TlsKeyLogBuffer;
 use super::{HttpRequest, HttpRequestIo, HttpResponseIo};
 use crate::config::server::ServerConfig;
 use crate::inspect::StreamInspectContext;
+use crate::inspect::http::upload_audit::{self, UploadBodyFraming};
 use crate::module::http_forward::HttpProxyClientResponse;
 use crate::serve::audit_bridge::log_bypass_audit_end;
 use crate::serve::{ServerIdleChecker, ServerTaskError, ServerTaskResult};
@@ -225,25 +226,21 @@ impl<'a, SC: ServerConfig> H1ForwardTask<'a, SC> {
     /// 流程：取并发名额 → 创建旁路适配器（注入客户端地址、用户名、连接五元组、
     /// TLS keylog）→ 边转发请求体边旁路上报 → 用管线的实测耗时回填审计字段；
     /// 客户端数据未读完或上游未写全时强制关闭连接（残留字节会破坏流水线上的下一个请求）。
-    /// 无请求体的请求完全不送检；名额用尽或 ICAP 连接建立失败都只跳过审计，
-    /// 转发照常（fail-open）。
+    /// 调用方已判定本请求值得送检（`body_type` + `body_framing` 来自送审判定）；
+    /// 名额用尽或 ICAP 连接建立失败都只跳过审计，转发照常（fail-open）。
     pub(super) async fn adapt_with_io<CR, CW, UR, UW>(
         &mut self,
         req_io: &mut HttpRequestIo<CR>,
         rsp_io: &mut HttpResponseIo<CW, UR, UW>,
         reqmod_client: &IcapReqmodClient,
+        body_type: HttpBodyType,
+        body_framing: UploadBodyFraming,
     ) where
         CR: AsyncRead + Send + Unpin,
         CW: AsyncWrite + Send + Unpin,
         UR: AsyncRead + Unpin,
         UW: AsyncWrite + Send + Unpin,
     {
-        // 旁路审计只针对有请求体的请求：无体请求直接普通转发
-        let Some(body_type) = self.req.body_type() else {
-            self.forward_with_io(req_io, rsp_io).await;
-            return;
-        };
-
         // 名额用尽：跳过审计，绝不排队等待
         let Some(_permit) = self.ctx.audit_handle.try_upload_audit_permit() else {
             self.ctx.audit_handle.mark_upload_audit_skipped();
@@ -285,10 +282,13 @@ impl<'a, SC: ServerConfig> H1ForwardTask<'a, SC> {
         // 同一拦截会话（keep-alive / 流水线）的下一个请求，不能半关闭
         adapter.set_upstream_half_close(false);
 
-        // 封装区请求头用面向源站的透明序列化形式，与发给上游的字节一致
+        // 封装区请求头用面向源站的透明序列化形式，与发给上游的字节一致；
+        // 协议来源按客户端侧是否 TLS 写 http/https，版本与请求体成帧另发两行
         let framing = BypassFraming {
             req_hdr: self.req.serialize_for_adapter(),
-            transformed_from: "HTTP/1.0",
+            transformed_from: upload_audit::scheme_tag(self.ctx.over_tls()),
+            http_version: upload_audit::http_version_tag(self.req.version),
+            body_framing: Some(body_framing.as_str()),
         };
 
         let mut adaptation_state = new_run_state();

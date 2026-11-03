@@ -32,6 +32,7 @@ use g3_types::net::UpstreamAddr;
 
 use super::{HttpRequest, HttpRequestIo, HttpResponseIo};
 use crate::config::server::ServerConfig;
+use crate::inspect::http::upload_audit;
 use crate::inspect::{BoxAsyncRead, BoxAsyncWrite, StreamInspectContext, StreamInspection};
 use crate::module::http_forward::HttpProxyClientResponse;
 use crate::serve::{ServerIdleChecker, ServerTaskError, ServerTaskResult};
@@ -230,6 +231,10 @@ where
         {
             Ok(mut adapter) => {
                 adapter.set_client_addr(self.ctx.task_notes.client_addr);
+                adapter.set_protocol_tag(
+                    upload_audit::scheme_tag(self.ctx.over_tls()),
+                    upload_audit::http_version_tag(self.req.version),
+                );
                 if let Some(username) = self.ctx.raw_user_name() {
                     adapter.set_client_username(username.clone());
                 }

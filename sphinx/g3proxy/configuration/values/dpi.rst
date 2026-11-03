@@ -700,6 +700,42 @@ The keys are:
 
   .. versionadded:: 1.9.2
 
+* req_hasbody
+
+  **optional**, **type**: bool
+
+  Set if only requests with a body are submitted to the ICAP request modification service for upload audit.
+
+  When this is disabled, any request with a body is audited and the size threshold below does not apply.
+
+  **default**: false
+
+* req_body_min_size
+
+  **optional**, **type**: int
+
+  Set the lower bound of the request body size for upload audit. Only requests whose ``Content-Length``
+  is strictly greater than this value are submitted to the ICAP service.
+
+  Requests whose body length cannot be known in advance (chunked transfer encoding, HTTP/2 streams
+  without a ``content-length`` header) are always audited, no matter what this value is.
+
+  **default**: 0
+
+* req_skip_urlencoded_form
+
+  **optional**, **type**: bool
+
+  Set if ``application/x-www-form-urlencoded`` requests are excluded from upload audit. This is meant
+  for login boxes and search boxes, which carry no file to inspect.
+
+  Browser file uploads use ``multipart/form-data``, which is still audited and only filtered by the
+  size threshold above.
+
+  **default**: false
+
+  .. versionadded:: 1.13.0
+
 .. _conf_value_dpi_h2_interception:
 
 h2 interception

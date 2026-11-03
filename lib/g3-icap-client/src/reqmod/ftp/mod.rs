@@ -65,6 +65,9 @@ pub fn build_ftp_framing(ftp_command: &str, ftp_path: &str) -> BypassFraming {
     BypassFraming {
         req_hdr,
         transformed_from: "FTP",
+        // FTP 数据通道没有 HTTP 版本与请求体成帧可言，保持既有记录形态不变
+        http_version: None,
+        body_framing: None,
     }
 }
 

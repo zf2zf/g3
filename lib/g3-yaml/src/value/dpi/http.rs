@@ -60,6 +60,10 @@ pub fn as_h1_interception_config(value: &Yaml) -> anyhow::Result<H1InterceptionC
                 config.req_body_min_size = crate::value::as_usize(v)?;
                 Ok(())
             }
+            "req_skip_urlencoded_form" => {
+                config.req_skip_urlencoded_form = crate::value::as_bool(v)?;
+                Ok(())
+            }
             _ => Err(anyhow!("invalid key {k}")),
         })?;
 
@@ -168,6 +172,9 @@ mod tests {
                 rsp_header_max_size: 64KB
                 body_line_max_length: 8192
                 steal_forwarded_for: true
+                req_hasbody: true
+                req_body_min_size: 65536
+                req_skip_urlencoded_form: true
             "
         );
         let config = as_h1_interception_config(&yaml).unwrap();
@@ -179,6 +186,9 @@ mod tests {
         assert_eq!(config.rsp_head_max_size, 64000);
         assert_eq!(config.body_line_max_len, 8192);
         assert!(config.steal_forwarded_for);
+        assert!(config.req_hasbody);
+        assert_eq!(config.req_body_min_size, 65536);
+        assert!(config.req_skip_urlencoded_form);
 
         // default configuration
         let yaml = Yaml::Hash(Default::default());
@@ -191,6 +201,9 @@ mod tests {
         assert_eq!(config.rsp_head_max_size, 65536);
         assert_eq!(config.body_line_max_len, 8192);
         assert!(!config.steal_forwarded_for);
+        assert!(!config.req_hasbody);
+        assert_eq!(config.req_body_min_size, 0);
+        assert!(!config.req_skip_urlencoded_form);
 
         // partial configuration with default values
         let yaml = yaml_doc!(
@@ -286,6 +299,14 @@ mod tests {
         let yaml = yaml_doc!(
             r"
                 steal_forwarded_for: not_bool
+            "
+        );
+        assert!(as_h1_interception_config(&yaml).is_err());
+
+        // invalid value for req_skip_urlencoded_form
+        let yaml = yaml_doc!(
+            r"
+                req_skip_urlencoded_form: not_bool
             "
         );
         assert!(as_h1_interception_config(&yaml).is_err());

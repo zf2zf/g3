@@ -33,6 +33,7 @@ use g3_types::net::WebSocketNotes;
 
 use super::H2StreamTransferError;
 use crate::config::server::ServerConfig;
+use crate::inspect::http::upload_audit;
 use crate::inspect::StreamInspectContext;
 use crate::serve::ServerIdleChecker;
 
@@ -221,6 +222,10 @@ impl<'a, SC: ServerConfig> ExchangeHead<'a, SC> {
                     let mut adaptation_state =
                         ReqmodAdaptationRunState::new(self.http_notes.started_ins);
                     adapter.set_client_addr(self.ctx.task_notes.client_addr);
+                    adapter.set_protocol_tag(
+                        upload_audit::scheme_tag(self.ctx.over_tls()),
+                        upload_audit::http_version_tag(Version::HTTP_2),
+                    );
                     if let Some(username) = self.ctx.raw_user_name() {
                         adapter.set_client_username(username.clone());
                     }

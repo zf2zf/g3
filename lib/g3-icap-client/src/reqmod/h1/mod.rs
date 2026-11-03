@@ -25,13 +25,12 @@
 //! 解析响应码与 `Encapsulated` → 三种结局之一
 //! （原样转发 / 转发改写后的请求 / 用 ICAP 的响应直接回复客户端）。
 
-use std::io;
+use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use arcstr::ArcStr;
-use bytes::BufMut;
 use http::Method;
 use tokio::io::{AsyncBufRead, AsyncWrite};
 use tokio::time::Instant;
@@ -135,6 +134,8 @@ impl IcapReqmodClient {
             /* added by wming for repid audit */
             connection_tuple: None,
             keylog_buffer: None,
+            transformed_scheme: "http",
+            http_version: Some("1.1"),
         })
     }
 }
@@ -158,6 +159,10 @@ pub struct HttpRequestAdapter<I: IdleCheck> {
     /* added by wming for repid audit */
     connection_tuple: Option<ConnectionTuple>,
     keylog_buffer: Option<Arc<TlsKeyLogBuffer>>,
+    /// `X-Transformed-From` 取值：`http` / `https`，由调用方按实际承载设置
+    transformed_scheme: &'static str,
+    /// `X-Http-Version` 取值（`1.0` / `1.1`）；`None` 时不发这个头
+    http_version: Option<&'static str>,
 }
 
 /// 一次上报任务的运行状态（由调用方持有，用于打点与观察进度）。
@@ -234,13 +239,25 @@ impl<I: IdleCheck> HttpRequestAdapter<I> {
         self.keylog_buffer = Some(buffer);
     }
 
+    /// 设置协议来源标签：`scheme` 为 `http` / `https`（写进 `X-Transformed-From`），
+    /// `version` 为客户端实际使用的 HTTP 版本（写进 `X-Http-Version`，
+    /// `None` 表示不发这个头）。不调用则按明文 HTTP/1.1 声明。
+    pub fn set_protocol_tag(&mut self, scheme: &'static str, version: Option<&'static str>) {
+        self.transformed_scheme = scheme;
+        self.http_version = version;
+    }
+
     /// 追加本适配器统一的扩展头。
     ///
-    /// `X-Transformed-From: HTTP/1.0` 是 RFC 3507 对封装请求来源协议的声明；
+    /// `X-Transformed-From` 声明封装报文的来源（`http` / `https`），
+    /// `X-Http-Version` 给出协议版本；两者都由调用方按实际承载设置。
     /// 其余均为 g3 自有扩展（客户端地址、用户名、五元组、TLS keylog），
     /// 未设置的项直接跳过，因此同一个适配器也能服务于不便提供这些信息的路径。
     fn push_extended_headers(&self, data: &mut Vec<u8>) {
-        data.put_slice(b"X-Transformed-From: HTTP/1.0\r\n");
+        let _ = write!(data, "X-Transformed-From: {}\r\n", self.transformed_scheme);
+        if let Some(version) = self.http_version {
+            let _ = write!(data, "X-Http-Version: {version}\r\n");
+        }
         if let Some(addr) = self.client_addr {
             crate::serialize::add_client_addr(data, addr);
         }

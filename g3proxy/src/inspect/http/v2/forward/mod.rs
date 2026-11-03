@@ -36,6 +36,7 @@ use g3_types::net::{HttpHeaderMap, TlsKeyLogBuffer};
 use super::{H2BodyTransfer, H2StreamTransferError};
 use crate::config::server::ServerConfig;
 use crate::inspect::StreamInspectContext;
+use crate::inspect::http::upload_audit;
 use crate::serve::ServerIdleChecker;
 use crate::serve::audit_bridge::log_bypass_audit_end;
 
@@ -278,66 +279,74 @@ where
         };
 
         /* added by wming for repid audit */
-        // 为 repid 审计提取请求体长度，后面据此决定是否送 ICAP 改编
+        // 为 repid 审计提取请求体长度与内容类型，后面据此决定是否送 ICAP 改编
         let content_length = parts
             .headers
             .get(http::header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<u64>().ok());
+        let content_type = parts
+            .headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok());
+
+        // 与 H1 共用同一条送审规则：无体不审、表单可按配置跳过、
+        // 声明了 content-length 的按阈值过滤，没声明的一律送审。
+        // 判定要在请求头交出之前做完——此后 parts 已归 ups_req，借不到头了
+        let upload_audit_body = upload_audit::h2_upload_audit(
+            self.ctx.h1_interception(),
+            !clt_body.is_end_stream(),
+            content_length,
+            content_type,
+        );
 
         // 请求头即将发往源站：此后响应尚未送出，出错时可合成错误响应
         self.send_error_response = true;
         let ups_req = Request::from_parts(parts, ());
 
-        // 配置了 ICAP 请求侧审计时走旁路管线：只送带请求体的流，且任何
-        // ICAP 侧失败都只降级审计、绝不阻断转发
-        if let Some(reqmod) = self.ctx.audit_handle.icap_reqmod_client() {
-            let cfg = self.ctx.h1_interception();
+        // 配置了 ICAP 请求侧审计时走旁路管线：只送判定为"值得审"的请求体，
+        // 且任何 ICAP 侧失败都只降级审计、绝不阻断转发
+        if let Some(reqmod) = self.ctx.audit_handle.icap_reqmod_client()
+            && let Some(body_framing) = upload_audit_body
+        {
+            // 并发名额用尽时不排队：本流退化为直通转发并计入跳过数。
+            // permit 持有到旁路转发结束，审计名额才与实际并发一致。
+            let permit = self.ctx.audit_handle.try_upload_audit_permit();
+            let bypass = if permit.is_some() {
+                self.new_bypass_adapter(reqmod).await
+            } else {
+                self.ctx.audit_handle.mark_upload_audit_skipped();
+                None
+            };
 
-            // 无请求体的流（GET/HEAD 等）完全不碰 ICAP；req_hasbody 配置下，
-            // 小于既有阈值的请求体同样跳过（不引入新阈值）
-            let use_icap = !clt_body.is_end_stream()
-                && !(cfg.req_hasbody
-                    && content_length.is_some_and(|cl| cl < cfg.req_body_min_size as u64));
+            if let Some(mut bypass) = bypass {
+                // 请求体成帧自带结束标记，上游 h2 连接还要留给别的流复用，
+                // 因此不能像 FTP 数据通道那样半关闭写侧
+                bypass.set_upstream_half_close(false);
 
-            if use_icap {
-                // 并发名额用尽时不排队：本流退化为直通转发并计入跳过数。
-                // permit 持有到旁路转发结束，审计名额才与实际并发一致。
-                let permit = self.ctx.audit_handle.try_upload_audit_permit();
-                let bypass = if permit.is_some() {
-                    self.new_bypass_adapter(reqmod).await
-                } else {
-                    self.ctx.audit_handle.mark_upload_audit_skipped();
-                    None
+                let framing = BypassFraming {
+                    req_hdr: ups_req.serialize_for_adapter(),
+                    transformed_from: upload_audit::scheme_tag(self.ctx.over_tls()),
+                    http_version: upload_audit::http_version_tag(http::Version::HTTP_2),
+                    body_framing: Some(body_framing.as_str()),
                 };
-
-                if let Some(mut bypass) = bypass {
-                    // 请求体成帧自带结束标记，上游 h2 连接还要留给别的流复用，
-                    // 因此不能像 FTP 数据通道那样半关闭写侧
-                    bypass.set_upstream_half_close(false);
-
-                    let framing = BypassFraming {
-                        req_hdr: ups_req.serialize_for_adapter(),
-                        transformed_from: "HTTP/2.0",
-                    };
-                    let mut adaptation_state = new_run_state();
-                    let r = self
-                        .forward_with_adaptation(
-                            ups_send_req,
-                            ups_req,
-                            clt_body,
-                            clt_send_rsp,
-                            bypass,
-                            framing,
-                            &mut adaptation_state,
-                        )
-                        .await;
-                    // 管线记录了请求体全部送达的时刻，回填到本任务日志表
-                    if let Some(dur) = adaptation_state.dur_ups_send_all {
-                        self.http_notes.dur_req_send_all = dur;
-                    }
-                    return r;
+                let mut adaptation_state = new_run_state();
+                let r = self
+                    .forward_with_adaptation(
+                        ups_send_req,
+                        ups_req,
+                        clt_body,
+                        clt_send_rsp,
+                        bypass,
+                        framing,
+                        &mut adaptation_state,
+                    )
+                    .await;
+                // 管线记录了请求体全部送达的时刻，回填到本任务日志表
+                if let Some(dur) = adaptation_state.dur_ups_send_all {
+                    self.http_notes.dur_req_send_all = dur;
                 }
+                return r;
             }
         }
 
