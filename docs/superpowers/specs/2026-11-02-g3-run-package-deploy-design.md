@@ -220,7 +220,8 @@ Documentation=file://@PREFIX@/README.md
 `deploy/conf/g3proxy.yaml` 是刻意最小化的**单一文件**：`runtime.thread_number: 2`、
 `log: stdout`、`controller.local`，`auditor:` 与 `server:` 都直接内联成数组
 （g3proxy 的 `HybridParser` 对这两个键同时接受"路径字符串"或"内联数组"，schema 不动），
-初版经由 `server.d`/`auditor.d` 的样例内容全部搬了进来；`resolver:`/`escaper:` 仍注释。
+初版经由 `server.d`/`auditor.d` 的样例内容全部搬了进来；`resolver:`/`escaper:` 也内联
+定义出来（`resolver` c-ares、`escaper` `direct_fixed` 直连，都叫 `default`）。
 
 - **`log: stdout`**：日志进 journald，`journalctl -u g3proxy` 是运维唯一入口，包内不带文件日志与
   轮转配置。

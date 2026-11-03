@@ -52,10 +52,20 @@ server:
     #  certificate: cert.pem
     #  private_key: key.pem
     listen:
-      address: "[::]:10087"
+      address: "[::]:3128"
     tcp_sock_speed_limit: 100M
 
     tls_client: { }
 
-# resolver: resolver.d/
-# escaper: escaper.d/
+# 出口解析与直连转发：server 段引用的 escaper: default 必须在这里定义出来，
+# 否则 g3proxy 会用内置的 DummyDeny 占位，所有请求以 ForbiddenByRule 拒绝。
+# 需要按域名/地址分流时，换成 fail_over / route_* 等类型或改走 escaper.d 目录。
+resolver:
+  - name: default
+    type: c-ares
+
+escaper:
+  - name: default
+    type: direct_fixed
+    resolver: default
+    no_ipv6: true

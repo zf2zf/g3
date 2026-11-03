@@ -237,8 +237,17 @@ diff /opt/zf/g3/conf/g3proxy.yaml{,.new}
 
 - 入口配置 `/opt/zf/g3/conf/g3proxy.yaml` 里 `server:`、`auditor:` 都是**内联数组**，
   改端口、ICAP 审计地址、拦截开关只动这一个文件。
-- `resolver:`、`escaper:` 默认注释。**目录不存在时打开这两行（指向 `resolver.d/` 等
-  路径）会让配置校验失败**，先建目录再取消注释，或者直接内联写。
+- `resolver:`、`escaper:` 已在入口配置里内联定义（`resolver` 用 c-ares、`escaper`
+  用 `direct_fixed` 直连出口，名字都叫 `default`）。**`server:` 段引用的 `escaper: default`
+  必须有对应定义**，否则 g3proxy 会拿内置 `DummyDeny` 占位，所有请求以
+  `ForbiddenByRule / method unavailable` 拒绝——浏览器配了代理却打不开任何页面就是这一条。
+  要按域名/地址分流换成 `fail_over`/`route_*`，或改走 `escaper.d/` 目录（先建目录再指向）。
+- HTTPS 走的是 MITM 拦截：证书由随包 CA 签发，客户端（浏览器/系统信任库/`curl`）必须信任
+  `myCA.crt`，否则报 `self-signed certificate in certificate chain`、握手失败（日志里是
+  `InterceptionError … ssl3_read_bytes`）。排查转发本身通不通时可临时用 `curl -x … -k` 绕过校验。
+  客户端信任 `myCA.crt` 可用仓库里的 Windows 脚本：`deploy/windows-install-ca.bat`（与
+  `myCA.crt` 放同目录双击，自动提权导进本机"受信任的根证书颁发机构"并校验；Firefox 仍需
+  在它自己的证书管理器里单独导入）。
 - 上传审计相关：`auditor` 段里的 `icap_reqmod_service` 决定旁路审计发给哪个 ICAP
   服务；`upload_audit_max_concurrency`（默认 64，0 表示不设限，样例里是注释掉的）控制
   同时进行的上传审计条数，名额用尽时新上传直接退化为直通转发并计入跳过数，不排队。详见
