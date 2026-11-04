@@ -24,3 +24,5 @@ dist/
 # run 包打包用的正式 CA，只进包不入库
 deploy/conf/myCA.crt
 deploy/conf/myCA.key
+# 换套 feature 重打的产物目录（跨发行版包、静态包）
+dist-*/

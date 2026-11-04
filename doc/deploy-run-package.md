@@ -24,6 +24,8 @@ deploy/build_run_package.sh --profile=debug                     # 排障用的�
 deploy/build_run_package.sh --bins="g3proxy g3proxy-ctl"        # 精简程序集
 deploy/build_run_package.sh --netns=no                          # g3proxy 不进网络命名空间
 deploy/build_run_package.sh --netns=/run/netns/ns-other         # 指定命名空间
+deploy/build_run_package.sh --portable                          # 跨发行版：去 Lua/Python，内置 OpenSSL/c-ares
+deploy/build_run_package.sh --static                            # 在 --portable 之上把 glibc 也静态进去
 ```
 
 产物在 `dist/`：
@@ -41,15 +43,36 @@ deploy/build_run_package.sh --netns=/run/netns/ns-other         # 指定命名�
 `deploy/conf/myCA.*` 已在 `.gitignore` 里：CA 私钥只进包、不入库。自动生成的 CA 适合
 测试；正式环境发布前把自己/机构的 CA 放进 `deploy/conf/` 替换掉再打包。
 
-**构建机必须与目标机同 OS、同架构。** 二进制按构建机的动态库链接（OpenSSL、c-ares、
-Lua、Python），换台机器就可能起不来。打包前可以确认一下：
+**默认构建的包只能装在与构建机同 OS、同架构的机器上。** 二进制按构建机的动态库链接
+（OpenSSL、c-ares、Lua、Python），换台机器就可能起不来。症状是安装脚本走到"校验配置"就断：
+
+```
+/opt/zf/g3/bin/g3proxy: error while loading shared libraries: libpython3.10.so.1.0: cannot open shared object file: No such file or directory
+配置校验失败，服务未启动；请检查上面 g3proxy 给出的报错
+```
+
+`libpython3.10.so.1.0` 只是这一串 `DT_NEEDED` 里第一个找不到的（`python` feature 用 pyo3
+`auto-initialize` 把解释器嵌进 g3proxy），补上它还会接着缺 `liblua5.4.so.0`、
+`libcares.so.2`、`libssl.so.3`/`libcrypto.so.3`。
+
+**缺库只是第一层，底下还有一层 glibc 符号版本的地板。** 目标机上再 `ldd` 一次，往往会看到
+`/usr/lib64/libc.so.6: version 'GLIBC_2.34' not found` 这样的行——那是构建机的 glibc（Ubuntu
+22.04 是 2.35）写进二进制的符号版本要求，目标机的 glibc 更老（Kylin V10、RHEL8/CentOS8 那一档
+是 2.28）就装不上 python/lua/openssl 也照样起不来。两层都只能在构建机上解决：按下一节
+「feature 裁剪」加 `--portable` / `--static` 重打，不要在目标机凑库。
+
+打包前可以确认一下：
 
 ```sh
 ldd dist/g3-run-*/bin/g3proxy | grep 'not found'   # 应该没有输出
 ```
 
-要交叉编译就设 `TARGET`（例如 `TARGET=x86_64-unknown-linux-musl`），此时包内自检会被跳过
-——产物不能在构建机上运行，配置校验得在目标机做。
+注意这一条只证明**构建机**上库是齐的，不代表目标机齐——同一条命令在目标机上跑，才能看出
+那边缺什么。
+
+要交叉编译就设 `--target`（例如 `--target=x86_64-unknown-linux-musl`）。只有当它和构建机
+三元组不一致时才跳过包内自检——产物跑不起来，配置校验得在目标机做。`--static` 自己补上的
+`--target` 就是构建机三元组，所以自检照跑。
 
 配置项用 `--参数=值`（同名环境变量仍可覆盖，仅留作兼容与测试后门）：
 
@@ -58,40 +81,96 @@ ldd dist/g3-run-*/bin/g3proxy | grep 'not found'   # 应该没有输出
 | `--bins=` | `RUN_BINS`+`BUILD_PACKAGES` | `g3proxy g3proxy-ctl g3fcgen` | 编译并拷进包 `bin/` 的可执行程序 |
 | `--packages=` | `BUILD_PACKAGES` | 同上 | 只改编译范围、不改 `bin/` 拷贝 |
 | `--profile=` | `PROFILE` | `release` | cargo profile；`debug` 走 cargo 的 dev profile |
-| `--target=` | `TARGET` | 空 | cargo `--target`，非空时跳过自检 |
+| `--target=` | `TARGET` | 空 | cargo `--target`，与构建机三元组不同时跳过自检 |
 | `--features=` | `EXTRA_FEATURES` | 空 | 追加 cargo feature |
+| `--portable` | `PORTABILITY=portable` | 关 | 跨发行版裁剪：去 Lua/Python，OpenSSL 与 c-ares 内置编译 |
+| `--static` | `PORTABILITY=static` | 关 | 在 `--portable` 之上把 glibc 也静态进去 |
 | `--netns=no` / `--netns=<绝对路径>` | `NETNS`/`NETNS_PATH` | `yes`、`/run/netns/ns-vpp` | g3proxy 单元是否写 `NetworkNamespacePath=` 及路径 |
 | `--build-args=` | `G3_BUILD_ARGS` | 空 | 原样附加给 cargo 的参数（逃生口） |
 | `--dist-dir=` | `DIST_DIR` | `<仓库>/dist` | 产物目录 |
 
 脚本自己判断 c-ares：`pkg-config --atleast-version 1.18.0 libcares` 通过就用系统库，否则退回
-`vendored-c-ares`，与 `scripts/package` 里现有打包脚本的判定一致。
+`vendored-c-ares`，与 `scripts/package` 里现有打包脚本的判定一致。`--portable` / `--static`
+不看 `pkg-config`，直接强制内置编译。
 
 ### feature 裁剪
 
 feature 一律写成 `包名/feature`（一次 `-p` 多个包时，裸 feature 名会撞上 `g3proxy-ctl` 没有
 feature 而报错）。默认 feature 都会编进来，缺 Lua 或 Python 开发库时 `lua54`/`python` 会失败，
-需要关掉默认 feature 重来：
+需要关掉默认 feature 重来。
+
+**跨发行版第一档：`--portable`**（目标机的 glibc 不低于构建机）。开关做三件事：关掉 cargo 的
+默认 feature（`lua54` 与 `python` 就不再链构建机的 `liblua5.4.so.0`、`libpython3.10.so.1.0`）、
+补回 `quic` 与 TLS 后端 `rustls-ring`、把 OpenSSL 与 c-ares 改成内置编译（`vendored-openssl`、
+`g3fcgen/vendored-openssl`、`vendored-c-ares`——c-ares 这一项不再走 pkg-config 探测，跨发行版的
+包不能碰构建机的 `libcares.so.2`）：
 
 ```sh
-G3_BUILD_ARGS=--no-default-features \
-EXTRA_FEATURES="quic rustls-ring vendored-openssl" \
-deploy/build_run_package.sh
+deploy/build_run_package.sh --portable --netns=no --dist-dir=dist-portable
 ```
 
-`EXTRA_FEATURES` 里不带包名的会补成 `g3proxy/`；c-ares 一项脚本已经加了，不用重复写。注意这样
-编出来的二进制没有 Lua/Python 审计模块——当前内联配置没用到 Lua/Python 审计器，但裁剪后请
-自行确认。`--no-default-features` 也不能省掉 TLS 后端（`rustls-ring` 或 `rustls-aws-lc` 选一）。
+`g3fcgen/vendored-openssl` 是开关自带的：g3fcgen 一样链 OpenSSL，只裁 g3proxy 会给它留下
+`libssl.so.3`/`libcrypto.so.3`。产物没有 Lua/Python 的用户认证模块（`auth` 里 `type: lua` /
+`type: python` 那种动态用户名来源）——当前内联配置里根本没有 `auth`，用不到它们；裁剪后请自行
+确认目标配置。这样打出来的二进制只剩 glibc 那套动态依赖：
+
+```sh
+ldd dist-portable/g3-run-*/bin/g3proxy \
+  | grep -vE 'linux-vdso|libc\.so|libm\.so|libgcc_s|ld-linux'   # 应该没有输出
+```
+
+**跨发行版第二档：`--static`**（目标机 glibc 比构建机老——Kylin V10、RHEL8/CentOS8 那一档，
+`ldd` 会报 `version 'GLIBC_2.34' not found`）。第一档只解决缺 `.so`，解决不了 glibc 符号版本的
+地板，得把 glibc 也静态进去：
+
+```sh
+deploy/build_run_package.sh --static --netns=no --dist-dir=dist-static
+```
+
+开关在第一档之上加 `RUSTFLAGS=-C target-feature=+crt-static`，并自动把 `--target` 填成构建机
+自己的三元组（`rustc -Vv` 里的 `host:`）。**这个 `--target` 必须有**：只有显式指定 target，
+cargo 才把 rustflags 只施加给目标工件，构建脚本与 proc-macro 走宿主编译；漏掉的话
+`tokio-macros`、`async-recursion` 也会吃 `+crt-static`，cargo 直接报
+`cannot produce proc-macro for ... as the target ... does not support these crate types`。
+早先手写这行配方时要手工补 `--target` 还要另外跑自检，就是被这个坑绊的；现在开关自己处理，
+自检也照跑（补出来的 target 就是本机三元组，产物能跑），并额外逐个可执行程序验一遍：
+
+```
+==> 自检：g3proxy -t -c conf/g3proxy.yaml
+==> 自检：静态链接
+  g3proxy: statically linked，无 GLIBC 版本要求
+  g3proxy-ctl: statically linked，无 GLIBC 版本要求
+  g3fcgen: statically linked，无 GLIBC 版本要求
+```
+
+任一条不是 `statically linked`、或者还带着 `GLIBC_` 符号版本要求，打包直接失败——这种包发到
+老 glibc 的机器上就是白跑一趟，在构建机拦住比在目标机报错好。手工复核（在目标机上也该用这两条
+判断包对不对）：
+
+```sh
+ldd bin/g3proxy bin/g3fcgen bin/g3proxy-ctl                    # 都该是 statically linked
+objdump -T bin/g3proxy | grep -c 'GLIBC_'                      # 该是 0
+```
+
+静态 glibc 的常规代价是 `getaddrinfo` 走不了 NSS（要 dlopen `libnss_*.so`）。这里碰不到：g3proxy
+的域名解析只走 `g3-resolver` 的 `c_ares` / `hickory` 两个驱动（自己发 UDP 查询），
+`g3proxy/src`、`lib/g3-types`、`lib/g3-daemon` 里没有一处 `getaddrinfo`/`ToSocketAddrs`。实测在
+构建机上用这个静态二进制起实例，代理一笔 `http://<主机名>:<端口>/` 能正常解析并按 DPI 规则
+放行/拦截。要是哪天改用依赖系统解析器的配置，这条得重新评估。
 
 ### 自检
 
-`TARGET` 为空时，脚本用**包里的二进制**加载**包里的配置**：
+`--target` 为空、或者与构建机三元组一致时，脚本用**包里的二进制**加载**包里的配置**：
 
 ```
 ==> 自检：g3proxy -t -c conf/g3proxy.yaml
 ```
 
-这一步失败不会出 `.run`，包目录留在 `dist/` 里供排查。
+`--static` 在这之后再加一轮静态链接断言（`ldd` 必须是 `statically linked`，`objdump -T` 里
+不能有任何 `GLIBC_` 符号版本要求），见上一节。
+
+只有真正交叉编译（`--target` 是别的三元组）才会打印跳过信息、跳过配置自检。
+这两步失败都不会出 `.run`，包目录留在 `--dist-dir`（默认 `dist/`）里供排查。
 
 ### 网络命名空间（NETNS）
 
@@ -100,6 +179,9 @@ deploy/build_run_package.sh
 - 默认（或显式 `--netns=yes` / `--netns=<绝对路径>`）→ 展开成 `NetworkNamespacePath=<路径>`
   （默认 `/run/netns/ns-vpp`）与 `PrivateNetwork=no`；
 - `--netns=no` → 这一整行删掉，单元里没有任何命名空间指令。
+
+`--netns=no` 是给非 VPP 宿主机的：默认包在单元里写死了 `/run/netns/ns-vpp`，目标机没有这个
+命名空间时，安装会在装完单元之后被 `install.sh` 的存在性检查拦住。
 
 所以进包的 `systemd/g3proxy.service` 在这一项上已经是成品，`install.sh` 只负责
 `@PREFIX@`/`@CONTROL_DIR@`/`@GROUP@` 这些目标机才知道的路径。`PrivateNetwork=no` 是

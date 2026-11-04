@@ -9,7 +9,8 @@
 #   sudo /opt/zf/g3/uninstall.sh   # 卸载（停服务、摘单元、删除 /opt/zf/g3）
 #
 # 重要：run 包里的二进制是按"打包这台机器"的动态库链接的（OpenSSL、c-ares、
-# Lua、Python），请在与目标机同 OS/同架构的机器上执行本脚本。
+# Lua、Python），请在与目标机同 OS/同架构的机器上执行本脚本。目标机是别的发行版，就加
+# --portable / --static 裁剪（见下面"跨发行版"一段）。
 #
 # g3fcgen 是必须的服务（auditor 的 tls_cert_generator 运行时向它取 MITM 证书），
 # 包里必须带 CA：deploy/conf 下有成套 myCA.crt/myCA.key 就直接打进包；没有则
@@ -22,6 +23,8 @@
 #   deploy/build_run_package.sh --target=x86_64-unknown-linux-musl   # 交叉编译
 #   deploy/build_run_package.sh --bins="g3proxy g3proxy-ctl"         # 精简程序集
 #   deploy/build_run_package.sh --features=vendored-openssl          # 追加 cargo feature
+#   deploy/build_run_package.sh --portable              # 跨发行版：去 Lua/Python，内置 OpenSSL/c-ares
+#   deploy/build_run_package.sh --static                # 在 --portable 之上再把 glibc 静态进去
 #   deploy/build_run_package.sh --netns=no                  # g3proxy 不进网络命名空间
 #   deploy/build_run_package.sh --netns=/run/netns/ns-other # 换命名空间（默认 ns-vpp）
 #
@@ -29,6 +32,17 @@
 # 的网络栈里，监听地址与回环都是该命名空间的。g3fcgen 与 ICAP 服务不进——
 # 生效后进的 127.0.0.1 是 ns-vpp 的回环，g3proxy.yaml 里走回环的 g3fcgen(2999)
 # 与 ICAP(1344) 必须在里面可达，否则 TLS 拦截与审计取不到东西。
+#
+# 目标机与构建机不是同一套系统，就加一个裁剪开关，别在目标机凑库：
+#   deploy/build_run_package.sh --portable    # 去 Lua/Python，OpenSSL 与 c-ares 内置编译
+#   deploy/build_run_package.sh --static      # 在 --portable 之上把 glibc 也静态进去
+# --portable 只解决"缺 .so"。目标机 glibc 比构建机老（Kylin V10、RHEL8 那一档，装完报
+# version 'GLIBC_2.34' not found）必须用 --static：开关自己补
+# RUSTFLAGS=-C target-feature=+crt-static 与 --target=<构建机三元组>，包内自检照跑，
+# 并额外验三个可执行程序确实不加载任何 .so。
+# 两个开关都会关掉 cargo 的默认 feature（quic 与 TLS 后端由开关补回来），产物里就没有
+# auth 的 type: lua / type: python 动态用户名来源——当前内联配置没有 auth，用不到。
+# 详见 doc/deploy-run-package.md 的"feature 裁剪"一节。
 
 set -eu
 
@@ -46,6 +60,9 @@ G3_BUILD_ARGS=${G3_BUILD_ARGS:-}
 EXTRA_FEATURES=${EXTRA_FEATURES:-}
 # 目标三元组，留空表示用当前主机的默认 target
 TARGET=${TARGET:-}
+# 跨发行版裁剪：no=按构建机的库链接（默认）；portable=去 Lua/Python，OpenSSL 与 c-ares
+# 内置编译；static=在 portable 之上把 glibc 也静态进去（目标机 glibc 比构建机老时用）
+PORTABILITY=${PORTABILITY:-no}
 # g3proxy 是否装进网络命名空间（yes/no），以及命名空间路径
 NETNS=${NETNS:-yes}
 NETNS_PATH=${NETNS_PATH:-/run/netns/ns-vpp}
@@ -99,6 +116,15 @@ while [ $# -gt 0 ]; do
 		NETNS=yes
 		NETNS_PATH=${opt#--netns=}
 		;;
+	--portable)
+		PORTABILITY=portable
+		;;
+	--static)
+		PORTABILITY=static
+		;;
+	--portable=no | --static=no)
+		PORTABILITY=no
+		;;
 	*)
 		echo "未知参数：${opt}（用 -h 看用法）" >&2
 		exit 1
@@ -109,9 +135,21 @@ done
 
 cd "$PROJECT_DIR"
 
-# c-ares：系统库太旧或缺失时退回内置编译，跟 scripts/package 的判定保持一致
+case "$PORTABILITY" in
+no | portable | static) ;;
+*)
+	echo "PORTABILITY=${PORTABILITY} 不认，只能是 no / portable / static" >&2
+	exit 1
+	;;
+esac
+
+# c-ares：系统库太旧或缺失时退回内置编译，跟 scripts/package 的判定保持一致。
+# 跨发行版的包不能碰构建机的 libcares.so.2，一律内置。
 CARGO_FEATURES=""
-if pkg-config --atleast-version 1.18.0 libcares 2>/dev/null; then
+if [ "$PORTABILITY" != no ]; then
+	echo "c-ares: ${PORTABILITY} 包，强制内置编译（vendored-c-ares）"
+	CARGO_FEATURES="vendored-c-ares"
+elif pkg-config --atleast-version 1.18.0 libcares 2>/dev/null; then
 	echo "c-ares: 使用系统库"
 	CARGO_FEATURES="c-ares"
 else
@@ -120,6 +158,39 @@ else
 fi
 if [ -n "$EXTRA_FEATURES" ]; then
 	CARGO_FEATURES="${CARGO_FEATURES} ${EXTRA_FEATURES}"
+fi
+
+# 跨发行版裁剪：默认 feature（lua54 + python + c-ares + quic + rustls-ring）整个关掉，
+# 再补回 quic 与 TLS 后端，OpenSSL 交给内置编译。写全包名的那条是给 g3fcgen 的——
+# 它一样链 OpenSSL，只裁 g3proxy 会给它留下 libssl.so.3。
+if [ "$PORTABILITY" != no ]; then
+	CARGO_FEATURES="${CARGO_FEATURES} quic rustls-ring vendored-openssl g3fcgen/vendored-openssl"
+	case " ${G3_BUILD_ARGS} " in
+	*" --no-default-features "*) ;;
+	*) G3_BUILD_ARGS="${G3_BUILD_ARGS} --no-default-features" ;;
+	esac
+	echo "==> 跨发行版裁剪（${PORTABILITY}）：关默认 feature，OpenSSL/c-ares 内置编译"
+	echo "    产物没有 Lua/Python 的用户认证模块（auth 里 type: lua / type: python 不可用）"
+fi
+
+# static：glibc 也静态进去，产物不加载任何 .so，也就不带 glibc 符号版本要求。
+# 必须显式给 --target，cargo 才会把 RUSTFLAGS 只施加给目标工件——否则连 proc-macro 也吃
+# +crt-static，cargo 直接报 "cannot produce proc-macro for ... does not support these
+# crate types"（async-recursion、tokio-macros 都中招）。
+if [ "$PORTABILITY" = static ]; then
+	HOST_TARGET=$(rustc -Vv 2>/dev/null | sed -n 's/^host: //p')
+	if [ -z "$HOST_TARGET" ]; then
+		echo "拿不到 rustc 的 host 三元组，无法自动设 --target；请显式传 --target=<三元组>" >&2
+		exit 1
+	fi
+	if [ -z "$TARGET" ]; then
+		TARGET=$HOST_TARGET
+	fi
+	# --static 打的就是构建机自己这个三元组时产物仍然能跑，自检照做（见打包前自检一段）
+	# shellcheck disable=SC2016
+	RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C target-feature=+crt-static"
+	export RUSTFLAGS
+	echo "==> 静态链接 glibc：RUSTFLAGS=${RUSTFLAGS}，TARGET=${TARGET}"
 fi
 
 # feature 必须写成 包名/feature：一次 -p 多个包时，不存在的裸 feature 名会让
@@ -139,7 +210,7 @@ for feat in $CARGO_FEATURES; do
 done
 
 # Lua：g3proxy 默认 feature 带 lua54 与 python，缺这两套开发库时构建会失败，
-# 具体怎么裁剪 feature 见 doc/deploy-run-package.md
+# 具体怎么裁剪 feature 见 doc/deploy-run-package.md。裁剪模式下默认 feature 已经关了，不用提示。
 LUA_OK=0
 for mod in lua lua55 lua54 lua53; do
 	if pkg-config --exists "$mod" 2>/dev/null; then
@@ -147,7 +218,7 @@ for mod in lua lua55 lua54 lua53; do
 		break
 	fi
 done
-if [ "$LUA_OK" = 0 ]; then
+if [ "$LUA_OK" = 0 ] && [ "$PORTABILITY" = no ]; then
 	echo "提示：未找到 Lua 开发库，g3proxy 默认 feature 里的 lua54 可能编不过" >&2
 fi
 
@@ -280,6 +351,34 @@ else
 	README_NETNS='本次打包未启用网络命名空间（NETNS=no），g3proxy 与 g3fcgen 都在 host 网络里。
 要进 ns 的话在构建机用默认值 NETNS=yes（可配 NETNS_PATH=/run/netns/<名字>）重新打包。'
 fi
+
+# 包是什么来路，写进 README 与 VERSION：装到目标机的人只看得到这两份
+case "$PORTABILITY" in
+no)
+	FEATURE_NOTE="默认 feature 之外额外启用了：${CARGO_FEATURES}。"
+	DEFAULTS_STATE=enabled
+	README_PORTABILITY='这个包按构建机的动态库链接（Lua/Python/OpenSSL/c-ares 用的都是构建机上的 .so），
+换台不同发行版的机器就可能起不来：先是 error while loading shared libraries 报缺库，补齐库
+还可能撞 glibc 符号版本（GLIBC_2.34 not found）。目标机不是同一套系统就在构建机重打：加
+--portable 裁掉 Lua/Python 并内置 OpenSSL/c-ares；目标机 glibc 比构建机老再加 --static。'
+	;;
+portable)
+	FEATURE_NOTE="已关闭 cargo 默认 feature，实际启用：${CARGO_FEATURES}。"
+	DEFAULTS_STATE="disabled (${PORTABILITY})"
+	README_PORTABILITY='这个包是 --portable 包：OpenSSL 与 c-ares 静态进二进制，运行时只剩 glibc 那套；
+没有 Lua/Python 的用户认证模块（auth 里 type: lua / type: python 不可用）。目标机的 glibc
+不能低于构建机，否则装完会报 GLIBC_x.y not found——那种机器要改用 --static 重打。'
+	;;
+static)
+	FEATURE_NOTE="已关闭 cargo 默认 feature，实际启用：${CARGO_FEATURES}，glibc 同样静态链接。"
+	DEFAULTS_STATE="disabled (static)"
+	README_PORTABILITY='这个包是 --static 包：三个可执行程序都不加载任何 .so（ldd 显示 statically linked），
+对目标机的 glibc 版本没有要求，可以装在与构建机不同发行版、glibc 更老的机器上（Kylin V10、
+RHEL8 那一档）。没有 Lua/Python 的用户认证模块（auth 里 type: lua / type: python 不可用）。
+静态 glibc 用不了 NSS 那套域名解析，本项目解析走 c-ares / hickory 自己发 UDP，不受影响。'
+	;;
+esac
+
 cp "$PROJECT_DIR/deploy/systemd/g3fcgen.service" "$PKG_DIR/systemd/"
 cp "$PROJECT_DIR/deploy/install.sh" "$PKG_DIR/install.sh"
 cp "$PROJECT_DIR/deploy/uninstall.sh" "$PKG_DIR/uninstall.sh"
@@ -290,7 +389,9 @@ cat > "$PKG_DIR/README.md" << EOF
 # g3 run 包 ${PKG_NAME}
 
 g3proxy 版本 ${VERSION}，git ${GIT_SHA}，构建于 $(uname -s) $(uname -m)（profile: ${PROFILE}）。
-默认 feature 之外额外启用了：${CARGO_FEATURES}。详见 VERSION 文件。
+${FEATURE_NOTE}详见 VERSION 文件。
+
+${README_PORTABILITY}
 
 ## 部署
 
@@ -338,21 +439,46 @@ build host: $(uname -s) $(uname -m)
 build profile: ${PROFILE}
 cargo target: ${TARGET:-default}
 built at (UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)
-extra features (on top of g3proxy defaults): ${CARGO_FEATURES}
+cargo features: ${CARGO_FEATURES}
+default features: ${DEFAULTS_STATE}
+rustflags (build env): ${RUSTFLAGS:-none}
+portability: ${PORTABILITY}
 ca bundled: yes (from deploy/conf, auto-generated at build if absent)
 network namespace (g3proxy only): ${NETNS_NOTE}
 EOF
 
 # 打包前自检：用包里这份二进制去加载包里这份配置。
-# 交叉编译（TARGET 非空）时跳过，因为产物不能在构建机上运行。
-if [ -z "$TARGET" ]; then
+# 真交叉编译（TARGET 与构建机三元组不同）时跳过——产物在构建机上跑不起来；
+# --static 补出来的 TARGET 就是构建机自己的三元组，自检照跑。
+if [ -z "$TARGET" ] || [ "$TARGET" = "${HOST_TARGET:-}" ]; then
 	echo "==> 自检：g3proxy -t -c conf/g3proxy.yaml"
 	if ! "$PKG_DIR/bin/g3proxy" -t -c "$PKG_DIR/conf/g3proxy.yaml"; then
 		echo "包内配置自检失败，已保留 $PKG_DIR 供排查" >&2
 		exit 1
 	fi
 else
-	echo "==> 跳过自检（TARGET=${TARGET}，产物不能在构建机运行）"
+	echo "==> 跳过配置自检（TARGET=${TARGET} 不是构建机三元组 ${HOST_TARGET:-未知}，产物跑不起来）"
+fi
+
+# --static 的核心承诺就是"不加载任何 .so"，检不掉就等于这个包白打，直接在构建机上拦掉
+if [ "$PORTABILITY" = static ]; then
+	echo "==> 自检：静态链接"
+	for bin in $RUN_BINS; do
+		path="$PKG_DIR/bin/$bin"
+		if ! ldd "$path" 2>&1 | grep -q 'statically linked'; then
+			echo "${bin} 不是静态链接：$(ldd "$path" 2>&1 | head -1)" >&2
+			echo "多半是 RUSTFLAGS 被别处覆盖了（-h 里有 --static 实际用的值）" >&2
+			exit 1
+		fi
+		if command -v objdump >/dev/null 2>&1; then
+			syms=$(objdump -T "$path" 2>/dev/null | grep -c 'GLIBC_' || true)
+			if [ "$syms" != 0 ]; then
+				echo "${bin} 还带 ${syms} 个 GLIBC 符号版本要求，老 glibc 的目标机照样装不上" >&2
+				exit 1
+			fi
+		fi
+		echo "  ${bin}: statically linked，无 GLIBC 版本要求"
+	done
 fi
 
 mkdir -p "$DIST_DIR"
