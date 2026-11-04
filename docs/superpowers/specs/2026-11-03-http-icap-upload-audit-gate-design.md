@@ -18,7 +18,7 @@
 1. 三个上行送审点收敛成一条规则，且以 **Content-Length 头**为判据：`CL` 严格大于阈值才送审。
 2. `chunked`（无 `Content-Length`）一律送审，字节保持**客户端原始分块帧**原样投递，另加一条标记头让审计侧知道自己拿到的是分块帧。
 3. `x-www-form-urlencoded` 表单可按配置跳过——它没有文件内容可审。
-4. `X-Transformed-From` 改为 `http` / `https`，协议版本移到新增的 `X-Http-Version`。
+4. `X-Transformed-From` 改为 `HTTP` / `HTTPS`（与既有的 `FTP` / `SMTP` / `IMAP` 标签同为大写），协议版本移到新增的 `X-Http-Version`。
 
 ## 非目标
 
@@ -68,7 +68,7 @@ h1_interception:
 同一旁路封装区，`X-Transformed-From` 之后按需追加两行：
 
 ```
-X-Transformed-From: https          # 原 HTTP/1.0 | HTTP/2.0
+X-Transformed-From: HTTPS          # 原 HTTP/1.0 | HTTP/2.0
 X-Http-Version: 1.1                # 新增：0.9 | 1.0 | 1.1 | 2.0 | 3.0
 X-Body-Framing: chunked            # 新增：content-length | chunked | stream
 ```
@@ -95,7 +95,7 @@ ICAP 侧那条通道是容量 64 的有界通道且带背压（`bypass/mod.rs:49
 
 | 位置 | 调用 | 说明 |
 | --- | --- | --- |
-| `inspect/http/upload_audit.rs` | `h1_upload_audit` / `h2_upload_audit` / `scheme_tag` / `http_version_tag` | 唯一规则源，本模块 11 条单元测试 |
+| `inspect/http/upload_audit.rs` | `h1_upload_audit` / `h2_upload_audit` / `scheme_tag` / `http_version_tag` | 唯一规则源，本模块 12 条单元测试 |
 | `inspect/http/v1/mod.rs` | 主循环里判定，把 `body_type` + 形态一起交给 `H1ForwardTask::adapt_with_io` | 判不过就 `forward_with_io`，不建 ICAP 会话 |
 | `inspect/http/v2/forward/mod.rs` | 请求头交给 `ups_req` 之前判定（借不到 `parts.headers` 之后就晚了） | 形态 `content-length` / `stream` |
 | `serve/http_proxy/task/forward/task.rs` | `upload_audit_body()` → `take_upload_audit(body_framing)` | 名额与连接都在判定之后才占用 |
@@ -104,17 +104,24 @@ ICAP 侧那条通道是容量 64 的有界通道且带背压（`bypass/mod.rs:49
 
 ## 验证记录
 
-单元测试：`g3proxy --lib` 89 通过（含 upload_audit 11 条）、`g3-icap-client --lib` 26 通过、`g3-yaml --lib` 153 通过；`cargo clippy -p g3proxy -p g3-icap-client -p g3-yaml -p g3-dpi --all-targets` 零 error，新增代码零告警（残留的两条 too-many-args 与 doc-list 是改动前就有的）。
+单元测试：`g3proxy --lib` 90 通过（含 upload_audit 12 条）、`g3-icap-client --lib` 26 通过、`g3-yaml --lib` 153 通过；`cargo clippy -p g3proxy -p g3-icap-client -p g3-yaml -p g3-dpi --all-targets` 零 error，新增代码零告警（残留的两条 too-many-args 与 doc-list 是改动前就有的）。
 
-端到端（临时实例，未触碰 3128 上的现网进程）：`icap_echo_server` 于 127.0.0.1:1344，阈值 `req_body_min_size: 100`，源站收 POST 并回 200。
+已知的既有抖动：`g3-icap-client` 的 `reqmod::bypass::tests::test_upstream_half_close_is_optional` 在本机大约两次里挂一次，挂在同一 client 上第二次 `bypass_adapter()`，报 `failed to get icap service options: invalid value for header Allow`——像是连接池把一条还没排空（上一笔 204 留在套接字缓冲里）的连接交回使用时又发了一次 OPTIONS。该测试由 3e0c272e（2026-11-02，本次改造之前）引入，本仓库这块改动只改了标签字面量，没有触碰 OPTIONS/连接池路径；留作独立问题。
+
+端到端（临时实例，未触碰 3128 上的现网进程）：`icap_echo_server` 于 127.0.0.1:1345，阈值 `req_body_min_size: 100`；明文源站与 TLS 源站各自回 200，h2 源站用 Node 的 `http2.createSecureServer`（TLS 拦截的 ALPN 跟着源站走，源站不支持 h2 时客户端只能回落到 1.1，所以补了这个源站才测得到 2.0）。共 14 笔请求，9 笔送审：
 
 | 用例 | 承载 | 预期 | 实测 ICAP 头 |
 | --- | --- | --- | --- |
 | 57 B `Content-Length` | 明文转发 | 不审 | 无提交 |
 | 305 B `x-www-form-urlencoded`，`req_skip_urlencoded_form: true` | 明文转发 | 不审 | 无提交 |
-| 457 B `multipart/form-data`（浏览器上传形态） | 明文转发 | 审 | `http` / `1.1` / `content-length` |
-| 272 B 分块 | 明文转发 | 审（长度不可先知） | `http` / `1.1` / `chunked` |
-| 150 B / 50 B `octet-stream` | TLS 拦截 | 审 / 不审 | `https` / `1.1` / `content-length` |
-| 305 B 表单，`req_skip_urlencoded_form` 缺省 | TLS 拦截 | 审 | `https` / `1.1` / `content-length` |
+| 272 B 分块但 Content-Type 是表单，`req_skip_urlencoded_form: true` | 明文转发 | 不审（表单判断在成帧之前） | 无提交 |
+| 454 B `multipart/form-data`（浏览器上传形态） | 明文转发 | 审 | `HTTP` / `1.1` / `content-length` |
+| 284 B 分块 `application/octet-stream` | 明文转发 | 审（长度不可先知） | `HTTP` / `1.1` / `chunked` |
+| `curl -T -` 无长度 PUT | 明文转发 | 审 | `HTTP` / `1.1` / `chunked` |
+| 272 B `octet-stream` | TLS 拦截 h1 | 审 | `HTTPS` / `1.1` / `content-length` |
+| 57 B / 50 B | TLS 拦截 | 不审 | 无提交 |
+| 305 B 表单，`req_skip_urlencoded_form` 缺省 | TLS 拦截 h1 | 审 | `HTTPS` / `1.1` / `content-length` |
+| 272 B `curl -T file --http2` | TLS 拦截 h2 | 审 | `HTTPS` / `2.0` / `content-length` |
+| 272 B `curl -T - --http2`（无长度） | TLS 拦截 h2 | 审 | `HTTPS` / `2.0` / `stream` |
 
-即 `http` 与 `https` 两条标签、表单开关的开与关都跑到了实处。未覆盖：**HTTP/2 送审点**（拦截实例未与客户端协商出 h2 ALPN，curl 回落到 1.1）与 `X-Body-Framing: stream`——这两条只有单元测试与代码走读支撑。现网 `req_body_min_size: 8` 依旧等于不筛，本次没有改动。
+即 `HTTP` 与 `HTTPS` 两条标签、`1.1` / `2.0` 两个版本、三种成帧标记、表单开关的开与关，以及 h2 送审点，都跑到了实处。现网 `req_body_min_size: 8` 依旧等于不筛，本次没有改动。

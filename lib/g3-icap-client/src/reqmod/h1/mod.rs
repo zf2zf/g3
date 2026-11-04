@@ -134,7 +134,7 @@ impl IcapReqmodClient {
             /* added by wming for repid audit */
             connection_tuple: None,
             keylog_buffer: None,
-            transformed_scheme: "http",
+            transformed_scheme: "HTTP",
             http_version: Some("1.1"),
         })
     }
@@ -159,7 +159,7 @@ pub struct HttpRequestAdapter<I: IdleCheck> {
     /* added by wming for repid audit */
     connection_tuple: Option<ConnectionTuple>,
     keylog_buffer: Option<Arc<TlsKeyLogBuffer>>,
-    /// `X-Transformed-From` 取值：`http` / `https`，由调用方按实际承载设置
+    /// `X-Transformed-From` 取值：`HTTP` / `HTTPS`，由调用方按实际承载设置
     transformed_scheme: &'static str,
     /// `X-Http-Version` 取值（`1.0` / `1.1`）；`None` 时不发这个头
     http_version: Option<&'static str>,
@@ -239,9 +239,9 @@ impl<I: IdleCheck> HttpRequestAdapter<I> {
         self.keylog_buffer = Some(buffer);
     }
 
-    /// 设置协议来源标签：`scheme` 为 `http` / `https`（写进 `X-Transformed-From`），
+    /// 设置协议来源标签：`scheme` 为 `HTTP` / `HTTPS`（写进 `X-Transformed-From`），
     /// `version` 为客户端实际使用的 HTTP 版本（写进 `X-Http-Version`，
-    /// `None` 表示不发这个头）。不调用则按明文 HTTP/1.1 声明。
+    /// `None` 表示不发这个头）。不调用则按明文声明：`HTTP` + 版本 `1.1`。
     pub fn set_protocol_tag(&mut self, scheme: &'static str, version: Option<&'static str>) {
         self.transformed_scheme = scheme;
         self.http_version = version;
@@ -249,7 +249,7 @@ impl<I: IdleCheck> HttpRequestAdapter<I> {
 
     /// 追加本适配器统一的扩展头。
     ///
-    /// `X-Transformed-From` 声明封装报文的来源（`http` / `https`），
+    /// `X-Transformed-From` 声明封装报文的来源（`HTTP` / `HTTPS`），
     /// `X-Http-Version` 给出协议版本；两者都由调用方按实际承载设置。
     /// 其余均为 g3 自有扩展（客户端地址、用户名、五元组、TLS keylog），
     /// 未设置的项直接跳过，因此同一个适配器也能服务于不便提供这些信息的路径。

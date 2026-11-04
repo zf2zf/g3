@@ -66,7 +66,7 @@ pub enum BypassErrorKind {
 pub struct BypassFraming {
     /// ICAP 封装区 req-hdr：以 `\r\n\r\n` 结尾的请求头字节
     pub req_hdr: Vec<u8>,
-    /// 写入 `X-Transformed-From` 的协议来源标签：HTTP 流量为 `http` / `https`，
+    /// 写入 `X-Transformed-From` 的协议来源标签：HTTP 流量为 `HTTP` / `HTTPS`，
     /// FTP 数据通道为 `FTP`
     pub transformed_from: &'static str,
     /// 写入 `X-Http-Version` 的协议版本（`1.0` / `1.1` / `2.0`）；
@@ -1424,7 +1424,7 @@ mod tests {
     fn test_framing() -> BypassFraming {
         BypassFraming {
             req_hdr: b"GET /x HTTP/1.1\r\nHost: t\r\n\r\n".to_vec(),
-            transformed_from: "http",
+            transformed_from: "HTTP",
             http_version: Some("1.1"),
             body_framing: Some("chunked"),
         }
@@ -1818,7 +1818,7 @@ mod tests {
         let req_hdr = b"POST /upload HTTP/1.1\r\nHost: example.org\r\nContent-Length: 4\r\n\r\n";
         let framing = BypassFraming {
             req_hdr: req_hdr.to_vec(),
-            transformed_from: "https",
+            transformed_from: "HTTPS",
             http_version: Some("2.0"),
             body_framing: Some("content-length"),
         };
@@ -1851,7 +1851,7 @@ mod tests {
         for expect in [
             "REQMOD icap://",
             "Allow: 204\r\n",
-            "X-Transformed-From: https\r\n",
+            "X-Transformed-From: HTTPS\r\n",
             "X-Http-Version: 2.0\r\n",
             "X-Body-Framing: content-length\r\n",
             "X-Client-IP: 203.0.113.7\r\n",

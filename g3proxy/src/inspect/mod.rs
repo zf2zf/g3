@@ -190,7 +190,7 @@ pub(crate) struct StreamInspectContext<SC: ServerConfig> {
     inspection_depth: usize,
 
     /// 本会话的客户端侧是否为 TLS。只在 TLS 拦截对象里置真（见
-    /// `TlsInspectObject::prepare_ctx`），供审计上报区分 http / https。
+    /// `TlsInspectObject::prepare_ctx`），供审计上报区分 HTTP / HTTPS。
     /// 不能靠 keylog 缓冲是否存在反推——keylog 是可以单独关掉的配置。
     over_tls: bool,
 
@@ -340,7 +340,7 @@ impl<SC: ServerConfig> StreamInspectContext<SC> {
         self.inspection_depth += 1;
     }
 
-    /// 客户端侧是否走 TLS；决定审计上报里 `X-Transformed-From` 写 http 还是 https
+    /// 客户端侧是否走 TLS；决定审计上报里 `X-Transformed-From` 写 HTTP 还是 HTTPS
     #[inline]
     pub(crate) fn over_tls(&self) -> bool {
         self.over_tls

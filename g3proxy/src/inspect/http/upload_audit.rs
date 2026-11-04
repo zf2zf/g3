@@ -22,12 +22,12 @@ use g3_dpi::H1InterceptionConfig;
 use g3_http::HttpBodyType;
 use http::Version;
 
-/// ICAP `X-Transformed-From` 的协议来源取值：客户端侧走 TLS 就是 `https`。
+/// ICAP `X-Transformed-From` 的协议来源取值：客户端侧走 TLS 就是 `HTTPS`。
 pub(crate) const fn scheme_tag(over_tls: bool) -> &'static str {
     if over_tls {
-        "https"
+        "HTTPS"
     } else {
-        "http"
+        "HTTP"
     }
 }
 
@@ -284,5 +284,14 @@ mod tests {
         assert_eq!(UploadBodyFraming::ContentLength.as_str(), "content-length");
         assert_eq!(UploadBodyFraming::Chunked.as_str(), "chunked");
         assert_eq!(UploadBodyFraming::Stream.as_str(), "stream");
+    }
+
+    #[test]
+    fn protocol_tags_are_uppercase_scheme_and_dotted_version() {
+        assert_eq!(scheme_tag(false), "HTTP");
+        assert_eq!(scheme_tag(true), "HTTPS");
+        assert_eq!(http_version_tag(Version::HTTP_10), Some("1.0"));
+        assert_eq!(http_version_tag(Version::HTTP_11), Some("1.1"));
+        assert_eq!(http_version_tag(Version::HTTP_2), Some("2.0"));
     }
 }

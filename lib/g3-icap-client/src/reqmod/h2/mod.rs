@@ -13,7 +13,8 @@
 //!   `:path`（缺 path 时 `OPTIONS` 用 `*`、其它方法用 `/`）拼成请求行
 //!   `METHOD path HTTP/1.1`，`:authority` 补成 `Host:` 头，`TE` 等
 //!   hop-by-hop 头被跳过。因此本模块的扩展头写
-//!   `X-Transformed-From: HTTP/2.0`（h1 版为 `HTTP/1.0`）。
+//!   `X-Transformed-From: HTTP`（TLS 承载时为 `HTTPS`）加
+//!   `X-Http-Version: 2.0`（h1 版的版本为 `1.0` / `1.1`）。
 //! - body 来自 h2 `RecvStream` 数据帧（流式、无 Content-Length 语义），
 //!   上报 ICAP 时按 chunked 传输编码**重新分块**
 //!   （`g3_h2::H2StreamToChunkedTransfer`，末尾补 `0\r\n` 终止块 +
@@ -125,7 +126,7 @@ impl IcapReqmodClient {
             /* added by wming for repid audit */
             connection_tuple: None,
             keylog_buffer: None,
-            transformed_scheme: "http",
+            transformed_scheme: "HTTP",
             http_version: Some("2.0"),
         })
     }
@@ -156,7 +157,7 @@ pub struct H2RequestAdapter<I: IdleCheck> {
     connection_tuple: Option<ConnectionTuple>,
     // TLS keylog 缓冲区，序列化成 X-TLS-* 头上报（供 ICAP 侧解密审计）
     keylog_buffer: Option<Arc<TlsKeyLogBuffer>>,
-    /// `X-Transformed-From` 取值：`http` / `https`，由调用方按实际承载设置
+    /// `X-Transformed-From` 取值：`HTTP` / `HTTPS`，由调用方按实际承载设置
     transformed_scheme: &'static str,
     /// `X-Http-Version` 取值（`2.0`）；`None` 时不发这个头
     http_version: Option<&'static str>,
@@ -240,9 +241,9 @@ impl<I: IdleCheck> H2RequestAdapter<I> {
         self.keylog_buffer = Some(buffer);
     }
 
-    /// 设置协议来源标签：`scheme` 为 `http` / `https`（写进 `X-Transformed-From`），
+    /// 设置协议来源标签：`scheme` 为 `HTTP` / `HTTPS`（写进 `X-Transformed-From`），
     /// `version` 写进 `X-Http-Version`，`None` 表示不发这个头。
-    /// 不调用则按明文 HTTP/2.0 声明。
+    /// 不调用则按明文声明：`HTTP` + 版本 `2.0`。
     pub fn set_protocol_tag(&mut self, scheme: &'static str, version: Option<&'static str>) {
         self.transformed_scheme = scheme;
         self.http_version = version;
@@ -250,7 +251,7 @@ impl<I: IdleCheck> H2RequestAdapter<I> {
 
     /// 追加 ICAP 扩展头（写进 ICAP 请求头区，位于 `Encapsulated` 之前）。
     ///
-    /// `X-Transformed-From` 声明封装报文的来源（`http` / `https`），
+    /// `X-Transformed-From` 声明封装报文的来源（`HTTP` / `HTTPS`），
     /// `X-Http-Version` 给出协议版本；当 h2 流带 `:protocol` pseudo-header
     /// （RFC 8441 extended CONNECT，h2 crate 以 `Protocol` 扩展形式挂在
     /// `Extensions` 上）时，额外用 `X-HTTP-Upgrade` 告知 ICAP 被升级的协议名

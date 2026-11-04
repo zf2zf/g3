@@ -29,14 +29,25 @@
 
 ## 2. 三个入口与协议来源标签
 
-ICAP 侧用 `X-Transformed-From` 区分被采集的原始协议，取值只有三种：
+ICAP 侧用 `X-Transformed-From` 区分被采集的原始协议：HTTP 流量按客户端侧是否走 TLS
+写 `HTTP` / `HTTPS`，FTP 数据通道写 `FTP`。协议版本与请求体成帧形态各占一条新头：
 
-| 入口 | `X-Transformed-From` |
-|------|----------------------|
-| 明文 HTTP 正向代理上传（`serve/http_proxy`） | `HTTP/1.0` |
-| TLS 拦截 HTTP/1 上传（`inspect/http/v1`） | `HTTP/1.0` |
-| TLS 拦截 HTTP/2 上传（`inspect/http/v2`） | `HTTP/2.0` |
-| FTP/FTPS STOR 上传（改造后共用同一管线） | `FTP` |
+| 入口 | `X-Transformed-From` | `X-Http-Version` | `X-Body-Framing` |
+|------|----------------------|------------------|------------------|
+| 明文 HTTP 正向代理上传（`serve/http_proxy`） | `HTTP` / `HTTPS` | `1.0` / `1.1` | `content-length` / `chunked` |
+| TLS 拦截 HTTP/1 上传（`inspect/http/v1`） | `HTTPS` | `1.0` / `1.1` | `content-length` / `chunked` |
+| TLS 拦截 HTTP/2 上传（`inspect/http/v2`） | `HTTPS` | `2.0` | `content-length` / `stream` |
+| FTP/FTPS STOR 上传（改造后共用同一管线） | `FTP` | 不发 | 不发 |
+
+`X-Transformed-From` 早先是 `HTTP/1.0` / `HTTP/2.0`——那是"封装区按哪个版本序列化"的身份
+标签，审计侧拿不到 scheme。现在 scheme、版本、成帧形态三者分列，取值都由
+`g3proxy/src/inspect/http/upload_audit.rs` 一处给出。
+
+`X-Body-Framing` 告诉审计服务 req-body 区里的字节要不要先解一层分块帧：客户端用
+`Transfer-Encoding: chunked` 上传时，代理刻意把原始帧原样投给源站（`HttpBodyReader`），
+旁路 tap 与上游读的是同一个 reader，于是 ICAP 侧在自己的分块外面又套了一层——审计侧看到
+的就是 `1a\r\n<数据>\r\n…0\r\n\r\n` 这种带十六进制长度行的原始流。`content-length` 与
+`stream` 两档的 req-body 就是请求体本身。
 
 HTTP/2 送出去的请求头是**伪 HTTP/1.1 报文头**：由 `:method` / `:path` 还原请求行，
 `Host` 缺失时用 URI 的 authority 补齐，`TE` 一类的逐跳（hop-by-hop）头剔除。这样做是
@@ -44,17 +55,22 @@ HTTP/2 送出去的请求头是**伪 HTTP/1.1 报文头**：由 `:method` / `:pa
 
 ## 3. 一笔请求是否被审计：开关链
 
-按代码里的实际判定顺序：
+按代码里的实际判定顺序（判定全部在 `inspect/http/upload_audit.rs`，三个入口共用，且都发生
+在**建立 ICAP 会话之前**）：
 
 1. auditor 配置里有 `icap_reqmod_service`（没有则整条链路不启用）。
-2. 请求带请求体。
-3. 若 `h1_interception.req_hasbody: true`，`Content-Length` 小于
-   `req_body_min_size` 的小请求体跳过送检。这是沿用既有阈值，本次改造没有新增阈值。
-4. 取并发名额 `upload_audit_max_concurrency`（默认 64，`0` 表示不设限）。
+2. 请求带请求体。GET / HEAD / 空体请求不建 ICAP 会话。
+3. `Content-Type: application/x-www-form-urlencoded` 且
+   `h1_interception.req_skip_urlencoded_form: true` → 跳过。登录框、搜索框、埋点这类
+   键值对没有文件可审。浏览器上传文件的 `multipart/form-data` 不受本项影响。
+4. 若 `h1_interception.req_hasbody: true`：`Content-Length` **严格大于**
+   `req_body_min_size` 才送检；长度无法预先得知（`chunked`、h2 省略 `content-length`）
+   一律送检。`req_hasbody: false` 是兼容模式——有体即审，阈值不参与。
+5. 取并发名额 `upload_audit_max_concurrency`（默认 64，`0` 表示不设限）。
    **名额用尽时不排队**：本笔请求直接走无审计直通转发，并在任务日志里记一次跳过。
-5. 从 ICAP 连接池取连接（池空则新建）。取不到 / 建连失败：打一条 warn 日志，
+6. 从 ICAP 连接池取连接（池空则新建）。取不到 / 建连失败：打一条 warn 日志，
    本笔走无审计直通转发。注意这条路径**不计入跳过数**——跳过数只统计名额耗尽。
-6. 进入旁路管线：同一份数据一边写给源站、一边重新分块送给 ICAP。
+7. 进入旁路管线：同一份数据一边写给源站、一边重新分块送给 ICAP。
 
 ## 4. ICAP 服务端会收到什么
 
@@ -64,7 +80,9 @@ HTTP/2 送出去的请求头是**伪 HTTP/1.1 报文头**：由 `:method` / `:pa
 REQMOD icap://<icap-host>:1344/<service> ICAP/1.0
 Host: <icap-host>
 Allow: 204
-X-Transformed-From: HTTP/2.0
+X-Transformed-From: HTTPS
+X-Http-Version: 2.0
+X-Body-Framing: content-length
 X-Client-IP: 203.0.113.7
 X-Client-Port: 5555
 X-Client-Username: alice
@@ -136,21 +154,39 @@ HTTP 转发任务日志里与旁路上报相关的字段：
 
 前置：ICAP 服务可用（例如 c-icap `icap://127.0.0.1:1344/echo`）、代理 auditor 里
 `icap_reqmod_service` 指向它、客户端信任代理的拦截 CA。抓 ICAP 侧报文：
-`sudo tcpdump -i lo0 port 1344 -w audit.pcap`。
+`sudo tcpdump -i lo port 1344 -w audit.pcap`（Linux 是 `lo`，BSD 是 `lo0`）。
 
-四组上传场景，四组都应当成功，ICAP 侧都应收到 REQMOD 且 `X-Transformed-From` 正确：
+四组上传场景，四组都应当成功，ICAP 侧都应收到 REQMOD 且三个协议标签都正确：
 
 ```sh
-# 1) 明文 HTTP/1，带 Content-Length 的请求体          -> HTTP/1.0
-curl -x 127.0.0.1:10087 --data-binary @file http://origin.example/upload
-# 2) 明文 HTTP/1，分块请求体                          -> HTTP/1.0
-curl -x 127.0.0.1:10087 -H 'Transfer-Encoding: chunked' --data-binary @file http://origin.example/upload
-# 3) TLS 拦截的 HTTP/1 POST                           -> HTTP/1.0
-curl -x 127.0.0.1:10087 --cacert proxy-ca.pem --data-binary @file https://origin.example/upload
-# 4) TLS 拦截的 HTTP/2 PUT（h2 上传）                 -> HTTP/2.0
+# 1) 明文 HTTP/1，带 Content-Length 的请求体
+#    -> X-Transformed-From: HTTP, X-Http-Version: 1.1, X-Body-Framing: content-length
+curl -x 127.0.0.1:10087 -H 'Content-Type: application/octet-stream' --data-binary @file http://origin.example/upload
+# 2) 明文 HTTP/1，分块请求体
+#    -> X-Transformed-From: HTTP, X-Http-Version: 1.1, X-Body-Framing: chunked
+curl -x 127.0.0.1:10087 -H 'Content-Type: application/octet-stream' -H 'Transfer-Encoding: chunked' --data-binary @file http://origin.example/upload
+# 3) TLS 拦截的 HTTP/1 POST
+#    -> X-Transformed-From: HTTPS, X-Http-Version: 1.1, X-Body-Framing: content-length
+curl -x 127.0.0.1:10087 -H 'Content-Type: application/octet-stream' --cacert proxy-ca.pem --data-binary @file https://origin.example/upload
+# 4) TLS 拦截的 HTTP/2 PUT（h2 上传）
+#    -> X-Transformed-From: HTTPS, X-Http-Version: 2.0, X-Body-Framing: content-length
 curl -x 127.0.0.1:10087 --http2 --cacert proxy-ca.pem -T file https://origin.example/put
 ```
 
+两个坑，都会让人误判"审计没生效"：
+
+- `curl --data` / `--data-binary` 不给 Content-Type 时自带 `application/x-www-form-urlencoded`，
+  开了 `req_skip_urlencoded_form` 就会被表单规则拦掉——想测文件上传形态就显式给一个
+  `application/octet-stream`，或者用 `-F`（multipart）/ `-T`。表单判断在成帧判断之前，
+  所以分块 + 表单类型同样不送审。
+- 第 4 条要真跑出 `2.0`，**源站必须支持 h2**：TLS 拦截时代理把自己与客户端协商的 ALPN
+  跟着源站的结果走（`inspect/tls/modern.rs:218-223`），源站只会 HTTP/1.1 时客户端就回落
+  到 1.1，标签也就成 `1.1` 了。本地起一个 h2 源站最省事，例如
+  `node -e 'require("http2").createSecureServer({key,cert},(q,s)=>{q.resume();q.on("close",()=>{s.writeHead(200);s.end("ok\n")})}).listen(18444,"0.0.0.0")'`。
+
+`X-Transformed-From` 只表示协议方案（`HTTP` / `HTTPS`，与既有的 `FTP` / `SMTP` / `IMAP`
+同为大写），版本号一律看 `X-Http-Version`；两者都由客户端侧实际是什么决定，与转发目标
+无关。
 对照检查：封装区里的请求头字节应与客户端实际发出的请求头一致（h2 是伪 HTTP/1.1 形式），
 `req-body` 偏移与请求头长度一致，重组后的分块内容长度应等于上传文件长度。
 
@@ -182,8 +218,16 @@ cargo test -p g3-h2 --lib              # HTTP/2 体收发：TRAILERS 与 END_STR
                                         # 截断体判定为 Incomplete、送检请求头字节
 cargo test -p g3proxy --features vendored-c-ares --lib   # 审计器配置（含
                                         # upload_audit_max_concurrency 默认 64 / 0 不设限 /
-                                        # 非法值报错）、名额耗尽跳过计数、日志字段
+                                        # 非法值报错）、名额耗尽跳过计数、日志字段、
+                                        # 送审判定规则（inspect/http/upload_audit.rs，12 条）
 ```
 
-§7 里需要真实 ICAP 服务与拦截证书链的部分（四组 curl、kill ICAP、FTP 实传）属于部署环境
-复核项，开发沙箱内没有执行；其上表覆盖的是同一批语义在库层面的等价断言。
+§7 的判定与标签部分已在本机沙箱跑通：`icap_echo_server`（本仓库 example）当 ICAP、
+g3fcgen 签发的拦截 CA、本地 HTTP/1.1 与 HTTP/2 源站各一个，共 14 笔请求、9 笔送审，
+`HTTP` / `HTTPS`、`1.1` / `2.0`、三种 `X-Body-Framing`、表单开关的开与关都对上了；
+真 c-icap 服务与 FTP 实传属于现网复核项，沙箱内没有执行。
+
+回归时若 `g3-icap-client` 里 `reqmod::bypass::tests::test_upstream_half_close_is_optional`
+报 `failed to get icap service options: invalid value for header Allow`，那是本仓库改动前
+就存在的抖动（约两次里挂一次，挂在同一 client 上第二次建 adapter 的连接池/OPTIONS 复用），
+重跑即可，不是这次的改造引入的。
