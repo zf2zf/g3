@@ -546,7 +546,7 @@ ${README_PORTABILITY}
 ## 这是什么
 
 审计链路末端的 ICAP 服务端：g3proxy 的 auditor 把上行请求送到
-icap://127.0.0.1:1344/echo（HTTP）或 /icap_audit（FTP），本服务把收到的 ICAP 报文逐段打印
+icap://127.0.0.1:1344/icap_audit（HTTP 与 FTP 两条审计链路都用这个名字），本服务把收到的 ICAP 报文逐段打印
 进 journald，再回 204 放行。用来验证送审判定与协议标签是否正确、旁路链路通不通，真实审计
 引擎还没就位时也可以先把端口占住。它不修改报文，也不做内容检测。
 
@@ -558,7 +558,7 @@ icap://127.0.0.1:1344/echo（HTTP）或 /icap_audit（FTP），本服务把收�
 
 程序落在 /opt/zf/icap（bin + systemd 单元 + 本说明），注册为 g3icap.service 并立即启动。
 这个包不写配置目录、不需要 CA；监听地址与注册的服务名写在单元里（默认
-127.0.0.1:1344，注册 echo、reqmod、respmod、icap_audit 四个）。要改就
+127.0.0.1:1344，注册 icap_audit 加上 echo、reqmod、respmod 三个别名）。要改就
 \`systemctl edit g3icap\` 覆盖 ExecStart=，再 daemon-reload + restart。
 
 ## 网络命名空间
@@ -576,7 +576,7 @@ ${README_NETNS}
     /opt/zf/icap/bin/g3icap --version
     /opt/zf/icap/bin/g3icap --listen 127.0.0.1:1345   # 手工起一份，别抢服务的端口
 
-g3proxy 侧确认送审有没有到达：journalctl -u g3icap 里应该出现 "ICAP REQMOD /echo" 一段，
+g3proxy 侧确认送审有没有到达：journalctl -u g3icap 里应该出现 "ICAP REQMOD /icap_audit" 一段，
 含 ICAP 头（X-Transformed-From / X-Http-Version / X-Body-Framing）与封装的 HTTP 报文。
 一条都没有就先比对三个服务的命名空间：
 

@@ -113,7 +113,7 @@ auditor:
     tls_interception_client: { }    # 代理→源站 的 TLS 参数
     h1_interception: { }            # HTTP/1 拦截参数（含超时）
     application_audit_ratio: 1.0    # 采样率：1.0 = 每个任务都检测
-    icap_reqmod_service: icap://127.0.0.1:1344/echo   # 送检后端
+    icap_reqmod_service: icap://127.0.0.1:1344/icap_audit   # 送检后端
 ```
 
 两个会绊住人的地方：

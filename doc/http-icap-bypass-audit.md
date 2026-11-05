@@ -152,7 +152,7 @@ HTTP 转发任务日志里与旁路上报相关的字段：
 
 ## 7. 在部署环境把链路验一遍
 
-前置：ICAP 服务可用（例如 c-icap `icap://127.0.0.1:1344/echo`）、代理 auditor 里
+前置：ICAP 服务可用（例如仓库自带的 `g3icap`，或 c-icap 的示例服务）、代理 auditor 里
 `icap_reqmod_service` 指向它、客户端信任代理的拦截 CA。抓 ICAP 侧报文：
 `sudo tcpdump -i lo port 1344 -w audit.pcap`（Linux 是 `lo`，BSD 是 `lo0`）。
 

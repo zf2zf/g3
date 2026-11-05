@@ -23,7 +23,8 @@ g3fcgen 是必须的服务：auditor 配置里的 `tls_cert_generator` 会在运
 前置条件（见第 1、3 节）。
 
 `g3icap` 是审计链路的末端：auditor 配置里的 `icap_reqmod_service` 指向
-`icap://127.0.0.1:1344/echo`。它由 `lib/g3-icap-client` 的 example 提升为独立 crate
+`icap://127.0.0.1:1344/icap_audit`（HTTP 与 FTP 两条链路都用这个名字）。它由
+`lib/g3-icap-client` 的 example 提升为独立 crate
 （`g3icap/`），只做回显 + 逐段打印送审报文，用来在没接真实 ICAP 设备时把链路打通、
 看清明面上到底送了什么。接真实 ICAP 服务（c-icap、检测网关等）时不必装这个包。
 
@@ -229,7 +230,7 @@ icap 包没有配置可加载，这一轮换成 `g3icap --version`（同样能�
 命名空间的回环，而它两个依赖全写在回环上：
 
 - `tls_cert_generator` 连 g3fcgen 的 `127.0.0.1:2999`（TLS 拦截取中间人证书）；
-- `icap_reqmod_service` 的 `icap://127.0.0.1:1344/echo`（旁路审计）。
+- `icap_reqmod_service` 的 `icap://127.0.0.1:1344/icap_audit`（旁路审计）。
 
 这两个服务留在 host 时，两条地址在 ns-vpp 里都是空的：TLS 拦截在握手时失败，审计请求静默
 丢掉——服务全都 `active (running)`，日志里却什么送审都没有，比装不上难查得多。所以约定是
@@ -367,9 +368,12 @@ ExecStart=@PREFIX@/bin/g3icap --listen 127.0.0.1:1344
 
 `--listen` 写在单元里而不是配置文件里，要换地址/端口就 `systemctl edit g3icap` 覆盖这一行；
 `--service`（注册给 OPTIONS 的服务名，默认 `echo,reqmod,respmod,icap_audit`）与
-`--max-body-print`（送审正文打印上限，默认 512 字节）同样可以在这里改。随包配置里
-`icap_reqmod_service` 走 `/echo`；仓库里 FTP 审计器的示例 `etc/g3proxy/ftp/auditor.d/ftp_auditor.yaml`
-走 `/icap_audit`，两个名字都在默认注册列表里，改配置时对齐一下即可。
+`--max-body-print`（送审正文打印上限，默认 512 字节）同样可以在这里改。服务名两边要对齐：
+随包配置与仓库里 `etc/g3proxy/http/auditor.d/default.yaml`、
+`etc/g3proxy/ftp/auditor.d/ftp_auditor.yaml` 都送 `/icap_audit`，`g3icap` 默认注册列表是
+`icap_audit,echo,reqmod,respmod`——`echo` 等留着当别名，因为升级从不覆盖现网
+`g3proxy.yaml`，老配置指向 `/echo` 也照样接得住。接真实 ICAP 设备时按设备暴露的服务名改
+`icap_reqmod_service` 即可。
 
 `NetworkNamespacePath=` 需要 systemd ≥ 246；命名空间必须已经存在（`ip netns list` 能看见），
 systemd 不会代你创建。三个单元由同一个 `@NETNS@` 机制展开，每个包只渲染自己那几个单元，

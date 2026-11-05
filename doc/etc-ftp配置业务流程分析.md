@@ -80,7 +80,7 @@ h1_interception:
   req_body_min_size: 8               # 最小 body 大小阈值
 
 # === ICAP 审计 ===
-icap_reqmod_service: icap://127.0.0.1:1344/echo   # ICAP REQMOD 服务地址
+icap_reqmod_service: icap://127.0.0.1:1344/icap_audit   # ICAP REQMOD 服务地址
 application_audit_ratio: 1.0                       # 审计比例（100%）
 ```
 
@@ -328,7 +328,7 @@ adapter.audit_and_forward(&mut state, clt_r, ups_w, "STOR", "/path/to/file").awa
 **ICAP 请求头构造**（`lib/g3-icap-client/src/reqmod/ftp/mod.rs:132-167`）：
 
 ```
-POST icap://127.0.0.1:1344/echo ICAP/1.0
+POST icap://127.0.0.1:1344/icap_audit ICAP/1.0
 Host: 127.0.0.1
 Encapsulated: req-hdr=0, req-body=148
 

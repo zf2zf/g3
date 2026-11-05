@@ -21,8 +21,8 @@
 //! Preview 握手（`ICAP/1.0 100 Continue`）自动完成，客户端未声明
 //! `Allow: 204` 时自动把 204 换成 200 原样回显封装报文。
 //!
-//! 服务默认注册 `echo,reqmod,respmod,icap_audit` 四个名字，对应 g3proxy 的 HTTP
-//! 审计（`/echo`）与 FTP 审计（`/icap_audit`）两条链路。
+//! 服务默认注册 `icap_audit,echo,reqmod,respmod`：部署配置里 HTTP 与 FTP 两条审计链路
+//! 都送 `/icap_audit`，`echo` 等名字留着兼容旧配置（升级不会覆盖现网 `g3proxy.yaml`）。
 //!
 //! 用法：
 //! ```sh
@@ -51,9 +51,11 @@ const ARG_SERVICE: &str = "service";
 const ARG_MAX_BODY_PRINT: &str = "max-body-print";
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:1344";
-// HTTP 审计走 /echo（deploy/conf/g3proxy.yaml），FTP 审计走 /icap_audit
-// （etc/g3proxy/ftp/auditor.d/ftp_auditor.yaml），默认两个都要接得住
-const DEFAULT_SERVICES: &str = "echo,reqmod,respmod,icap_audit";
+// 部署用的服务名是 /icap_audit：HTTP 审计（deploy/conf/g3proxy.yaml、
+// etc/g3proxy/http/auditor.d/default.yaml）与 FTP 审计
+// （etc/g3proxy/ftp/auditor.d/ftp_auditor.yaml）都指它。echo/reqmod/respmod 作为别名
+// 一并注册：现网旧配置的升级不会覆盖 g3proxy.yaml，`icap_perf_test` 也按 echo 发报文。
+const DEFAULT_SERVICES: &str = "icap_audit,echo,reqmod,respmod";
 const DEFAULT_MAX_BODY_PRINT: &str = "512";
 
 fn build_cli_args() -> Command {

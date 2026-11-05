@@ -87,7 +87,7 @@ auditor:
     h1_interception: { }             # HTTP/1 解析参数
     application_audit_ratio: 1.0     # 100% 采样
     # tls_stream_dump: { }           # 可选：解密流量 UDP 导出（默认 127.0.0.1:5555）
-    icap_reqmod_service: icap://127.0.0.1:1344/echo
+    icap_reqmod_service: icap://127.0.0.1:1344/icap_audit
 ```
 
 第一次跑建议**把 `icap_reqmod_service` 这行注释掉**：本机没有 ICAP 服务时，请求会在送检处报错，

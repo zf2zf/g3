@@ -224,3 +224,12 @@ OpenSSL/c-ares 要内置。开关照旧接受，只为让两个包的命令行�
   对端未装只提示、包结构自检、icap 卸载只摘 `g3icap.service` 且保留 g3 单元与目录、
   在包目录里执行卸载脚本时整包原样保留。全部通过。
 - 现网 `g3proxy` :3128 全程未接触：所有 `systemctl` 调用都走桩，测试完临时 ns 已删除。
+
+## 后续变更（2026-11-05）：送审服务名统一为 `/icap_audit`
+
+上面各处按 HTTP 送 `/echo`、FTP 送 `/icap_audit` 写，现已统一：`deploy/conf/g3proxy.yaml`、
+`etc/g3proxy/http/auditor.d/default.yaml` 的 `icap_reqmod_service` 都改成
+`icap://127.0.0.1:1344/icap_audit`，与 FTP 那条对齐。`g3icap` 的默认注册列表相应改成
+`icap_audit,echo,reqmod,respmod`——部署用的名字排第一，`echo` 等保留为别名，因为升级
+从不覆盖现网 `g3proxy.yaml`，老配置指向 `/echo` 时必须还能接得住（否则会 OPTIONS 失败、
+审计静默丢）。真实 ICAP 设备按它自己的服务名配置即可，与本仓库的取名无关。

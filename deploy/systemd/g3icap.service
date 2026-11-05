@@ -7,7 +7,8 @@ Wants=network-online.target
 [Service]
 Type=exec
 @NETNS@
-# 监听地址与 g3proxy.yaml 里的 icap_reqmod_service 对齐；要换端口就 systemctl edit g3icap
+# 监听地址与 g3proxy.yaml 里的 icap_reqmod_service 对齐：HTTP 与 FTP 两条审计链路都送
+# /icap_audit（g3icap 默认注册，旧配置用的 /echo 作为别名也在）。要换端口就 systemctl edit g3icap
 ExecStart=@PREFIX@/bin/g3icap --listen 127.0.0.1:1344
 # 用 SIGINT 让它把手上的审计请求收尾（SIGTERM 也接得住）
 ExecStop=/bin/kill -INT $MAINPID

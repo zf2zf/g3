@@ -58,7 +58,7 @@ auditor:
     application_audit_ratio: 1.0
 
     # tls_stream_dump: { }
-    icap_reqmod_service: icap://127.0.0.1:1344/echo
+    icap_reqmod_service: icap://127.0.0.1:1344/icap_audit
     # 同时进行的旁路上传审计条数上限（默认 64，0 表示不设限）。名额用尽时
     # 新请求直接退化为直通转发并计入跳过数，不排队等待，因此调小只会少审计
     # 几笔上传，绝不会变慢转发。
