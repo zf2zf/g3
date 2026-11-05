@@ -1,16 +1,21 @@
 #!/bin/sh
 #
-# 编译并打一个 g3 "run 包"：可执行程序 + 配置 + systemd 单元 + 安装/卸载脚本，
-# 产物是 dist/ 下的一个目录、同名 tar.gz，和一个可直接执行的自解压 .run，
-# 部署目标是 /opt/zf/g3。
+# 编译并打一个 g3 "run 包"：可执行程序 + systemd 单元 + 安装/卸载脚本（以及配置），
+# 产物是 dist/ 下的一个目录、同名 tar.gz，和一个可直接执行的自解压 .run。
+#
+# 两个组件，共用同一套编译开关与命名空间约定：
+#   --component=g3    g3proxy + g3proxy-ctl + g3fcgen，装到 /opt/zf/g3（默认）
+#   --component=icap  g3icap（ICAP 回显服务，审计链路末端），装到 /opt/zf/icap
 #
 # 目标机部署就一条命令：
 #   sudo ./g3-run-xxx.run      # 装 g3proxy 与 g3fcgen 两个服务，起不来则整装失败
 #   sudo /opt/zf/g3/uninstall.sh   # 卸载（停服务、摘单元、删除 /opt/zf/g3）
+#   sudo ./g3icap-run-xxx.run      # 装 g3icap 一个服务
+#   sudo /opt/zf/icap/uninstall.sh # 卸载（只动 g3icap，不碰 g3 的单元与目录）
 #
-# 重要：run 包里的二进制是按"打包这台机器"的动态库链接的（OpenSSL、c-ares、
-# Lua、Python），请在与目标机同 OS/同架构的机器上执行本脚本。目标机是别的发行版，就加
-# --portable / --static 裁剪（见下面"跨发行版"一段）。
+# 重要：run 包里的二进制是按"打包这台机器"的动态库链接的（g3 组件链 OpenSSL、c-ares、
+# Lua、Python，icap 组件只链 glibc），请在与目标机同 OS/同架构的机器上执行本脚本。目标机
+# 是别的发行版，就加 --portable / --static 裁剪（见下面"跨发行版"一段）。
 #
 # g3fcgen 是必须的服务（auditor 的 tls_cert_generator 运行时向它取 MITM 证书），
 # 包里必须带 CA：deploy/conf 下有成套 myCA.crt/myCA.key 就直接打进包；没有则
@@ -25,13 +30,15 @@
 #   deploy/build_run_package.sh --features=vendored-openssl          # 追加 cargo feature
 #   deploy/build_run_package.sh --portable              # 跨发行版：去 Lua/Python，内置 OpenSSL/c-ares
 #   deploy/build_run_package.sh --static                # 在 --portable 之上再把 glibc 静态进去
-#   deploy/build_run_package.sh --netns=no                  # g3proxy 不进网络命名空间
+#   deploy/build_run_package.sh --netns=no                  # 三个服务都不进网络命名空间
 #   deploy/build_run_package.sh --netns=/run/netns/ns-other # 换命名空间（默认 ns-vpp）
+#   deploy/build_run_package.sh --component=icap --static   # ICAP 回显服务的独立包
 #
-# g3proxy 默认装进网络命名空间（--netns 的路径值，默认 /run/netns/ns-vpp）：跑在 VPP 那边
-# 的网络栈里，监听地址与回环都是该命名空间的。g3fcgen 与 ICAP 服务不进——
-# 生效后进的 127.0.0.1 是 ns-vpp 的回环，g3proxy.yaml 里走回环的 g3fcgen(2999)
-# 与 ICAP(1344) 必须在里面可达，否则 TLS 拦截与审计取不到东西。
+# g3proxy、g3fcgen 与 g3icap 默认一起装进网络命名空间（--netns 的路径值，默认
+# /run/netns/ns-vpp）：三个服务共用 VPP 那边那一套网络栈，127.0.0.1 是该命名空间的回环，
+# g3proxy.yaml 里的 g3fcgen(2999) 与 ICAP(1344) 就直接可达。两个包必须用同一个
+# --netns 路径打包，装错会在安装时被拦住（见 doc/deploy-run-package.md 的命名空间一节）。
+# --netns=no 时三个服务都留在 host 网络。
 #
 # 目标机与构建机不是同一套系统，就加一个裁剪开关，别在目标机凑库：
 #   deploy/build_run_package.sh --portable    # 去 Lua/Python，OpenSSL 与 c-ares 内置编译
@@ -42,6 +49,9 @@
 # 并额外验三个可执行程序确实不加载任何 .so。
 # 两个开关都会关掉 cargo 的默认 feature（quic 与 TLS 后端由开关补回来），产物里就没有
 # auth 的 type: lua / type: python 动态用户名来源——当前内联配置没有 auth，用不到。
+# --component=icap 时 --portable 不追加任何 feature：g3icap 是纯 Rust（icap-rs + tokio +
+# tracing），没有 Lua/Python 要裁，也没有 OpenSSL/c-ares 要内置；对它真正有用的是 --static
+# （glibc 那一层）。开关照旧接受，为的是两个包的命令行保持一致。
 # 详见 doc/deploy-run-package.md 的"feature 裁剪"一节。
 
 set -eu
@@ -49,10 +59,13 @@ set -eu
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PROJECT_DIR=$(CDPATH= cd -- "${SCRIPT_DIR}/.." && pwd)
 
-# 打进 run 包的可执行程序，按需增删
-RUN_BINS=${RUN_BINS:-"g3proxy g3proxy-ctl g3fcgen"}
-# 需要一起编译的 workspace 包
-BUILD_PACKAGES=${BUILD_PACKAGES:-"g3proxy g3proxy-ctl g3fcgen"}
+# 打哪个组件的包：g3 = g3proxy + g3proxy-ctl + g3fcgen（装 /opt/zf/g3）；
+# icap = g3icap 回显服务（装 /opt/zf/icap）
+COMPONENT=${COMPONENT:-g3}
+# 打进 run 包的可执行程序，按需增删；留空按组件取默认
+RUN_BINS=${RUN_BINS:-}
+# 需要一起编译的 workspace 包；留空按组件取默认
+BUILD_PACKAGES=${BUILD_PACKAGES:-}
 # cargo 的构建 profile 与额外参数
 PROFILE=${PROFILE:-release}
 G3_BUILD_ARGS=${G3_BUILD_ARGS:-}
@@ -116,6 +129,9 @@ while [ $# -gt 0 ]; do
 		NETNS=yes
 		NETNS_PATH=${opt#--netns=}
 		;;
+	--component=*)
+		COMPONENT=${opt#*=}
+		;;
 	--portable)
 		PORTABILITY=portable
 		;;
@@ -135,6 +151,40 @@ done
 
 cd "$PROJECT_DIR"
 
+# 组件差异全集中在这张表里：编译哪些包、进哪些可执行程序与单元、包名前缀、安装前缀，
+# 以及裸 feature 名默认挂在哪个包上。其余部分——编译开关、命名空间展开、静态断言、
+# .run 自解压头——两个组件共用一份，避免"g3 包是静态的、icap 包悄悄不是"这种漂移。
+case "$COMPONENT" in
+g3)
+	RUN_BINS=${RUN_BINS:-"g3proxy g3proxy-ctl g3fcgen"}
+	BUILD_PACKAGES=${BUILD_PACKAGES:-"g3proxy g3proxy-ctl g3fcgen"}
+	UNITS="g3proxy.service g3fcgen.service"
+	NS_MEMBERS="g3proxy、g3fcgen"
+	FEATURE_PKG=g3proxy
+	PKG_PREFIX=g3-run
+	INSTALL_PREFIX=/opt/zf/g3
+	INSTALL_SCRIPT=install.sh
+	UNINSTALL_SCRIPT=uninstall.sh
+	PKG_SUMMARY="装 ${INSTALL_PREFIX}，起 g3proxy 与 g3fcgen"
+	;;
+icap)
+	RUN_BINS=${RUN_BINS:-g3icap}
+	BUILD_PACKAGES=${BUILD_PACKAGES:-g3icap}
+	UNITS=g3icap.service
+	NS_MEMBERS=g3icap
+	FEATURE_PKG=g3icap
+	PKG_PREFIX=g3icap-run
+	INSTALL_PREFIX=/opt/zf/icap
+	INSTALL_SCRIPT=icap-install.sh
+	UNINSTALL_SCRIPT=icap-uninstall.sh
+	PKG_SUMMARY="装 ${INSTALL_PREFIX}，起 g3icap"
+	;;
+*)
+	echo "COMPONENT=${COMPONENT} 不认，只能是 g3 或 icap" >&2
+	exit 1
+	;;
+esac
+
 case "$PORTABILITY" in
 no | portable | static) ;;
 *)
@@ -143,18 +193,22 @@ no | portable | static) ;;
 	;;
 esac
 
-# c-ares：系统库太旧或缺失时退回内置编译，跟 scripts/package 的判定保持一致。
-# 跨发行版的包不能碰构建机的 libcares.so.2，一律内置。
+# c-ares / Lua / Python / OpenSSL 只有 g3 组件用得上，icap 组件一条都不涉及（g3icap 是
+# 纯 Rust：icap-rs + tokio + tracing），所以 feature 组合整段按组件分支。
 CARGO_FEATURES=""
-if [ "$PORTABILITY" != no ]; then
-	echo "c-ares: ${PORTABILITY} 包，强制内置编译（vendored-c-ares）"
-	CARGO_FEATURES="vendored-c-ares"
-elif pkg-config --atleast-version 1.18.0 libcares 2>/dev/null; then
-	echo "c-ares: 使用系统库"
-	CARGO_FEATURES="c-ares"
-else
-	echo "c-ares: 系统库不可用，改用内置编译（vendored-c-ares）"
-	CARGO_FEATURES="vendored-c-ares"
+if [ "$COMPONENT" = g3 ]; then
+	# c-ares：系统库太旧或缺失时退回内置编译，跟 scripts/package 的判定保持一致。
+	# 跨发行版的包不能碰构建机的 libcares.so.2，一律内置。
+	if [ "$PORTABILITY" != no ]; then
+		echo "c-ares: ${PORTABILITY} 包，强制内置编译（vendored-c-ares）"
+		CARGO_FEATURES="vendored-c-ares"
+	elif pkg-config --atleast-version 1.18.0 libcares 2>/dev/null; then
+		echo "c-ares: 使用系统库"
+		CARGO_FEATURES="c-ares"
+	else
+		echo "c-ares: 系统库不可用，改用内置编译（vendored-c-ares）"
+		CARGO_FEATURES="vendored-c-ares"
+	fi
 fi
 if [ -n "$EXTRA_FEATURES" ]; then
 	CARGO_FEATURES="${CARGO_FEATURES} ${EXTRA_FEATURES}"
@@ -163,7 +217,7 @@ fi
 # 跨发行版裁剪：默认 feature（lua54 + python + c-ares + quic + rustls-ring）整个关掉，
 # 再补回 quic 与 TLS 后端，OpenSSL 交给内置编译。写全包名的那条是给 g3fcgen 的——
 # 它一样链 OpenSSL，只裁 g3proxy 会给它留下 libssl.so.3。
-if [ "$PORTABILITY" != no ]; then
+if [ "$PORTABILITY" != no ] && [ "$COMPONENT" = g3 ]; then
 	CARGO_FEATURES="${CARGO_FEATURES} quic rustls-ring vendored-openssl g3fcgen/vendored-openssl"
 	case " ${G3_BUILD_ARGS} " in
 	*" --no-default-features "*) ;;
@@ -171,6 +225,9 @@ if [ "$PORTABILITY" != no ]; then
 	esac
 	echo "==> 跨发行版裁剪（${PORTABILITY}）：关默认 feature，OpenSSL/c-ares 内置编译"
 	echo "    产物没有 Lua/Python 的用户认证模块（auth 里 type: lua / type: python 不可用）"
+elif [ "$PORTABILITY" = portable ]; then
+	echo "==> ${COMPONENT} 组件：没有 C 依赖可裁，--portable 只是让两个包的命令行保持一致"
+	echo "    目标机 glibc 比构建机老时用 --static（glibc 静态进去，这一层对 ${COMPONENT} 有效）"
 fi
 
 # static：glibc 也静态进去，产物不加载任何 .so，也就不带 glibc 符号版本要求。
@@ -194,13 +251,14 @@ if [ "$PORTABILITY" = static ]; then
 fi
 
 # feature 必须写成 包名/feature：一次 -p 多个包时，不存在的裸 feature 名会让
-# cargo 直接报错（g3proxy-ctl 根本没有 feature）。默认都归到 g3proxy 上，
-# 要改其他包的 feature 请自己写全名，例如 EXTRA_FEATURES="g3fcgen/vendored-openssl"
+# cargo 直接报错（g3proxy-ctl 根本没有 feature）。默认归到当前组件的主包上
+# （g3 组件是 g3proxy，icap 组件是 g3icap），要改其他包的 feature 请自己写全名，
+# 例如 EXTRA_FEATURES="g3fcgen/vendored-openssl"
 FEATURE_LIST=""
 for feat in $CARGO_FEATURES; do
 	case "$feat" in
 	*/*) qualified=$feat ;;
-	*) qualified="g3proxy/$feat" ;;
+	*) qualified="${FEATURE_PKG}/$feat" ;;
 	esac
 	if [ -z "$FEATURE_LIST" ]; then
 		FEATURE_LIST=$qualified
@@ -218,7 +276,7 @@ for mod in lua lua55 lua54 lua53; do
 		break
 	fi
 done
-if [ "$LUA_OK" = 0 ] && [ "$PORTABILITY" = no ]; then
+if [ "$LUA_OK" = 0 ] && [ "$PORTABILITY" = no ] && [ "$COMPONENT" = g3 ]; then
 	echo "提示：未找到 Lua 开发库，g3proxy 默认 feature 里的 lua54 可能编不过" >&2
 fi
 
@@ -236,7 +294,11 @@ esac
 for pkg in $BUILD_PACKAGES; do
 	set -- "$@" -p "$pkg"
 done
-set -- "$@" --features "$FEATURE_LIST"
+# icap 组件没有任何 feature 要开（CARGO_FEATURES 为空），空列表传给 cargo 会被当成
+# "启用一个不存在的特性"，所以只在非空时拼这个参数
+if [ -n "$FEATURE_LIST" ]; then
+	set -- "$@" --features "$FEATURE_LIST"
+fi
 if [ -n "$TARGET" ]; then
 	set -- "$@" --target "$TARGET"
 fi
@@ -252,16 +314,22 @@ echo "==> cargo $* ${G3_BUILD_ARGS:+$G3_BUILD_ARGS}"
 # shellcheck disable=SC2086
 cargo "$@" $G3_BUILD_ARGS
 
+# 包名与 VERSION 里的版本一律取 g3proxy 的号：一批交付只有一个版本号语义。组件自己的
+# crate 版本另记一行，避免"二进制报 0.1.0、包名报 1.13.0"看起来像两处对不上。
 VERSION=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' "$PROJECT_DIR/g3proxy/Cargo.toml" | head -1)
+CRATE_VERSION=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' "$PROJECT_DIR/${FEATURE_PKG}/Cargo.toml" | head -1)
 GIT_SHA=$(git -C "$PROJECT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)
 ARCH=$(uname -s | tr 'A-Z' 'a-z')-$(uname -m)
 BUILT_AT=$(date -u +%Y%m%d)
-PKG_NAME="g3-run-${VERSION}-${GIT_SHA}-${ARCH}-${BUILT_AT}"
+PKG_NAME="${PKG_PREFIX}-${VERSION}-${GIT_SHA}-${ARCH}-${BUILT_AT}"
 PKG_DIR="$DIST_DIR/$PKG_NAME"
 
-echo "==> 组装 run 包：$PKG_DIR"
+echo "==> 组装 run 包（组件 ${COMPONENT}）：$PKG_DIR"
 rm -rf "$PKG_DIR"
-mkdir -p "$PKG_DIR/bin" "$PKG_DIR/conf" "$PKG_DIR/systemd"
+mkdir -p "$PKG_DIR/bin" "$PKG_DIR/systemd"
+if [ "$COMPONENT" = g3 ]; then
+	mkdir -p "$PKG_DIR/conf"
+fi
 
 for bin in $RUN_BINS; do
 	if [ ! -f "$BIN_DIR/$bin" ]; then
@@ -272,54 +340,56 @@ for bin in $RUN_BINS; do
 	chmod 0755 "$PKG_DIR/bin/$bin"
 done
 
-cp "$PROJECT_DIR/deploy/conf/g3proxy.yaml" "$PKG_DIR/conf/g3proxy.yaml"
-cp "$PROJECT_DIR/deploy/conf/g3fcgen.yaml" "$PKG_DIR/conf/g3fcgen.yaml"
+if [ "$COMPONENT" = g3 ]; then
+	cp "$PROJECT_DIR/deploy/conf/g3proxy.yaml" "$PKG_DIR/conf/g3proxy.yaml"
+	cp "$PROJECT_DIR/deploy/conf/g3fcgen.yaml" "$PKG_DIR/conf/g3fcgen.yaml"
 
-# CA：g3fcgen 起来的前提，包里永远带一套。deploy/conf 下已有就直接用；
-# 没有则用 g3mkcert 现生成一份自签根 CA 写回 deploy/conf（下次打包复用）。
-# 只有一半视为操作者放错，直接报错——不拆散半套 CA。
-CA_DIR="$PROJECT_DIR/deploy/conf"
-if [ -e "$CA_DIR/myCA.crt" ] || [ -e "$CA_DIR/myCA.key" ]; then
-	if [ ! -e "$CA_DIR/myCA.crt" ] || [ ! -e "$CA_DIR/myCA.key" ]; then
-		echo "deploy/conf 下 myCA.crt 与 myCA.key 必须成对存在" >&2
-		exit 1
-	fi
-	echo "==> 使用 deploy/conf 下已有的 CA"
-else
-	MKCERT="$BIN_DIR/g3mkcert"
-	if [ ! -x "$MKCERT" ]; then
-		echo "==> 编译 g3mkcert（用于生成 CA）"
-		set -- build -p g3mkcert
-		case "$PROFILE" in
-		release) set -- "$@" --release ;;
-		debug) ;;
-		*) set -- "$@" --profile "$PROFILE" ;;
-		esac
-		if [ -n "$TARGET" ]; then
-			set -- "$@" --target "$TARGET"
+	# CA：g3fcgen 起来的前提，包里永远带一套。deploy/conf 下已有就直接用；
+	# 没有则用 g3mkcert 现生成一份自签根 CA 写回 deploy/conf（下次打包复用）。
+	# 只有一半视为操作者放错，直接报错——不拆散半套 CA。
+	CA_DIR="$PROJECT_DIR/deploy/conf"
+	if [ -e "$CA_DIR/myCA.crt" ] || [ -e "$CA_DIR/myCA.key" ]; then
+		if [ ! -e "$CA_DIR/myCA.crt" ] || [ ! -e "$CA_DIR/myCA.key" ]; then
+			echo "deploy/conf 下 myCA.crt 与 myCA.key 必须成对存在" >&2
+			exit 1
 		fi
-		# shellcheck disable=SC2086
-		cargo "$@" $G3_BUILD_ARGS
+		echo "==> 使用 deploy/conf 下已有的 CA"
+	else
+		MKCERT="$BIN_DIR/g3mkcert"
+		if [ ! -x "$MKCERT" ]; then
+			echo "==> 编译 g3mkcert（用于生成 CA）"
+			set -- build -p g3mkcert
+			case "$PROFILE" in
+			release) set -- "$@" --release ;;
+			debug) ;;
+			*) set -- "$@" --profile "$PROFILE" ;;
+			esac
+			if [ -n "$TARGET" ]; then
+				set -- "$@" --target "$TARGET"
+			fi
+			# shellcheck disable=SC2086
+			cargo "$@" $G3_BUILD_ARGS
+		fi
+		echo "==> deploy/conf 无 CA，自动生成自签根 CA（RSA 2048，写回 deploy/conf 供复用）"
+		if ! "$MKCERT" --root --rsa 2048 \
+			--organization "g3" --common-name "g3 MITM Root CA" \
+			--output-cert "$CA_DIR/myCA.crt" --output-key "$CA_DIR/myCA.key"; then
+			echo "CA 自动生成失败：交叉编译时 g3mkcert 可能不能在构建机运行，" >&2
+			echo "请先在同架构机器生成 myCA.crt/myCA.key 放入 deploy/conf 再打包" >&2
+			exit 1
+		fi
 	fi
-	echo "==> deploy/conf 无 CA，自动生成自签根 CA（RSA 2048，写回 deploy/conf 供复用）"
-	if ! "$MKCERT" --root --rsa 2048 \
-		--organization "g3" --common-name "g3 MITM Root CA" \
-		--output-cert "$CA_DIR/myCA.crt" --output-key "$CA_DIR/myCA.key"; then
-		echo "CA 自动生成失败：交叉编译时 g3mkcert 可能不能在构建机运行，" >&2
-		echo "请先在同架构机器生成 myCA.crt/myCA.key 放入 deploy/conf 再打包" >&2
-		exit 1
-	fi
+	cp "$CA_DIR/myCA.crt" "$PKG_DIR/conf/myCA.crt"
+	cp "$CA_DIR/myCA.key" "$PKG_DIR/conf/myCA.key"
+	chmod 0600 "$PKG_DIR/conf/myCA.key"
 fi
-cp "$CA_DIR/myCA.crt" "$PKG_DIR/conf/myCA.crt"
-cp "$CA_DIR/myCA.key" "$PKG_DIR/conf/myCA.key"
-chmod 0600 "$PKG_DIR/conf/myCA.key"
 
-# 单元模板里的 @NETNS@ 在这里就展开：进包的 g3proxy.service 是成品，install.sh 只
-# 替换 @PREFIX@/@CONTROL_DIR@/@GROUP@ 这些目标机才知道的路径。
+# 单元模板里的 @NETNS@ 在这里就展开：进包的单元是成品，install.sh 只替换
+# @PREFIX@/@CONTROL_DIR@/@GROUP@ 这些目标机才知道的路径。
 case "$NETNS" in
 no | false | off | 0 | n)
 	NETNS_LINES=""
-	NETNS_NOTE="off（NETNS=${NETNS}，g3proxy 留在 host 网络）"
+	NETNS_NOTE="off（NETNS=${NETNS}，本包的 ${NS_MEMBERS} 留在 host 网络）"
 	;;
 *)
 	# systemd 只认绝对路径，且指令行开头不能留空白（会被当成上一行的续行）
@@ -327,11 +397,11 @@ no | false | off | 0 | n)
 		echo "NETNS_PATH=${NETNS_PATH} 不是绝对路径（应为 /run/netns/<名字>），或者用 NETNS=no 关掉" >&2
 		exit 1
 	fi
-	NETNS_LINES=$(printf '# 进程搬进 vpp 侧已建好的网络命名空间；PrivateNetwork=no 是 systemd 默认值，\n# 写出来只是表明这里不做网络隔离。生效后 127.0.0.1 是该命名空间的回环，\n# g3proxy.yaml 里的 g3fcgen(2999) 与 ICAP(1344) 必须在里面可达。\nNetworkNamespacePath=%s\nPrivateNetwork=no' "$NETNS_PATH")
-	NETNS_NOTE="${NETNS_PATH}（只有 g3proxy 进入，g3fcgen 与 ICAP 留在 host）"
+	NETNS_LINES=$(printf '# 进程搬进 vpp 侧已建好的网络命名空间；PrivateNetwork=no 是 systemd 默认值，\n# 写出来只是表明这里不做网络隔离。进 ns 之后 127.0.0.1 是该命名空间的回环，\n# 所以 g3proxy、g3fcgen 与 g3icap 必须共用同一个命名空间，2999 与 1344 才连得上。\nNetworkNamespacePath=%s\nPrivateNetwork=no' "$NETNS_PATH")
+	NETNS_NOTE="${NETNS_PATH}（本包的 ${NS_MEMBERS} 进这个命名空间；两个包必须用同一个路径）"
 	;;
 esac
-echo "==> g3proxy 网络命名空间：${NETNS_NOTE}"
+echo "==> 网络命名空间：${NETNS_NOTE}"
 
 render_systemd_unit() {
 	# @NETNS@ 单独占一行：开启时展开成指令，关闭时整行删掉，不留空行
@@ -344,12 +414,20 @@ render_systemd_unit() {
 	' "$1" > "$2"
 }
 
-render_systemd_unit "$PROJECT_DIR/deploy/systemd/g3proxy.service" "$PKG_DIR/systemd/g3proxy.service"
+for unit in $UNITS; do
+	render_systemd_unit "$PROJECT_DIR/deploy/systemd/$unit" "$PKG_DIR/systemd/$unit"
+done
+
 if [ -n "$NETNS_LINES" ]; then
-	README_NETNS=$(printf 'g3proxy 跑在网络命名空间 %s 里（这两行指令在打包时展开进单元，g3fcgen 仍在 host）。\n所以 127.0.0.1 是这个命名空间自己的回环：g3proxy.yaml 里指向 127.0.0.1 的 g3fcgen(2999)\n与 ICAP(1344) 必须在 %s 里可达，否则 TLS 拦截取不到证书、审计也发不出去。\n想退回 host 网络：现场用 systemctl edit g3proxy 写一条空的 NetworkNamespacePath= 再\nrestart；或在构建机 NETNS=no 重新打包。' "$NETNS_PATH" "$NETNS_PATH")
+	if [ "$COMPONENT" = g3 ]; then
+		README_NETNS=$(printf 'g3proxy 与 g3fcgen 都跑在网络命名空间 %s 里（这两行指令在打包时展开进单元），\n所以 127.0.0.1 是这个命名空间自己的回环：g3proxy.yaml 里指向 127.0.0.1 的 g3fcgen(2999)\n与 ICAP(1344) 都落在 %s 里面。ICAP 服务端请用 g3icap 包装进同一个命名空间：\n  deploy/build_run_package.sh --component=icap --netns=%s\n两个包命名空间不一致的话，安装脚本会在写系统目录之前就把安装拦住。\n想退回 host 网络：现场用 systemctl edit 写一条空的 NetworkNamespacePath= 再 restart；\n或在构建机 NETNS=no 重新打包两个包。' "$NETNS_PATH" "$NETNS_PATH" "$NETNS_PATH")
+	else
+		README_NETNS=$(printf 'g3icap 跑在网络命名空间 %s 里（这两行指令在打包时展开进单元）。它必须和 g3proxy、\ng3fcgen 用同一个命名空间——安装脚本会拿已装好的 g3 单元比对 NetworkNamespacePath，\n不一致就直接失败：g3proxy 只会连自己那个命名空间里的 127.0.0.1:1344，装在别的 ns\n等于审计请求打到空回环上，还很难查。\n打包时用和 g3 包一样的 --netns=%s。' "$NETNS_PATH" "$NETNS_PATH")
+	fi
 else
-	README_NETNS='本次打包未启用网络命名空间（NETNS=no），g3proxy 与 g3fcgen 都在 host 网络里。
-要进 ns 的话在构建机用默认值 NETNS=yes（可配 NETNS_PATH=/run/netns/<名字>）重新打包。'
+	README_NETNS='本次打包未启用网络命名空间（NETNS=no），本包的服务（'${NS_MEMBERS}'）都在 host 网络里。
+要进 ns 的话在构建机用默认值 NETNS=yes（可配 NETNS_PATH=/run/netns/<名字>）重新打包，
+两个包都用同一个路径。'
 fi
 
 # 包是什么来路，写进 README 与 VERSION：装到目标机的人只看得到这两份
@@ -379,13 +457,39 @@ RHEL8 那一档）。没有 Lua/Python 的用户认证模块（auth 里 type: lu
 	;;
 esac
 
-cp "$PROJECT_DIR/deploy/systemd/g3fcgen.service" "$PKG_DIR/systemd/"
-cp "$PROJECT_DIR/deploy/install.sh" "$PKG_DIR/install.sh"
-cp "$PROJECT_DIR/deploy/uninstall.sh" "$PKG_DIR/uninstall.sh"
+if [ "$COMPONENT" = icap ]; then
+	# 上面那段是照 g3proxy 的依赖写的：Lua/Python 认证模块、内置 OpenSSL 与 c-ares，
+	# g3icap 一样都没有（纯 Rust：icap-rs + tokio + tracing）。说明按它自己的来路写，
+	# 别让装包的人以为这个包也裁过东西。
+	DEFAULTS_STATE="n/a (无 C 依赖)"
+	case "$PORTABILITY" in
+	no)
+		FEATURE_NOTE="无额外 cargo feature：g3icap 只依赖纯 Rust 的库。"
+		README_PORTABILITY='这个包按构建机的 glibc 动态链接。目标机 glibc 比构建机老（Kylin V10、RHEL8 那一档，
+装完报 GLIBC_x.y not found）就在构建机加 --static 重打。'
+		;;
+	portable)
+		FEATURE_NOTE="无额外 cargo feature：--portable 对 g3icap 不追加任何东西。"
+		README_PORTABILITY='--portable 对 g3icap 没有额外作用：它没有 Lua/Python 要裁，也没有 OpenSSL/c-ares 要内置，
+本来就不依赖构建机的第三方 .so。目标机 glibc 更老时用 --static。'
+		;;
+	static)
+		FEATURE_NOTE="无额外 cargo feature，glibc 静态链接。"
+		README_PORTABILITY='这个包是 --static 包：g3icap 不加载任何 .so（ldd 显示 statically linked），对目标机的
+glibc 版本没有要求，可以装在与构建机不同发行版、glibc 更老的机器上（Kylin V10、RHEL8 那一档）。
+静态 glibc 用不了 NSS 那套域名解析；本服务只在本机回环上监听与应答，不做外发解析，不受影响。'
+		;;
+	esac
+fi
+# 包内一律叫 install.sh / uninstall.sh：.run 自解压头只调这两个名字，目标机上
+# ${INSTALL_PREFIX}/uninstall.sh 的路径约定也保持不变
+cp "$PROJECT_DIR/deploy/$INSTALL_SCRIPT" "$PKG_DIR/install.sh"
+cp "$PROJECT_DIR/deploy/$UNINSTALL_SCRIPT" "$PKG_DIR/uninstall.sh"
 chmod 0755 "$PKG_DIR/install.sh" "$PKG_DIR/uninstall.sh"
 
 # 目标机上唯一能看到的说明，装完会一起落到 ${PREFIX}/README.md
-cat > "$PKG_DIR/README.md" << EOF
+if [ "$COMPONENT" = g3 ]; then
+	cat > "$PKG_DIR/README.md" << EOF
 # g3 run 包 ${PKG_NAME}
 
 g3proxy 版本 ${VERSION}，git ${GIT_SHA}，构建于 $(uname -s) $(uname -m)（profile: ${PROFILE}）。
@@ -430,34 +534,100 @@ ${README_NETNS}
 配置不合法时进程以 255 退出，systemd 不会反复重启它（RestartPreventExitStatus=255），
 journal 里会留完整报错。
 EOF
+else
+	cat > "$PKG_DIR/README.md" << EOF
+# g3icap run 包 ${PKG_NAME}
+
+g3icap（ICAP 回显服务）版本 ${CRATE_VERSION}，属 g3proxy ${VERSION} 这批交付，git ${GIT_SHA}，
+构建于 $(uname -s) $(uname -m)（profile: ${PROFILE}）。${FEATURE_NOTE}详见 VERSION 文件。
+
+${README_PORTABILITY}
+
+## 这是什么
+
+审计链路末端的 ICAP 服务端：g3proxy 的 auditor 把上行请求送到
+icap://127.0.0.1:1344/echo（HTTP）或 /icap_audit（FTP），本服务把收到的 ICAP 报文逐段打印
+进 journald，再回 204 放行。用来验证送审判定与协议标签是否正确、旁路链路通不通，真实审计
+引擎还没就位时也可以先把端口占住。它不修改报文，也不做内容检测。
+
+## 部署
+
+把 ${PKG_NAME}.run 拷到目标机，一条命令装完：
+
+    sudo ./${PKG_NAME}.run
+
+程序落在 /opt/zf/icap（bin + systemd 单元 + 本说明），注册为 g3icap.service 并立即启动。
+这个包不写配置目录、不需要 CA；监听地址与注册的服务名写在单元里（默认
+127.0.0.1:1344，注册 echo、reqmod、respmod、icap_audit 四个）。要改就
+\`systemctl edit g3icap\` 覆盖 ExecStart=，再 daemon-reload + restart。
+
+## 网络命名空间
+
+${README_NETNS}
+
+## 日常操作
+
+    systemctl status g3icap
+    journalctl -u g3icap -f            # ICAP 报文的逐段打印都在这里
+    sudo /opt/zf/icap/uninstall.sh     # 停服务、摘单元、删除 /opt/zf/icap（不碰 g3 的单元与目录）
+
+## 校验与排查
+
+    /opt/zf/icap/bin/g3icap --version
+    /opt/zf/icap/bin/g3icap --listen 127.0.0.1:1345   # 手工起一份，别抢服务的端口
+
+g3proxy 侧确认送审有没有到达：journalctl -u g3icap 里应该出现 "ICAP REQMOD /echo" 一段，
+含 ICAP 头（X-Transformed-From / X-Http-Version / X-Body-Framing）与封装的 HTTP 报文。
+一条都没有就先比对三个服务的命名空间：
+
+    systemctl show -p NetworkNamespacePath g3proxy g3fcgen g3icap   # 三行应当一致
+EOF
+fi
+
+if [ "$COMPONENT" = g3 ]; then
+	VERSION_CA='ca bundled: yes (from deploy/conf, auto-generated at build if absent)'
+else
+	VERSION_CA='ca bundled: no (g3icap 只回显 ICAP 报文，不签发证书)'
+fi
 
 cat > "$PKG_DIR/VERSION" << EOF
 package: ${PKG_NAME}
+component: ${COMPONENT} (crate ${FEATURE_PKG} ${CRATE_VERSION})
+install prefix: ${INSTALL_PREFIX}
 g3proxy version: ${VERSION}
 git commit: ${GIT_SHA}
 build host: $(uname -s) $(uname -m)
 build profile: ${PROFILE}
 cargo target: ${TARGET:-default}
 built at (UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)
-cargo features: ${CARGO_FEATURES}
+cargo features: ${CARGO_FEATURES:-none}
 default features: ${DEFAULTS_STATE}
 rustflags (build env): ${RUSTFLAGS:-none}
 portability: ${PORTABILITY}
-ca bundled: yes (from deploy/conf, auto-generated at build if absent)
-network namespace (g3proxy only): ${NETNS_NOTE}
+${VERSION_CA}
+network namespace: ${NETNS_NOTE}
 EOF
 
-# 打包前自检：用包里这份二进制去加载包里这份配置。
+# 打包前自检：拿包里这份二进制在构建机上真跑一次，把"缺 .so / glibc 版本对不上"这类
+# 装载期问题挡在构建机。g3 组件是加载包里的配置，icap 组件没有配置文件，跑 --version。
 # 真交叉编译（TARGET 与构建机三元组不同）时跳过——产物在构建机上跑不起来；
 # --static 补出来的 TARGET 就是构建机自己的三元组，自检照跑。
 if [ -z "$TARGET" ] || [ "$TARGET" = "${HOST_TARGET:-}" ]; then
-	echo "==> 自检：g3proxy -t -c conf/g3proxy.yaml"
-	if ! "$PKG_DIR/bin/g3proxy" -t -c "$PKG_DIR/conf/g3proxy.yaml"; then
-		echo "包内配置自检失败，已保留 $PKG_DIR 供排查" >&2
-		exit 1
+	if [ "$COMPONENT" = g3 ]; then
+		echo "==> 自检：g3proxy -t -c conf/g3proxy.yaml"
+		if ! "$PKG_DIR/bin/g3proxy" -t -c "$PKG_DIR/conf/g3proxy.yaml"; then
+			echo "包内配置自检失败，已保留 $PKG_DIR 供排查" >&2
+			exit 1
+		fi
+	else
+		echo "==> 自检：g3icap --version"
+		if ! "$PKG_DIR/bin/g3icap" --version; then
+			echo "包内自检失败（连 --version 都跑不起来，多半是链接问题），已保留 $PKG_DIR 供排查" >&2
+			exit 1
+		fi
 	fi
 else
-	echo "==> 跳过配置自检（TARGET=${TARGET} 不是构建机三元组 ${HOST_TARGET:-未知}，产物跑不起来）"
+	echo "==> 跳过包内自检（TARGET=${TARGET} 不是构建机三元组 ${HOST_TARGET:-未知}，产物跑不起来）"
 fi
 
 # --static 的核心承诺就是"不加载任何 .so"，检不掉就等于这个包白打，直接在构建机上拦掉
@@ -492,9 +662,8 @@ RUN_HEADER=$(mktemp)
 cat > "$RUN_HEADER" << 'EOF'
 #!/bin/sh
 #
-# g3 run 包自解压安装器：把尾部的程序+配置+单元解到临时目录（用完即删），
-# 执行包内固定安装流程。不带任何命令行参数——装 /opt/zf/g3、起 g3proxy 与
-# g3fcgen；卸载用 sudo /opt/zf/g3/uninstall.sh。
+# run 包自解压安装器：把尾部的程序+配置+单元解到临时目录（用完即删），执行包内固定
+# 安装流程。不带任何命令行参数——@PKG_SUMMARY@；卸载用 sudo @INSTALL_PREFIX@/uninstall.sh。
 
 set -eu
 
@@ -502,7 +671,7 @@ PKG_NAME="@PKG_NAME@"
 PAYLOAD_LINE=@PAYLOAD_LINE@
 
 if [ "$#" -gt 0 ]; then
-	echo "这个 .run 不接受参数：sudo \"$0\" 即按默认方式安装（/opt/zf/g3，g3proxy+g3fcgen）" >&2
+	echo "这个 .run 不接受参数：sudo \"$0\" 即按默认方式安装（@PKG_SUMMARY@）" >&2
 	exit 1
 fi
 
@@ -511,7 +680,7 @@ if ! command -v tar >/dev/null 2>&1; then
 	exit 1
 fi
 
-TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/g3-run.XXXXXX")
+TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/g3pkg.XXXXXX")
 trap 'rm -rf "$TMP_DIR"' EXIT INT TERM
 
 tail -n +"$PAYLOAD_LINE" "$0" | tar xzf - -C "$TMP_DIR"
@@ -522,7 +691,9 @@ EOF
 
 # 替换占位符只动行内容不动行数，所以 payload 起始行号可以在写死进头部之前一次算定
 PAYLOAD_START=$(awk 'END { print NR + 1 }' "$RUN_HEADER")
-sed -e "s/@PKG_NAME@/${PKG_NAME}/" -e "s/@PAYLOAD_LINE@/${PAYLOAD_START}/" \
+# 用 # 当分隔符：PKG_SUMMARY 与 INSTALL_PREFIX 里都带 /
+sed -e "s#@PKG_NAME@#${PKG_NAME}#" -e "s#@PKG_SUMMARY@#${PKG_SUMMARY}#" \
+	-e "s#@INSTALL_PREFIX@#${INSTALL_PREFIX}#" -e "s#@PAYLOAD_LINE@#${PAYLOAD_START}#" \
 	"$RUN_HEADER" > "$DIST_DIR/$PKG_NAME.run"
 rm -f "$RUN_HEADER"
 # 校验必须在追加载荷之前做：sh -n 会把整个文件当脚本解析，尾部 tar 数据必然报错

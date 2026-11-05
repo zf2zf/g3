@@ -5,10 +5,16 @@ run 包是把 g3 一次编译、一次安装交付到目标机的形态：一个
 不用挑参数——装完程序与配置统一落在 `/opt/zf/g3`，g3proxy 与 g3fcgen 两个服务由 systemd
 托管并立即启动。
 
+同一套脚本还打**第二个包**：ICAP 审计服务端 `g3icap`（`--component=icap`，装到
+`/opt/zf/icap`）。分两个包是因为它不是 g3proxy 的必需品（现场多半接自己的 ICAP 设备），
+但**装了三者就必须同一个网络命名空间**（见第 1 节"网络命名空间"）。
+
 - 打包脚本：`deploy/build_run_package.sh`
-- 安装脚本：`deploy/install.sh`（进包，由 `.run` 解压后调用，不单独使用）
-- 卸载脚本：`deploy/uninstall.sh`（进包，安装时落到 `/opt/zf/g3/uninstall.sh`）
-- 单元模板：`deploy/systemd/g3proxy.service`、`deploy/systemd/g3fcgen.service`
+- 安装脚本：`deploy/install.sh`（g3 包）、`deploy/icap-install.sh`（icap 包）。进包后都叫
+  `install.sh`，由 `.run` 解压后调用，不单独使用
+- 卸载脚本：`deploy/uninstall.sh`、`deploy/icap-uninstall.sh`（进包后都叫 `uninstall.sh`，
+  安装时复制到各自前缀下）
+- 单元模板：`deploy/systemd/g3proxy.service`、`g3fcgen.service`、`g3icap.service`
 - 配置来源：`deploy/conf/`——入口配置全部内联在 `g3proxy.yaml` 一个文件里，
   没有 `server.d`、`auditor.d` 子目录
 
@@ -16,24 +22,32 @@ g3fcgen 是必须的服务：auditor 配置里的 `tls_cert_generator` 会在运
 `127.0.0.1:2999` 向它按 SNI 取中间人证书。它没有 CA 材料就起不来，所以 CA 是安装的
 前置条件（见第 1、3 节）。
 
+`g3icap` 是审计链路的末端：auditor 配置里的 `icap_reqmod_service` 指向
+`icap://127.0.0.1:1344/echo`。它由 `lib/g3-icap-client` 的 example 提升为独立 crate
+（`g3icap/`），只做回显 + 逐段打印送审报文，用来在没接真实 ICAP 设备时把链路打通、
+看清明面上到底送了什么。接真实 ICAP 服务（c-icap、检测网关等）时不必装这个包。
+
 ## 1. 编译 run 包
 
 ```sh
 deploy/build_run_package.sh                                    # 默认 release，g3proxy 进 ns-vpp
 deploy/build_run_package.sh --profile=debug                     # 排障用的调试包
 deploy/build_run_package.sh --bins="g3proxy g3proxy-ctl"        # 精简程序集
-deploy/build_run_package.sh --netns=no                          # g3proxy 不进网络命名空间
+deploy/build_run_package.sh --netns=no                          # 三个服务都不进网络命名空间
 deploy/build_run_package.sh --netns=/run/netns/ns-other         # 指定命名空间
 deploy/build_run_package.sh --portable                          # 跨发行版：去 Lua/Python，内置 OpenSSL/c-ares
 deploy/build_run_package.sh --static                            # 在 --portable 之上把 glibc 也静态进去
+deploy/build_run_package.sh --component=icap                    # 打 ICAP 服务端那个包
+deploy/build_run_package.sh --component=icap --static --netns=/run/netns/ns-vpp   # 老 glibc 目标机
 ```
 
 产物在 `dist/`：
 
-- `g3-run-<版本>-<git短sha>-<os>-<arch>-<日期>.run` —— 交付用的自解压安装器；
+- `g3-run-<版本>-<git短sha>-<os>-<arch>-<日期>.run` / `g3icap-run-<...>.run`
+  —— 交付用的自解压安装器；
 - 同名 `.tar.gz` 与目录 —— 内容相同，留作不便执行 `.run` 时的手动解包通道。
 
-包里永远有 CA，构建时按这个顺序确定：
+g3 包里永远有 CA，构建时按这个顺序确定：
 
 1. `deploy/conf/` 下有成套的 `myCA.crt`/`myCA.key` → 直接打进包（正式 CA 就放这里）；
 2. 没有 → 构建脚本自动用 `g3mkcert` 生成一份自签根 CA（RSA 2048）写回 `deploy/conf/`，
@@ -42,6 +56,11 @@ deploy/build_run_package.sh --static                            # 在 --portable
 
 `deploy/conf/myCA.*` 已在 `.gitignore` 里：CA 私钥只进包、不入库。自动生成的 CA 适合
 测试；正式环境发布前把自己/机构的 CA 放进 `deploy/conf/` 替换掉再打包。
+
+**下面这一整段"库依赖 / glibc 地板"只针对 g3 包。** `g3icap` 的依赖树是纯 Rust
+（`icap-rs` + tokio + tracing），不链 OpenSSL/c-ares/Lua/Python，缺 `.so` 那一层根本不会
+出现；`--portable` 对它是空操作（接受这个参数只为两条命令行长得一样）。老 glibc 的
+目标机（Kylin V10、RHEL8 那一档）要打 `--component=icap --static`，见"feature 裁剪"。
 
 **默认构建的包只能装在与构建机同 OS、同架构的机器上。** 二进制按构建机的动态库链接
 （OpenSSL、c-ares、Lua、Python），换台机器就可能起不来。症状是安装脚本走到"校验配置"就断：
@@ -78,14 +97,15 @@ ldd dist/g3-run-*/bin/g3proxy | grep 'not found'   # 应该没有输出
 
 | 参数 | 环境变量 | 默认值 | 作用 |
 |------|----------|--------|------|
-| `--bins=` | `RUN_BINS`+`BUILD_PACKAGES` | `g3proxy g3proxy-ctl g3fcgen` | 编译并拷进包 `bin/` 的可执行程序 |
+| `--component=g3` / `--component=icap` | `COMPONENT` | `g3` | 打哪个包：g3proxy+g3fcgen，还是 ICAP 服务端 |
+| `--bins=` | `RUN_BINS`+`BUILD_PACKAGES` | g3 包 `g3proxy g3proxy-ctl g3fcgen`；icap 包 `g3icap` | 编译并拷进包 `bin/` 的可执行程序 |
 | `--packages=` | `BUILD_PACKAGES` | 同上 | 只改编译范围、不改 `bin/` 拷贝 |
 | `--profile=` | `PROFILE` | `release` | cargo profile；`debug` 走 cargo 的 dev profile |
 | `--target=` | `TARGET` | 空 | cargo `--target`，与构建机三元组不同时跳过自检 |
-| `--features=` | `EXTRA_FEATURES` | 空 | 追加 cargo feature |
-| `--portable` | `PORTABILITY=portable` | 关 | 跨发行版裁剪：去 Lua/Python，OpenSSL 与 c-ares 内置编译 |
+| `--features=` | `EXTRA_FEATURES` | 空 | 追加 cargo feature（写成 `包名/feature`） |
+| `--portable` | `PORTABILITY=portable` | 关 | 跨发行版裁剪：去 Lua/Python，OpenSSL 与 c-ares 内置编译（对 icap 包是空操作） |
 | `--static` | `PORTABILITY=static` | 关 | 在 `--portable` 之上把 glibc 也静态进去 |
-| `--netns=no` / `--netns=<绝对路径>` | `NETNS`/`NETNS_PATH` | `yes`、`/run/netns/ns-vpp` | g3proxy 单元是否写 `NetworkNamespacePath=` 及路径 |
+| `--netns=no` / `--netns=<绝对路径>` | `NETNS`/`NETNS_PATH` | `yes`、`/run/netns/ns-vpp` | 本包的服务单元是否写 `NetworkNamespacePath=` 及路径；两个包必须给同一个路径 |
 | `--build-args=` | `G3_BUILD_ARGS` | 空 | 原样附加给 cargo 的参数（逃生口） |
 | `--dist-dir=` | `DIST_DIR` | `<仓库>/dist` | 产物目录 |
 
@@ -152,6 +172,20 @@ ldd bin/g3proxy bin/g3fcgen bin/g3proxy-ctl                    # 都该是 stati
 objdump -T bin/g3proxy | grep -c 'GLIBC_'                      # 该是 0
 ```
 
+ICAP 包同样吃这一档，而且它才是老目标机上更常用的一档——`g3icap` 没有 C 依赖，需要静态的
+只有 glibc 本身：
+
+```sh
+deploy/build_run_package.sh --component=icap --static --netns=/run/netns/ns-vpp
+```
+
+```
+==> 自检：g3icap --version
+g3icap 0.1.0
+==> 自检：静态链接
+  g3icap: statically linked，无 GLIBC 版本要求
+```
+
 静态 glibc 的常规代价是 `getaddrinfo` 走不了 NSS（要 dlopen `libnss_*.so`）。这里碰不到：g3proxy
 的域名解析只走 `g3-resolver` 的 `c_ares` / `hickory` 两个驱动（自己发 UDP 查询），
 `g3proxy/src`、`lib/g3-types`、`lib/g3-daemon` 里没有一处 `getaddrinfo`/`ToSocketAddrs`。实测在
@@ -166,39 +200,65 @@ objdump -T bin/g3proxy | grep -c 'GLIBC_'                      # 该是 0
 ==> 自检：g3proxy -t -c conf/g3proxy.yaml
 ```
 
+icap 包没有配置可加载，这一轮换成 `g3icap --version`（同样能确认产物在构建机上跑得起来）。
+
 `--static` 在这之后再加一轮静态链接断言（`ldd` 必须是 `statically linked`，`objdump -T` 里
 不能有任何 `GLIBC_` 符号版本要求），见上一节。
 
 只有真正交叉编译（`--target` 是别的三元组）才会打印跳过信息、跳过配置自检。
 这两步失败都不会出 `.run`，包目录留在 `--dist-dir`（默认 `dist/`）里供排查。
 
-### 网络命名空间（NETNS）
+### 网络命名空间（NETNS）：三个服务必须在一个里
 
-`deploy/systemd/g3proxy.service` 模板里有一行 `@NETNS@` 占位符，**打包时**就展开：
+`deploy/systemd/` 下三个单元模板（`g3proxy.service`、`g3fcgen.service`、`g3icap.service`）
+在第 9 行都有一行 `@NETNS@` 占位符，**打包时**展开：
 
 - 默认（或显式 `--netns=yes` / `--netns=<绝对路径>`）→ 展开成 `NetworkNamespacePath=<路径>`
   （默认 `/run/netns/ns-vpp`）与 `PrivateNetwork=no`；
 - `--netns=no` → 这一整行删掉，单元里没有任何命名空间指令。
 
 `--netns=no` 是给非 VPP 宿主机的：默认包在单元里写死了 `/run/netns/ns-vpp`，目标机没有这个
-命名空间时，安装会在装完单元之后被 `install.sh` 的存在性检查拦住。
+命名空间时安装会失败（在写任何系统目录**之前**就拦下，不留半装状态）。
 
-所以进包的 `systemd/g3proxy.service` 在这一项上已经是成品，`install.sh` 只负责
-`@PREFIX@`/`@CONTROL_DIR@`/`@GROUP@` 这些目标机才知道的路径。`PrivateNetwork=no` 是
-systemd 的默认值，写出来是为了表明意图：只是把进程搬进一个**已存在**的命名空间，
-不是做网络隔离。命名空间由 vpp 侧（或 `ip netns add`）先建好，systemd 只负责进去。
+所以进包的单元在这一项上已经是成品，`install.sh` 只负责 `@PREFIX@`/`@CONTROL_DIR@`/`@GROUP@`
+这些目标机才知道的路径。`PrivateNetwork=no` 是 systemd 的默认值，写出来是为了表明意图：
+只是把进程搬进一个**已存在**的命名空间，不是做网络隔离。命名空间由 vpp 侧（或
+`ip netns add`）先建好，systemd 只负责进去。
 
-生效以后 g3proxy 看到的是 ns-vpp 的网络栈，**`127.0.0.1` 变成该命名空间的回环**，而
-g3proxy 的两个回环依赖都不进 ns：
+**为什么 g3fcgen 与 g3icap 也要进去。** g3proxy 进 ns 之后，它眼里的 `127.0.0.1` 就是那个
+命名空间的回环，而它两个依赖全写在回环上：
 
 - `tls_cert_generator` 连 g3fcgen 的 `127.0.0.1:2999`（TLS 拦截取中间人证书）；
 - `icap_reqmod_service` 的 `icap://127.0.0.1:1344/echo`（旁路审计）。
 
-也就是说：这两条地址必须在 ns-vpp 里取到东西（vpp 侧自己有一套 g3fcgen/ICAP，或者用
-`query_peer_addr` 等配置指向能跨命名空间到达的地址），否则 TLS 拦截会在握手时失败、
-审计请求发不出去。`install.sh` 只检查命名空间存不存在，检查不了里面的服务通不通。
+这两个服务留在 host 时，两条地址在 ns-vpp 里都是空的：TLS 拦截在握手时失败，审计请求静默
+丢掉——服务全都 `active (running)`，日志里却什么送审都没有，比装不上难查得多。所以约定是
+**g3proxy、g3fcgen、g3icap 三个服务共用一个命名空间**，两个包打包时 `--netns` 给同一个路径。
+不想动配置的话就都得进去；要让 g3proxy 跨命名空间取东西，改的是配置（`tls_cert_generator`
+的 `query_peer_addr`、`icap_reqmod_service` 的地址），不是单元。
+
+安装脚本按这个约定拦三种错，两个包的脚本对称：
+
+1. **本包自己**：g3 包装前比对包内 `g3proxy.service` 与 `g3fcgen.service` 的
+   `NetworkNamespacePath=`，不相等说明这个包是手工改过的，直接失败；
+2. **跨包**：读目标机上已装的兄弟单元（g3 包看 `g3icap.service`，icap 包看
+   `g3proxy.service`/`g3fcgen.service`），路径不一致就失败并给出三条出路（用同一个
+   `--netns` 重打 / `systemctl edit` 现场改 / 两边都退回 host）。目标机上还没装对端时
+   只提示一句，不拦——两个包谁先装都行；
+3. **存在性**：单元里的命名空间路径在目标机不存在就失败（systemd 不会代你建）。
+
+装完之后，如果确实进了命名空间，脚本再用 `nsenter --net=<路径>` 探一次回环
+（`exec 3<>/dev/tcp/127.0.0.1/2999` 与 `:1344`），把可达/不可达逐条打印出来。这一步
+**只提示、不作为安装失败条件**：另一个包可能还没装，目标机也可能没 `nsenter`。现场
+核对三个服务在不在同一个命名空间，一条命令就够：
+
+```sh
+systemctl show -p NetworkNamespacePath g3proxy g3fcgen g3icap    # 三行应当一致
+```
 
 ## 2. 包内结构
+
+g3 包（`--component=g3`，默认）：
 
 ```
 g3-run-<...>/
@@ -206,12 +266,29 @@ g3-run-<...>/
 ├── conf/g3proxy.yaml        # 入口配置：server、auditor 全部内联
 ├── conf/g3fcgen.yaml        # MITM 证书签发服务的配置
 ├── conf/myCA.crt  myCA.key  # 必带：deploy/conf 里的成套 CA，没有则构建时自动生成
-├── systemd/g3proxy.service  systemd/g3fcgen.service   # g3proxy.service 已展开 NETNS，余下占位符待安装时替换
-├── install.sh               # 由 .run 调用
+├── systemd/g3proxy.service  systemd/g3fcgen.service
+├── install.sh               # 由 .run 调用，装 /opt/zf/g3
 ├── uninstall.sh             # 安装时复制到 /opt/zf/g3/uninstall.sh
 ├── README.md                # 目标机上的操作说明
 └── VERSION                  # 版本、git sha、构建机、profile、feature、是否带 CA、NETNS 取值
 ```
+
+ICAP 包（`--component=icap`）：
+
+```
+g3icap-run-<...>/
+├── bin/g3icap
+├── systemd/g3icap.service
+├── install.sh               # 装 /opt/zf/icap；包里那份叫 icap-install.sh，进包统一改名
+├── uninstall.sh             # 安装时复制到 /opt/zf/icap/uninstall.sh
+├── README.md
+└── VERSION
+```
+
+没有 `conf/`：`g3icap` 的参数（监听地址、注册的服务名、打印正文的上限）全在命令行为主，
+单元里写死 `--listen 127.0.0.1:1344`，要改就 `systemctl edit g3icap`。两个包的单元里
+`@NETNS@` 都已在打包时展开，其余占位符待安装时替换；`VERSION` 里额外记了
+`component:` 与所用 crate 的版本（`g3icap` 自己的 0.1.0 与 g3proxy 的包版本是两个数）。
 
 `.run` 就是在这个结构上做的自解压：一个几十行的 POSIX sh 头部脚本 + 尾部 tar.gz 负载。
 运行时 `tail -n +<行号>` 取出负载解进 `mktemp` 临时目录（0700，退出即删——里面可能有
@@ -225,24 +302,34 @@ CA 私钥），然后执行包内 `install.sh`。
 sudo ./g3-run-<...>.run
 ```
 
-没有任何参数（给了参数会直接拒绝并说明卸载方式）。要求 root 和 `systemctl`，非 systemd
-的机器不支持。做的事：
+没有任何参数（给了参数会直接拒绝并说明本包装法与卸载方式）。要求 root 和 `systemctl`，
+非 systemd 的机器不支持。g3 包做的事：
 
 1. 检查包结构、root、systemd，再兜底检查 CA：正常构建的包必带 CA（见第 1 节），只有包被
    手工改动时才可能缺失——那时在写任何系统目录**之前**中止；
-2. `bin/*` 装到 `/opt/zf/g3/bin`（0755），`README.md`/`VERSION` 落到 `/opt/zf/g3/`；
-3. 配置装到 `/opt/zf/g3/conf`（`g3proxy.yaml`、`g3fcgen.yaml`、随包的 CA）。**首次安装**
-   （目标机上还没有 `g3proxy.yaml`）会问一行"g3proxy 监听端口 [10087]："：直接回车或输入
+2. **命名空间契约检查**（也在写任何系统目录之前）：包内 `g3proxy.service` 与
+   `g3fcgen.service` 的 `NetworkNamespacePath=` 必须相等；目标机上已装的 `g3icap.service`
+   必须是同一个路径；这个路径在目标机必须已经存在。三种情况任一不满足就失败退出，并给出
+   三条出路（按同一个路径重打包 / `systemctl edit` 现场改 / 全都退回 host）。理由见第 1 节：
+   装在两个命名空间里表面正常，审计与取证书静默丢掉，比装不上难查得多；
+3. `bin/*` 装到 `/opt/zf/g3/bin`（0755），`README.md`/`VERSION` 落到 `/opt/zf/g3/`；
+4. 配置装到 `/opt/zf/g3/conf`（`g3proxy.yaml`、`g3fcgen.yaml`、随包的 CA）。**首次安装**
+   （目标机上还没有 `g3proxy.yaml`）会问一行"g3proxy 监听端口 [3128]："：直接回车或输入
    空行用默认，填别的数字则写进刚装好的 `g3proxy.yaml`，非法输入会重问；非交互执行
    （stdin 到 EOF）自动落默认值。已有配置时不询问，端口以现网文件为准，改端口直接编辑
    `/opt/zf/g3/conf/g3proxy.yaml` 再重启；
-4. 用 `/opt/zf/g3/bin/g3proxy -t -c /opt/zf/g3/conf/g3proxy.yaml` 校验配置，**失败就不装单元、不启服务**；
-5. `sed` 渲染单元里的 `@PREFIX@`/`@CONTROL_DIR@`/`@GROUP@`（`@NETNS@` 已在打包时展开掉了），写到 `/etc/systemd/system/`，`daemon-reload`；
-6. 把 `uninstall.sh` 复制到 `/opt/zf/g3/uninstall.sh`；
-7. 单元里写了 `NetworkNamespacePath=` 时，检查该路径在目标机存在——命名空间不存在就直接
-   失败并给出三条出路（建命名空间 / `systemctl edit` 现场置空 / `--netns=no` 重打包），
-   不留一个起不来的 g3proxy 让操作者去翻 journal；
-8. `systemctl enable --now g3fcgen`（失败即整体失败退出），再 `enable --now g3proxy`。
+5. 用 `/opt/zf/g3/bin/g3proxy -t -c /opt/zf/g3/conf/g3proxy.yaml` 校验配置，**失败就不装单元、不启服务**；
+6. `sed` 渲染单元里的 `@PREFIX@`/`@CONTROL_DIR@`/`@GROUP@`（`@NETNS@` 已在打包时展开掉了），写到 `/etc/systemd/system/`，`daemon-reload`；
+7. 把 `uninstall.sh` 复制到 `/opt/zf/g3/uninstall.sh`；
+8. `systemctl enable --now g3fcgen`（失败即整体失败退出），再 `enable --now g3proxy`；
+9. 进了命名空间时，`nsenter` 探一次 ns 内的 `127.0.0.1:2999` 与 `:1344` 并打印结果（只提示，
+   不影响退出码）；目标机上没有 `g3icap.service` 时提醒一句 ICAP 在另一个包里。
+
+ICAP 包（`sudo ./g3icap-run-<...>.run`）是同一套流程的裁剪版：先做对称的命名空间检查
+（与目标机上已装的 `g3proxy`/`g3fcgen` 比对，对端还没装只提示不拦），然后装
+`bin/g3icap` 到 `/opt/zf/icap`、渲染 `g3icap.service`、复制 `uninstall.sh`、
+`systemctl enable --now g3icap`（失败即退出，提示去看 `journalctl -u g3icap`）。它没有
+配置目录，也没有 CA。两个包谁先装都行，后装的那一个负责把不一致拦下来。
 
 **配置文件绝不覆盖。** 目标机上已有的配置（含 CA）一律保持原样：内容相同打一行
 "配置未变化"，内容不同把新内容写成同名的 `*.new`，由操作者自己比对合并。这是升级时
@@ -268,11 +355,26 @@ RestartPreventExitStatus=255            # 配置不合法时进程以 255 退出
 `g3proxy-ctl` 找不到套接字。配置里 `log: stdout`，日志进 journald。
 
 `g3fcgen.service` 用 `ExecStop=/bin/kill -INT $MAINPID` 停止，同样带
-`RestartPreventExitStatus=255`。
+`RestartPreventExitStatus=255`，第 9 行也是 `@NETNS@`——它跟 g3proxy 进同一个命名空间，
+`127.0.0.1:2999` 才在 g3proxy 那一侧可达。
+
+`g3icap.service`（另一个包）形状与 g3fcgen 一致：`Type=exec`、第 9 行同一个 `@NETNS@`、
+`ExecStop=/bin/kill -INT $MAINPID`，启动命令是
+
+```
+ExecStart=@PREFIX@/bin/g3icap --listen 127.0.0.1:1344
+```
+
+`--listen` 写在单元里而不是配置文件里，要换地址/端口就 `systemctl edit g3icap` 覆盖这一行；
+`--service`（注册给 OPTIONS 的服务名，默认 `echo,reqmod,respmod,icap_audit`）与
+`--max-body-print`（送审正文打印上限，默认 512 字节）同样可以在这里改。随包配置里
+`icap_reqmod_service` 走 `/echo`；仓库里 FTP 审计器的示例 `etc/g3proxy/ftp/auditor.d/ftp_auditor.yaml`
+走 `/icap_audit`，两个名字都在默认注册列表里，改配置时对齐一下即可。
 
 `NetworkNamespacePath=` 需要 systemd ≥ 246；命名空间必须已经存在（`ip netns list` 能看见），
-systemd 不会代你创建。g3fcgen 单元不带这两行，它留在 host 网络——因此 g3proxy 进了 ns 之后
-两者不在同一个回环上，取舍见第 1 节。
+systemd 不会代你创建。三个单元由同一个 `@NETNS@` 机制展开，每个包只渲染自己那几个单元，
+所以 `--netns=no` 要在两个包的命令上各给一次；三个服务都留在 host 时回环依赖天然可达，
+但也就和 vpp 那侧的转发不在一起了。
 
 ## 5. 日常操作
 
@@ -284,9 +386,26 @@ systemctl restart g3proxy         # 整份配置重载
 sudo /opt/zf/g3/uninstall.sh      # 停服务、摘单元，并删除 /opt/zf/g3
 ```
 
+装了 ICAP 包的话，另加三条：
+
+```sh
+systemctl status g3icap
+journalctl -u g3icap -f           # 每笔送审的 ICAP 请求行、头部、正文逐段打在这里
+sudo /opt/zf/icap/uninstall.sh    # 只停 g3icap、摘它的单元、删 /opt/zf/icap，不碰 g3
+sudo systemctl edit g3icap        # 覆盖 ExecStart 换 --listen / --service / --max-body-print
+```
+
 卸载停服务、摘 systemd 单元，最后**删除整个 `/opt/zf/g3`**——配置与 CA 一并清除，
 确认没有唯一副本再跑（要留就先拷走 `conf/`）。包里那份 `uninstall.sh` 有守卫：在包
-目录里执行时识别出 `install.sh` 同级，只摘单元、整包原样保留。
+目录里执行时识别出 `install.sh` 同级，只摘单元、整包原样保留。两个包的卸载脚本各删各的，
+卸 icap 不会动 g3 的单元与目录，反之也一样。
+
+审计链路"一条都没收到"时，先确认三个服务在同一个命名空间，再看监听地址：
+
+```sh
+systemctl show -p NetworkNamespacePath g3proxy g3fcgen g3icap   # 三行应当一致
+ss -lntp | grep -E '1344|2999'                                 # 监听在该命名空间的回环上
+```
 
 reload 走 `g3proxy-ctl reload`，可以只重载某一类：
 
@@ -314,6 +433,11 @@ diff /opt/zf/g3/conf/g3proxy.yaml{,.new}
 回滚：直接拿旧包的 `.run` 再跑一次（二进制覆盖、现网配置不动），再把 `.new` 删掉；
 不必先卸载——`uninstall.sh` 会把 `/opt/zf/g3` 整个删掉。`VERSION` 文件记了 git sha、
 构建 feature 和是否带 CA，出问题时先核对它确认装的是哪一份。
+
+两个包要一起升级时注意 `--netns` 路径别改：新包的命名空间和已装的兄弟单元不一致，安装
+脚本会在写系统目录之前拒装（这是设计如此，比装完再静默丢审计好）。真要换命名空间，
+就两个包都用新路径重打，先卸后装。`VERSION` 里的 `component:` 和
+`network namespace:` 两行记录了这份包是给哪个组件、进哪个命名空间打的。
 
 ## 7. 配置注意
 
@@ -353,10 +477,11 @@ diff /opt/zf/g3/conf/g3proxy.yaml{,.new}
   服务；`upload_audit_max_concurrency`（默认 64，0 表示不设限，样例里是注释掉的）控制
   同时进行的上传审计条数，名额用尽时新上传直接退化为直通转发并计入跳过数，不排队。详见
   `doc/http-icap-bypass-audit.md`。
-- 默认打包让 g3proxy 进 `ns-vpp`：`g3proxy.yaml` 里写 `127.0.0.1` 的 g3fcgen(2999) 与
-  ICAP(1344) 指的是 ns-vpp 的回环，不是 host 的。vpp 里没有这两个服务时，要么在 ns-vpp 里
-  起一套，要么把地址改成能跨命名空间到达的（`tls_cert_generator` 的 `query_peer_addr`、
-  `icap_reqmod_service` 里的地址）。
+- 默认打包让 g3proxy、g3fcgen 进 `ns-vpp`，ICAP 包默认也进同一个：`g3proxy.yaml` 里写
+  `127.0.0.1` 的 g3fcgen(2999) 与 ICAP(1344) 指的是 ns-vpp 的回环，不是 host 的。接现场
+  自己的 ICAP 设备时不必装 `g3icap`，但那个设备必须在 ns-vpp 里可达——要么地址本来就跨得过去，
+  要么把 `icap_reqmod_service` 改成能到达的地址（同理 `tls_cert_generator` 的
+  `query_peer_addr`）。三个服务分处两个命名空间是最坑的一种：全都 running，审计一条不到。
 - `g3fcgen.yaml` 里的 `myCA.crt`/`myCA.key` 是相对配置目录的路径。CA 由构建保证随包：
   `deploy/conf/` 有成套就用它，没有则 `g3mkcert` 自动生成（正式环境发布前换成自己的再打包）。
   仓库里的测试私钥不外发；带 CA 的 `.run` 本身就是敏感物，分发必须走受控渠道。
@@ -368,13 +493,17 @@ diff /opt/zf/g3/conf/g3proxy.yaml{,.new}
   `NetworkNamespacePath=` 只是把进程搬进 vpp 那侧已经存在的网络命名空间（systemd 需要
   `CAP_SYS_ADMIN`，root 服务本就有），`PrivateNetwork=no` 表示没有做网络隔离，不是安全加固；
   要完全关掉就在打包时 `--netns=no`。
+- **`g3icap` 会把送审内容打进日志**：每笔 ICAP 请求的请求行、头部和正文（默认截到 512 字节）
+  都进 journald。它是排障/打通链路用的，不是审计留痕系统——要长期存审计数据请接真实 ICAP
+  服务或把日志按敏感级别保管。`--max-body-print=0` 不打印正文字节（正文长度那行仍会打）。
 - 带 CA 的 `.run` 含私钥：临时目录 0700、退出即删，但**文件本身的保管与分发要按私钥的
   级别来**。`deploy/conf/myCA.*` 已进 `.gitignore`，不要把私钥提交进仓库。
 - `uninstall.sh` 会 `rm -rf` 整个安装目录 `/opt/zf/g3`，配置与 CA 全在里面，执行前确认
-  没有唯一副本。
+  没有唯一副本。icap 包那份删 `/opt/zf/icap`，只摘 `g3icap.service`，不碰 g3 的任何东西。
 - 安装/卸载脚本只在目标机本地读写，不联网、不外发任何数据。
 
 ## 9. 设计与跟踪
 
 - 设计（含方案取舍与遗留待决策项）：`docs/superpowers/specs/2026-11-02-g3-run-package-deploy-design.md`
 - 实施与验证清单：`docs/superpowers/plans/2026-11-02-g3-run-package-deploy.md`
+- ICAP 包与三服务同命名空间的设计：`docs/superpowers/specs/2026-11-04-g3-icap-package-netns-design.md`

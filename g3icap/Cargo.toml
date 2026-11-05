@@ -1,0 +1,16 @@
+[package]
+name = "g3icap"
+version = "0.1.0"
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "G3 ICAP echo server for the audit chain"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+clap.workspace = true
+http.workspace = true
+icap-rs.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }

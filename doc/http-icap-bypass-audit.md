@@ -222,7 +222,8 @@ cargo test -p g3proxy --features vendored-c-ares --lib   # 审计器配置（含
                                         # 送审判定规则（inspect/http/upload_audit.rs，12 条）
 ```
 
-§7 的判定与标签部分已在本机沙箱跑通：`icap_echo_server`（本仓库 example）当 ICAP、
+§7 的判定与标签部分已在本机沙箱跑通：`g3icap`（`cargo run -p g3icap`；当时还是
+`lib/g3-icap-client` 的 example `icap_echo_server`，现已提升为独立 crate）当 ICAP、
 g3fcgen 签发的拦截 CA、本地 HTTP/1.1 与 HTTP/2 源站各一个，共 14 笔请求、9 笔送审，
 `HTTP` / `HTTPS`、`1.1` / `2.0`、三种 `X-Body-Framing`、表单开关的开与关都对上了；
 真 c-icap 服务与 FTP 实传属于现网复核项，沙箱内没有执行。

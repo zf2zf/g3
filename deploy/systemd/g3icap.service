@@ -1,0 +1,18 @@
+[Unit]
+Description=G3 ICAP Echo Server (run package under @PREFIX@)
+Documentation=file://@PREFIX@/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+@NETNS@
+# 监听地址与 g3proxy.yaml 里的 icap_reqmod_service 对齐；要换端口就 systemctl edit g3icap
+ExecStart=@PREFIX@/bin/g3icap --listen 127.0.0.1:1344
+# 用 SIGINT 让它把手上的审计请求收尾（SIGTERM 也接得住）
+ExecStop=/bin/kill -INT $MAINPID
+Restart=on-failure
+TimeoutStartSec=10
+
+[Install]
+WantedBy=multi-user.target

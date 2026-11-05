@@ -301,7 +301,9 @@ services:
 
 ## 7. 动手体验（新手路径）
 
-1. **起一个 ICAP 服务器**：如 c-icap / Squid icap 示例服务，监听 1344。
+1. **起一个 ICAP 服务器**：仓库里自带一个回显服务 `cargo run -p g3icap`（默认监听
+   `127.0.0.1:1344`，把收到的每笔 ICAP 请求打印出来并原样回）；也可以用 c-icap /
+   Squid 的 icap 示例服务，同样监听 1344。部署形态见 `doc/deploy-run-package.md`。
 2. **跑压测样例**（它同时是一个手写的"最小上报报文"教材，直接展示了
    `Encapsulated: req-hdr=0, req-body=<off>` + chunked body 的拼法）：
    ```bash

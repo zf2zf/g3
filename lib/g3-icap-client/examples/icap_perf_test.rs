@@ -18,8 +18,8 @@ use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-// 用法：先在本机 1344 端口起一个 ICAP 服务器（提供 "echo" 服务），再
-// `cargo run --example icap_perf_test`
+// 用法：先在本机 1344 端口起一个 ICAP 服务器（提供 "echo" 服务，本仓库用 `cargo run -p g3icap`），
+// 再 `cargo run --example icap_perf_test`
 #[tokio::main]
 async fn main() {
     let icap_server = "127.0.0.1:1344";

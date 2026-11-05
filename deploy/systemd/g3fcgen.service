@@ -6,6 +6,7 @@ Wants=network-online.target
 
 [Service]
 Type=exec
+@NETNS@
 ExecStart=@PREFIX@/bin/g3fcgen -c @PREFIX@/conf/g3fcgen.yaml -s -G @GROUP@
 # g3fcgen 没有控制套接字，停止用 SIGINT 让它把手上的签发请求收尾
 ExecStop=/bin/kill -INT $MAINPID

@@ -1251,7 +1251,6 @@ dependencies = [
  "g3-yaml",
  "h2",
  "http",
- "icap-rs",
  "itoa",
  "kanal",
  "log",
@@ -1260,7 +1259,6 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-rustls",
- "tracing-subscriber",
  "url",
  "yaml-rust2",
 ]
@@ -1783,6 +1781,17 @@ dependencies = [
  "variant-ssl",
  "variant-ssl-sys",
  "yaml-rust2",
+]
+
+[[package]]
+name = "g3icap"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "http",
+ "icap-rs",
+ "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]
