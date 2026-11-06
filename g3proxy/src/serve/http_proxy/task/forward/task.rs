@@ -16,6 +16,7 @@ use g3_http::client::HttpForwardRemoteResponse;
 use g3_http::server::HttpProxyClientRequest;
 use g3_http::{HttpBodyReader, HttpBodyType};
 use g3_icap_client::reqmod::bypass::{BypassAdapter, BypassFraming, BypassRunState};
+use g3_icap_client::reqmod::{ConnectionProtocol, ConnectionTuple};
 use g3_icap_client::respmod::h1::{
     HttpResponseAdapter, RespmodAdaptationEndState, RespmodAdaptationRunState,
 };
@@ -985,6 +986,15 @@ impl<'a> HttpProxyForwardTask<'a> {
             }
         };
         adapter.set_client_addr(self.ctx.client_addr());
+        // 上游连接的实际两端作为 ICAP 五元组：代理侧本地地址 + 下一跳地址，
+        // 与 inspect/FTP 审计路径一致，供审计侧按 repid 关联真实数据流
+        if let (Some(local_addr), Some(remote_addr)) = (self.tcp_notes.local, self.tcp_notes.next) {
+            adapter.set_connection_tuple(ConnectionTuple {
+                server_addr: local_addr,
+                remote_addr,
+                protocol: ConnectionProtocol::Tcp,
+            });
+        }
         // HTTP 请求体成帧自带结束标记，不需要靠半关闭上游写侧来信令传输结束；
         // 关掉才能把上游连接留给 keep-alive / 流水线上的下一个请求
         adapter.set_upstream_half_close(false);
