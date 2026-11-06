@@ -59,6 +59,14 @@ auditor:
 
     # tls_stream_dump: { }
     icap_reqmod_service: icap://127.0.0.1:1344/icap_audit
+    # 排查送审内容时把上面一行换成 map 形态，多一个 log_audit_header 开关：
+    # g3-icap-client 会把每条送审的 ICAP 头 + 封装的 HTTP 请求头打进日志，
+    # 正文一律不打，X-TLS-* 密钥头的值屏蔽成 ***。默认 false（只在 debug 级打）。
+    # 看这条日志要给 g3proxy 加 -v（systemctl edit g3proxy 改 ExecStart），
+    # 不带 -v 时库的 log 记录只放行 warn 及以上，info 会被丢掉。
+    # icap_reqmod_service:
+    #   url: icap://127.0.0.1:1344/icap_audit
+    #   log_audit_header: true
     # 同时进行的旁路上传审计条数上限（默认 64，0 表示不设限）。名额用尽时
     # 新请求直接退化为直通转发并计入跳过数，不排队等待，因此调小只会少审计
     # 几笔上传，绝不会变慢转发。

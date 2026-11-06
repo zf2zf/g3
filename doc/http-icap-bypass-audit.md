@@ -150,6 +150,23 @@ HTTP 转发任务日志里与旁路上报相关的字段：
   或连接池耗尽，此时上传照常，但审计数据在缺失。
 - 上传延迟本身不会因为 ICAP 变慢而升高：管线是全量转发后再后台读判决。
 
+想直接看送审内容而不再抓包，把 auditor 的 `icap_reqmod_service` 改成 map 形态并打开
+`log_audit_header`（别名 `audit_log_header`，默认 false）：
+
+```yaml
+    icap_reqmod_service:
+      url: icap://127.0.0.1:1344/icap_audit
+      log_audit_header: true
+```
+
+每发一条送审就打印一行 `Bypass ICAP audit header (...)`，内容是 ICAP 请求头加封装的
+HTTP 请求头——正文一个字节都不打，`X-TLS-*` 密钥行的值屏蔽成 `***`。
+开关关着时这段内容仍按 debug 级打，开关只是免去逐条改代码或抓包。
+
+看这条日志要给 g3proxy 加 `-v`：库里的 `log` 记录经桥进进程日志时，默认（不带 `-v`）
+只放行 warn 及以上，info/debug 会被丢掉。现场排查就
+`systemctl edit g3proxy` 给 `ExecStart` 补一个 `-v` 再重启，查完撤掉。
+
 ## 7. 在部署环境把链路验一遍
 
 前置：ICAP 服务可用（例如仓库自带的 `g3icap`，或 c-icap 的示例服务）、代理 auditor 里

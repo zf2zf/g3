@@ -14,7 +14,8 @@
 //!   `tls_client` / `tls_name` / `tcp_keepalive` / `use_unix_socket`(unix) /
 //!   `icap_connection_pool`(别名 `connection_pool` / `pool`) /
 //!   `icap_max_header_size` / `disable_preview`(别名 `no_preview`) /
-//!   `preview_data_read_timeout` / `respond_shared_names` / `bypass`。
+//!   `preview_data_read_timeout` / `respond_shared_names` / `bypass` /
+//!   `log_audit_header`(别名 `audit_log_header`)。
 
 use std::path::Path;
 use std::str::FromStr;
@@ -116,6 +117,13 @@ impl IcapServiceConfig {
             "bypass" => {
                 let bypass = g3_yaml::value::as_bool(v)?;
                 config.set_bypass(bypass);
+                Ok(())
+            }
+            // 送审头部的调试日志：正文不发，只把头部按 info 级打一遍。
+            "log_audit_header" | "audit_log_header" => {
+                let enabled = g3_yaml::value::as_bool(v)
+                    .context(format!("invalid bool value for key {k}"))?;
+                config.set_log_audit_header(enabled);
                 Ok(())
             }
             _ => Err(anyhow!("invalid key {k}")),
@@ -230,6 +238,7 @@ mod tests {
                   - "X-Header-1"
                   - "X-Header-2"
                 bypass: false
+                log_audit_header: true
             "#
         );
         let config = IcapServiceConfig::parse_reqmod_service_yaml(&yaml, None).unwrap();
@@ -258,6 +267,7 @@ mod tests {
         assert!(config.respond_shared_names.contains("x-header-1"));
         assert!(config.respond_shared_names.contains("x-header-2"));
         assert!(!config.bypass);
+        assert!(config.log_audit_header);
 
         #[cfg(unix)]
         {
@@ -322,6 +332,7 @@ mod tests {
         );
         assert!(config.respond_shared_names.contains("x-single-header"));
         assert!(config.bypass);
+        assert!(!config.log_audit_header);
     }
 
     #[test]
@@ -414,6 +425,14 @@ mod tests {
             "#
         );
         assert!(IcapServiceConfig::parse_respmod_service_yaml(&yaml, None).is_err());
+
+        let yaml = yaml_doc!(
+            r#"
+                url: "icap://example.com:1344/service"
+                log_audit_header: "invalid"
+            "#
+        );
+        assert!(IcapServiceConfig::parse_reqmod_service_yaml(&yaml, None).is_err());
 
         #[cfg(unix)]
         {

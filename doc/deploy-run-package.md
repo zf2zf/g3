@@ -411,6 +411,21 @@ systemctl show -p NetworkNamespacePath g3proxy g3fcgen g3icap   # 三行应当�
 ss -lntp | grep -E '1344|2999'                                 # 监听在该命名空间的回环上
 ```
 
+不想抓包、也不想只看 g3icap 那侧，可以让代理自己把送审的头部打出来：把 auditor 的
+`icap_reqmod_service` 改成 map 形态，加 `log_audit_header: true`，再重载 auditor 即可。
+它每送一条就打一行 `Bypass ICAP audit header (...)`，内容是 ICAP 请求头加封装的 HTTP
+请求头——正文一个字节不打，`X-TLS-*` 密钥行的值屏蔽成 `***`。这条记录是 info 级，而库的
+`log` 记录默认只放行 warn 及以上，所以要给 g3proxy 补一个 `-v` 才看得见：
+
+```sh
+sudo systemctl edit g3proxy      # [Service] 里把 ExecStart 末尾补上 -v
+sudo systemctl daemon-reload && sudo systemctl restart g3proxy
+journalctl -u g3proxy -f | grep 'Bypass ICAP audit header'
+```
+
+查完把开关关掉、`-v` 撤掉：这条日志里带着完整的请求头（Cookie、Authorization 之类都在），
+只适合排障时短期开。
+
 reload 走 `g3proxy-ctl reload`，可以只重载某一类：
 
 ```sh
@@ -500,6 +515,9 @@ diff /opt/zf/g3/conf/g3proxy.yaml{,.new}
 - **`g3icap` 会把送审内容打进日志**：每笔 ICAP 请求的请求行、头部和正文（默认截到 512 字节）
   都进 journald。它是排障/打通链路用的，不是审计留痕系统——要长期存审计数据请接真实 ICAP
   服务或把日志按敏感级别保管。`--max-body-print=0` 不打印正文字节（正文长度那行仍会打）。
+- **`log_audit_header` 打开时，g3proxy 这侧也会把送审头部写进 journald**：里面是客户端原始
+  请求头，Cookie、Authorization 这类凭据头都在，正文字节与 `X-TLS-*` 密钥行不会被打（密钥值
+  统一屏蔽成 `***`）。默认关闭，排障用完就关；开启期间的日志要按敏感级别保管。
 - 带 CA 的 `.run` 含私钥：临时目录 0700、退出即删，但**文件本身的保管与分发要按私钥的
   级别来**。`deploy/conf/myCA.*` 已进 `.gitignore`，不要把私钥提交进仓库。
 - `uninstall.sh` 会 `rm -rf` 整个安装目录 `/opt/zf/g3`，配置与 CA 全在里面，执行前确认

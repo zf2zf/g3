@@ -289,6 +289,7 @@ services:
       respond_shared_names:        # ICAP 响应里要回传给代理的头
         - X-Scan-Verdict
       bypass: false                # true: ICAP 失败时直接放行（降级开关）
+      # log_audit_header: true     # 送审头部排查看 §7.0；默认 false
       tls_client:
         trusted_certs: /etc/g3/ca.pem
       tcp_keepalive: ...
@@ -300,6 +301,42 @@ services:
 ---
 
 ## 7. 动手体验（新手路径）
+
+### 7.0 先看送审的头部（log_audit_header）
+
+想知道代理到底往 ICAP 发了什么，把 auditor 的 `icap_reqmod_service` 从 URL 简写改成
+map 形态，加上开关：
+
+```yaml
+    icap_reqmod_service:
+      url: icap://127.0.0.1:1344/icap_audit
+      log_audit_header: true
+```
+
+旁路上报每发一条，就打一行 `Bypass ICAP audit header (...)`：
+
+```
+Bypass ICAP audit header (426 bytes icap header, 96 bytes req-hdr)
+REQMOD icap://127.0.0.1:1344/icap_audit ICAP/1.0
+Allow: 204
+X-Transformed-From: HTTPS
+X-Http-Version: 1.1
+X-Body-Framing: content-length
+X-Client-IP: 10.0.0.7
+X-Client-Port: 51234
+X-TLS-VERSION: TLSv1.3
+X-TLS-CLIENT_RANDOM: ***
+Encapsulated: req-hdr=0, req-body=96
+[encapsulated req-hdr]
+POST /upload HTTP/1.1
+Host: example.com
+Content-Length: 1048576
+```
+
+只打头部：正文（文件内容）一个字节都不打，`X-TLS-*` 里那几行密钥（TLS keylog）的
+值屏蔽成 `***` —— 密钥进了日志，等于把同一批抓包一并解密了。开关关着时退回原来的
+debug 级，内容相同。这条日志要进程带 `-v` 才看得见：库的 `log` 记录经桥进进程日志，
+默认只放行 warn 及以上。这个开关只对旁路上传审计这条管线生效。
 
 1. **起一个 ICAP 服务器**：仓库里自带一个回显服务 `cargo run -p g3icap`（默认监听
    `127.0.0.1:1344`，把收到的每笔 ICAP 请求打印出来并原样回）；也可以用 c-icap /

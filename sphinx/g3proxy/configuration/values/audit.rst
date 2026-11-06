@@ -119,6 +119,29 @@ For *map* value, the keys are:
 
   **default**: false
 
+* log_audit_header
+
+  **optional**, **type**: bool
+
+  Set to true to log the request header sent to the ICAP server,
+  for debugging what is actually submitted for audit.
+
+  Only the header part is logged: the ICAP request header plus the encapsulated
+  HTTP request header, never the body. Values of the *X-TLS-\** keylog headers are
+  masked out so that TLS key material can't leak into the log files.
+
+  When disabled (the default), the ICAP request header is still logged at *debug* level.
+
+  Note that these records are emitted by the library *log* facade, which is bridged
+  into the process log at *info* and above only when g3proxy is started with the
+  `-v` flag. Without it, only *warn* and above are passed through.
+
+  This config option now only apply to the bypass upload audit pipeline.
+
+  **default**: false
+
+  .. versionadded:: 1.13.0
+
 .. _conf_value_audit_stream_detour_service_config:
 
 stream detour service config

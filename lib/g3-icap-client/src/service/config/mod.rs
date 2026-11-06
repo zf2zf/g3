@@ -17,7 +17,10 @@
 //! - `preview_data_read_timeout`：PREVIEW 等待上层喂数据的超时，避免死锁；
 //! - `respond_shared_names`：RESPMOD 响应中允许透传给客户端的扩展头白名单
 //!   （如 `X-ICAP-Header`），不在名单内的扩展头会被丢弃；
-//! - `bypass`：ICAP 服务故障时是否放行流量（true = 降级放行；false = 拒绝）。
+//! - `bypass`：ICAP 服务故障时是否放行流量（true = 降级放行；false = 拒绝）；
+//! - `log_audit_header`：把送审的头部（ICAP 头 + 封装的 HTTP 请求头，不含正文）
+//!   以 info 级打出来，供现场排查送审内容；关闭时只保留 debug 级那一条。
+//!   两者都要进程带 `-v` 启动才看得到（库的 `log` 记录默认只放行 warn 及以上）。
 //!
 //! 请求头拼装：[`IcapServiceConfig::build_request_header`] 产出"请求头前缀"
 //! （请求行 + Host + User-Agent + Authorization），上层协议适配器在此基础上
@@ -77,6 +80,8 @@ pub struct IcapServiceConfig {
     pub(crate) respond_shared_names: BTreeSet<String>,
     // ICAP 服务故障时是否 bypass：true = 放行原流量，false = 报错拒接。
     pub(crate) bypass: bool,
+    // 送审头部日志开关：true = 每次送审以 info 级打一遍头部（正文不打）。
+    pub(crate) log_audit_header: bool,
 }
 
 impl IcapServiceConfig {
@@ -125,6 +130,7 @@ impl IcapServiceConfig {
             preview_data_read_timeout: Duration::from_secs(4),
             respond_shared_names: BTreeSet::new(),
             bypass: false,
+            log_audit_header: false,
         })
     }
 
@@ -156,6 +162,11 @@ impl IcapServiceConfig {
     /// 故障 bypass 开关：true = ICAP 不可用时放行；false = 拒绝。
     pub fn set_bypass(&mut self, bypass: bool) {
         self.bypass = bypass;
+    }
+
+    /// 送审头部日志开关：true = 每次送审以 info 级打出头部（正文不打，密钥头屏蔽）。
+    pub fn set_log_audit_header(&mut self, enabled: bool) {
+        self.log_audit_header = enabled;
     }
 
     /// 向 RESPMOD 响应头白名单中添加一项；内部以小写字符串存储。

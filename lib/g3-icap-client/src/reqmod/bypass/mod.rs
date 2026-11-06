@@ -21,7 +21,7 @@ use tokio::time::Instant;
 use g3_io_ext::{IdleCheck, LimitedWriteExt, OnceBufReader, StreamCopyConfig};
 use g3_types::net::TlsKeyLogBuffer;
 
-use log::{debug, warn};
+use log::{debug, info, warn};
 
 use super::{ConnectionTuple, IcapReqmodClient};
 use crate::reqmod::mail::ReqmodAdaptationRunState;
@@ -262,12 +262,7 @@ impl<I: IdleCheck> BypassAdapter<I> {
             framing.req_hdr.len()
         );
 
-        debug!(
-            "Bypass ICAP request header ({} bytes, req_hdr {} bytes):\n{}",
-            icap_header.len(),
-            framing.req_hdr.len(),
-            String::from_utf8_lossy(&icap_header)
-        );
+        self.log_audit_header(&icap_header, &framing.req_hdr);
 
         // 两段头一次 write_all_vectored 发出：省一次系统调用，
         // 也保证 ICAP 头与封装的请求头作为整体送达服务器。
@@ -279,6 +274,30 @@ impl<I: IdleCheck> BypassAdapter<I> {
             ])
             .await?;
         self.icap_connection.writer.flush().await
+    }
+
+    /// 送审头部的调试日志：正文一律不打，只把 ICAP 请求头与封装的 HTTP 请求头打出来。
+    /// 开关 `log_audit_header` 打开时走 info 级，关掉时退回原来的 debug 一条——两者都要
+    /// 求 g3proxy 带 `-v` 启动：库代码的 `log` 记录经桥进 slog，默认（不带 `-v`）只放行
+    /// warn 及以上。两个级别都屏蔽承载密钥的 X-TLS-* 头——TLS 会话密钥进了日志，
+    /// 等于把同一批抓包一并解密了。
+    fn log_audit_header(&self, icap_header: &[u8], req_hdr: &[u8]) {
+        let enabled = self.icap_client.config.log_audit_header;
+        if !enabled && log::max_level() < log::Level::Debug {
+            return;
+        }
+        let message = format!(
+            "Bypass ICAP audit header ({} bytes icap header, {} bytes req-hdr)\n{}\n[encapsulated req-hdr]\n{}",
+            icap_header.len(),
+            req_hdr.len(),
+            masked_header_lines(icap_header),
+            masked_header_lines(req_hdr),
+        );
+        if enabled {
+            info!("{message}");
+        } else {
+            debug!("{message}");
+        }
     }
 
     /// 主入口：把客户端数据流同时扇出到上游写端和 ICAP 后台写任务。
@@ -959,6 +978,35 @@ impl<I: IdleCheck> BypassAdapter<I> {
 /// 用于从排空数据里切出完整的 ICAP 响应头。
 fn find_icap_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+/// 日志用的头部文本：逐行输出，密钥头只留名字、值换成 `***`，其余行把控制
+/// 字符换成空格——和 `serialize::add_keylog_headers` 写上线时的清洗一致，
+/// 免得别人构造的值在日志里伪造出一行。
+fn masked_header_lines(header: &[u8]) -> String {
+    String::from_utf8_lossy(header)
+        .lines()
+        .map(|line| match line.split_once(':') {
+            Some((name, _)) if is_keylog_header(name.trim()) => format!("{name}: ***"),
+            _ => line
+                .chars()
+                .map(|c| if c.is_ascii_control() { ' ' } else { c })
+                .collect(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 是否是承载密钥的 ICAP 扩展头：`X-TLS-` 前缀里只有版本、密码套件和 server
+/// random 是握手公开值，其余条目（`X-TLS-<LABEL>: <client_random> <secret>`）
+/// 都是 TLS keylog，不能进日志。
+fn is_keylog_header(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.starts_with("x-tls-")
+        && !matches!(
+            name.as_str(),
+            "x-tls-version" | "x-tls-cipher" | "x-tls-server_random"
+        )
 }
 
 /// Append `<hex-size>\r\n` to the buffer without heap allocation.
@@ -1921,7 +1969,7 @@ mod tests {
 
     // ---------- append_chunk_header 既有单测平移 ----------
 
-    use super::append_chunk_header;
+    use super::{append_chunk_header, masked_header_lines};
 
     #[test]
     fn test_append_chunk_header_zero() {
@@ -1968,5 +2016,22 @@ mod tests {
         } else {
             assert_eq!(buf.as_ref(), b"ffffffff\r\n");
         }
+    }
+
+    #[test]
+    fn masked_audit_header_hides_keylog_secrets() {
+        let header = b"REQMOD icap://127.0.0.1:1344/icap_audit ICAP/1.0\r\n\
+            Allow: 204\r\n\
+            X-TLS-VERSION: TLSv1.3\r\n\
+            X-TLS-CLIENT_RANDOM: deadbeef cafebabe\r\n\
+            X-TLS-CLIENT_HANDSHAKE_TRAFFIC_SECRET: deadbeef 11223344\r\n\
+            X-Client-Username: jo\thn\r\n";
+        let text = masked_header_lines(header);
+        assert!(text.contains("X-TLS-VERSION: TLSv1.3"), "{text}");
+        assert!(text.contains("X-TLS-CLIENT_RANDOM: ***"), "{text}");
+        assert!(text.contains("X-TLS-CLIENT_HANDSHAKE_TRAFFIC_SECRET: ***"));
+        assert!(!text.contains("cafebabe"));
+        assert!(!text.contains("11223344"));
+        assert!(text.contains("X-Client-Username: jo hn"), "{text}");
     }
 }
