@@ -45,14 +45,20 @@ pub fn add_connection_tuple(buf: &mut Vec<u8>, tuple: &ConnectionTuple) {
 /// 字符（\r、\n、NUL 等）一律替换为空格，避免破坏 "Name: value\r\n" 线格式、
 /// 被利用注入额外头部。
 pub fn add_keylog_headers(buf: &mut Vec<u8>, keylog: &TlsKeyLogBuffer) {
-    if keylog.is_empty() {
+    // 元数据（版本/套件/server random）与 keylog 条目任一存在就输出：
+    // TLS 1.2 会话复用等场景可能没有新条目，但握手公开值仍有解密价值。
+    if keylog.is_empty()
+        && keylog.tls_version().is_none()
+        && keylog.cipher_name().is_none()
+        && keylog.server_random().is_none()
+    {
         return;
     }
     if let Some(version) = keylog.tls_version() {
-        let _ = write!(buf, "X-TLS-VERSION: {}\r\n", version.as_str());
+        let _ = write!(buf, "X-TLS-VERSION: {}\r\n", version.as_icap_str());
     }
-    if let Some(cipher) = keylog.cipher_suite() {
-        let _ = write!(buf, "X-TLS-CIPHER: {}\r\n", cipher);
+    if let Some(cipher) = keylog.cipher_name() {
+        let _ = write!(buf, "X-TLS-CIPHER: {cipher}\r\n");
     }
     if let Some(server_random) = keylog.server_random() {
         let _ = write!(buf, "X-TLS-SERVER_RANDOM: {}\r\n", server_random);

@@ -27,6 +27,16 @@ impl TlsVersion {
             TlsVersion::TLS1_3 => "TLS1.3",
         }
     }
+
+    /// ICAP 审计头里使用的写法（如 `TLSv1.3`），与配置文件/日志的 `TLS1.3` 区分
+    pub fn as_icap_str(&self) -> &'static str {
+        match self {
+            TlsVersion::TLS1_0 => "TLSv1.0",
+            TlsVersion::TLS1_1 => "TLSv1.1",
+            TlsVersion::TLS1_2 => "TLSv1.2",
+            TlsVersion::TLS1_3 => "TLSv1.3",
+        }
+    }
 }
 
 impl FromStr for TlsVersion {

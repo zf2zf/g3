@@ -13,12 +13,14 @@
 //! 已消费的首段字节通过 `OnceBufReader` / `FlexBufReader` 重新拼接回读流，
 //! 保证下游协议解析器看到的是完整、未丢失的原始数据。
 
+use std::sync::Arc;
+
 use bytes::{Buf, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use g3_dpi::{Protocol, ProtocolInspectError, ProtocolInspector};
 use g3_io_ext::{FlexBufReader, OnceBufReader};
-use g3_types::net::UpstreamAddr;
+use g3_types::net::{TlsKeyLogBuffer, UpstreamAddr};
 
 use g3_icap_client::reqmod::{ConnectionProtocol, ConnectionTuple};
 
@@ -57,6 +59,9 @@ pub(crate) struct StreamInspectObject<SC: ServerConfig> {
     pub(super) ctx: StreamInspectContext<SC>,
     /// 上游目标地址，既用于 DPI 的端口线索，也用于下游拦截对象建连
     upstream: UpstreamAddr,
+    /// TLS 拦截会话的密钥日志缓冲；协议由内容识别（而非 ALPN）得出时，
+    /// 需继续传给内层 HTTP 拦截对象，否则 ICAP 审计会丢失 X-TLS-* 头
+    keylog_buffer: Option<Arc<TlsKeyLogBuffer>>,
 }
 
 impl<SC> StreamInspectObject<SC>
@@ -70,7 +75,13 @@ where
             io: None,
             ctx,
             upstream,
+            keylog_buffer: None,
         }
+    }
+
+    /// 注入外层 TLS 拦截会话的密钥日志缓冲，供识别出的内层协议继续上报
+    pub(crate) fn set_keylog_buffer(&mut self, buffer: Option<Arc<TlsKeyLogBuffer>>) {
+        self.keylog_buffer = buffer;
     }
 
     /// 装配四路 IO 半部，使对象具备读取首段数据进行协议识别的能力
@@ -202,7 +213,7 @@ where
                         self.ctx,
                         upload_info,
                         data_channel_tuple,
-                        None,
+                        self.keylog_buffer.clone(),
                     );
                     ftp_upload_obj.set_io(
                         Box::new(OnceBufReader::new(clt_r, clt_r_buf)),
@@ -264,7 +275,10 @@ where
             }
             Protocol::Http1 => {
                 // HTTP/1 需要边解析边读，用 FlexBufReader 把已采样字节续接在原读流前
-                let mut h1_obj = crate::inspect::http::H1InterceptObject::new(self.ctx, None);
+                let mut h1_obj = crate::inspect::http::H1InterceptObject::new(
+                    self.ctx,
+                    self.keylog_buffer.clone(),
+                );
                 h1_obj.set_io(
                     FlexBufReader::with_bytes(clt_r_buf, clt_r),
                     clt_w,
@@ -278,7 +292,7 @@ where
                 let mut h2_obj = crate::inspect::http::H2InterceptObject::new(
                     self.ctx,
                     self.upstream.clone(),
-                    None,
+                    self.keylog_buffer.clone(),
                 );
                 h2_obj.set_io(OnceBufReader::new(clt_r, clt_r_buf), clt_w, ups_r, ups_w);
                 return Ok(StreamInspection::H2(h2_obj));

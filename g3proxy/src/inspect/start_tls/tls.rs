@@ -157,8 +157,7 @@ where
                 buf.set_tls_version(version);
             }
             if let Some(cipher) = ups_tls_stream.ssl().current_cipher() {
-                let cipher_id = u16::from_be_bytes(cipher.protocol_id());
-                buf.set_cipher_suite(cipher_id);
+                buf.set_cipher_name(cipher.name().to_string());
             }
             let mut random_buf = [0u8; 32];
             let random_len = ups_tls_stream.ssl().server_random(&mut random_buf);

@@ -76,7 +76,7 @@ pub struct TlsKeyLogBuffer {
     entries: Mutex<Vec<TlsKeyLogEntry>>,
     max_entries: usize,
     tls_version: Mutex<Option<TlsVersion>>,
-    cipher_suite: Mutex<Option<u16>>,
+    cipher_name: Mutex<Option<String>>,
     server_random: Mutex<Option<String>>,
 }
 
@@ -87,7 +87,7 @@ impl TlsKeyLogBuffer {
             entries: Mutex::new(Vec::with_capacity(MAX_KEYLOG_ENTRIES_PER_CONNECTION)),
             max_entries: MAX_KEYLOG_ENTRIES_PER_CONNECTION,
             tls_version: Mutex::new(None),
-            cipher_suite: Mutex::new(None),
+            cipher_name: Mutex::new(None),
             server_random: Mutex::new(None),
         }
     }
@@ -99,7 +99,7 @@ impl TlsKeyLogBuffer {
             entries: Mutex::new(Vec::with_capacity(max)),
             max_entries: max,
             tls_version: Mutex::new(None),
-            cipher_suite: Mutex::new(None),
+            cipher_name: Mutex::new(None),
             server_random: Mutex::new(None),
         }
     }
@@ -111,7 +111,7 @@ impl TlsKeyLogBuffer {
             entries: Mutex::new(Vec::with_capacity(MAX_KEYLOG_ENTRIES_PER_CONNECTION)),
             max_entries: MAX_KEYLOG_ENTRIES_PER_CONNECTION,
             tls_version: Mutex::new(None),
-            cipher_suite: Mutex::new(None),
+            cipher_name: Mutex::new(None),
             server_random: Mutex::new(None),
         }
     }
@@ -124,7 +124,7 @@ impl TlsKeyLogBuffer {
             entries: Mutex::new(Vec::with_capacity(max)),
             max_entries: max,
             tls_version: Mutex::new(None),
-            cipher_suite: Mutex::new(None),
+            cipher_name: Mutex::new(None),
             server_random: Mutex::new(None),
         }
     }
@@ -139,14 +139,14 @@ impl TlsKeyLogBuffer {
         *self.tls_version.lock().unwrap()
     }
 
-    /// Set the negotiated cipher suite (protocol ID).
-    pub fn set_cipher_suite(&self, cipher: u16) {
-        *self.cipher_suite.lock().unwrap() = Some(cipher);
+    /// Set the negotiated cipher suite name (e.g. TLS_AES_256_GCM_SHA384).
+    pub fn set_cipher_name(&self, name: String) {
+        *self.cipher_name.lock().unwrap() = Some(name);
     }
 
-    /// Get the negotiated cipher suite (protocol ID).
-    pub fn cipher_suite(&self) -> Option<u16> {
-        *self.cipher_suite.lock().unwrap()
+    /// Get the negotiated cipher suite name.
+    pub fn cipher_name(&self) -> Option<String> {
+        self.cipher_name.lock().unwrap().clone()
     }
 
     /// Set the server random (hex format).

@@ -559,6 +559,7 @@ where
         let ctx = self.prepare_ctx(protocol);
         let mut stream_obj =
             crate::inspect::stream::StreamInspectObject::new(ctx, self.upstream.clone());
+        stream_obj.set_keylog_buffer(self.keylog_buffer.clone());
         stream_obj.set_io(
             Box::new(clt_r),
             Box::new(clt_w),

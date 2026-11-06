@@ -19,7 +19,9 @@ use openssl::ssl::Ssl;
 use g3_dpi::{Protocol, ProtocolInspector};
 use g3_io_ext::OnceBufReader;
 use g3_openssl::{SslAcceptor, SslConnector};
-use g3_types::net::{AlpnProtocol, Host, TlsCertUsage, TlsKeyLogBuffer, TlsServiceType};
+use g3_types::net::{
+    AlpnProtocol, Host, TlsCertUsage, TlsKeyLogBuffer, TlsServiceType, TlsVersion,
+};
 
 use super::{ParsedClientHello, TlsInterceptIo, TlsInterceptObject, TlsInterceptionError};
 use crate::config::server::ServerConfig;
@@ -180,6 +182,25 @@ where
         .map_err(|e| {
             TlsInterceptionError::UpstreamHandshakeFailed(anyhow!("upstream handshake error: {e}"))
         })?;
+
+        // 记录 TLS 版本/套件/服务端随机数（与 STARTTLS 路径一致）。这些是握手
+        // 公开值，ICAP 审计头里以 X-TLS-VERSION / X-TLS-CIPHER /
+        // X-TLS-SERVER_RANDOM 输出，配合 keylog 条目才能解密会话。
+        if let Some(buf) = &self.keylog_buffer {
+            if let Some(ssl_version) = ups_tls_stream.ssl().version2()
+                && let Ok(version) = TlsVersion::try_from(ssl_version)
+            {
+                buf.set_tls_version(version);
+            }
+            if let Some(cipher) = ups_tls_stream.ssl().current_cipher() {
+                buf.set_cipher_name(cipher.name().to_string());
+            }
+            let mut random_buf = [0u8; 32];
+            let random_len = ups_tls_stream.ssl().server_random(&mut random_buf);
+            if random_len > 0 {
+                buf.set_server_random(hex::encode(&random_buf[..random_len]));
+            }
+        }
 
         // 等待后台预取结果；未命中缓存则取上游真实证书去签发对应假证书
         let pre_fetch_pair = pre_fetch_handle.await.map_err(|e| {
