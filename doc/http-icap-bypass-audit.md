@@ -159,13 +159,21 @@ HTTP 转发任务日志里与旁路上报相关的字段：
       log_audit_header: true
 ```
 
-每发一条送审就打印一行 `Bypass ICAP audit header (...)`，内容是 ICAP 请求头加封装的
-HTTP 请求头——正文一个字节都不打，`X-TLS-*` 密钥行的值屏蔽成 `***`。
-开关关着时这段内容仍按 debug 级打，开关只是免去逐条改代码或抓包。
+每发一条送审就打印一条 `Bypass ICAP audit header (...)`，几十行：第一行是字节数，
+接着是 ICAP 请求头，再是封装的 HTTP 请求头——正文一个字节都不打，`X-TLS-*` 密钥行的
+值屏蔽成 `***`。开关关着时这段内容仍按 debug 级打，开关只是免去逐条改代码或抓包。
 
 这条日志是 info 级，g3proxy 检测到开关打开会自动把库日志的级别门限放到 info，
 `journalctl -u g3proxy -f` 直接可见，不用改 `ExecStart` 加 `-v`；开关关着时那条
 debug 仍需 `-vv` 才看得到。
+
+想看全一条记录，用 journalctl 自己的过滤，别再管道接 `grep`——管道按行过滤，一条记录
+只有第一行带这个串，于是只剩那行字节数，内容看着像没打出来：
+
+```sh
+journalctl -u g3proxy -f --grep 'Bypass ICAP audit header' -o cat
+# systemd < 247 没有 --grep：journalctl -u g3proxy --since "-10min" | grep -A40 'Bypass ICAP audit header'
+```
 
 ## 7. 在部署环境把链路验一遍
 

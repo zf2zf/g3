@@ -313,7 +313,8 @@ map 形态，加上开关：
       log_audit_header: true
 ```
 
-旁路上报每发一条，就打一行 `Bypass ICAP audit header (...)`：
+旁路上报每发一条，就打一条 `Bypass ICAP audit header (...)`（几十行：第一行字节数，
+接着 ICAP 请求头，再封装的请求头）：
 
 ```
 Bypass ICAP audit header (426 bytes icap header, 96 bytes req-hdr)
@@ -338,6 +339,15 @@ Content-Length: 1048576
 debug 级，内容相同，要看仍需 `-vv`。开关打开时走 info 级，且不需要给进程加 `-v`：
 g3proxy 解析到开关打开会自动把库日志的级别门限放到 info。这个开关只对旁路上传
 审计这条管线生效。
+
+在装了 systemd 的机器上看这条：
+
+```sh
+journalctl -u g3proxy -f --grep 'Bypass ICAP audit header' -o cat
+```
+
+一条记录有几十行，`journalctl | grep 'Bypass ICAP audit header'` 那种写法只会留下
+第一行（带这个串的正好是报字节数那行），看着像没打内容。
 
 1. **起一个 ICAP 服务器**：仓库里自带一个回显服务 `cargo run -p g3icap`（默认监听
    `127.0.0.1:1344`，把收到的每笔 ICAP 请求打印出来并原样回）；也可以用 c-icap /

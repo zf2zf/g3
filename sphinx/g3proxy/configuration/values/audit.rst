@@ -137,6 +137,17 @@ For *map* value, the keys are:
   raise the level automatically so the *info* records show up without the `-v`
   flag; the *debug* line mentioned above still requires `-vv`.
 
+  One record spans many lines: the byte count summary, then the ICAP request
+  header, then the encapsulated HTTP request header. Filter them with journalctl's
+  own options::
+
+    journalctl -u g3proxy -f --grep 'Bypass ICAP audit header' -o cat
+
+  Piping into ``grep`` instead keeps only the first line of each record -- the one
+  carrying the byte counts -- so the header content looks like it was never
+  logged. On systemd older than 247, which has no ``--grep``, use
+  ``grep -A40 'Bypass ICAP audit header'``.
+
   This config option now only apply to the bypass upload audit pipeline.
 
   **default**: false
