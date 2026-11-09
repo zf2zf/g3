@@ -1,7 +1,8 @@
 #!/bin/sh
 #
 # 编译并打一个 g3 "run 包"：可执行程序 + systemd 单元 + 安装/卸载脚本（以及配置），
-# 产物是 dist/ 下的一个目录、同名 tar.gz，和一个可直接执行的自解压 .run。
+# 产物是 dist/ 下的一个可直接执行的自解压 .run。组装用的目录和 tar.gz 都放在工作区
+# （target/pkg，见 WORK_DIR），生成 .run 后即删——dist 下只留 .run 这一个文件。
 #
 # 两个组件，共用同一套编译开关与命名空间约定：
 #   --component=g3    g3proxy + g3proxy-ctl + g3fcgen，装到 /opt/zf/g3（默认）
@@ -81,6 +82,8 @@ NETNS=${NETNS:-yes}
 NETNS_PATH=${NETNS_PATH:-/run/netns/ns-vpp}
 
 DIST_DIR=${DIST_DIR:-"${PROJECT_DIR}/dist"}
+# 组装工作区：包目录和中间 tar.gz 都在这里，dist 只接收最终的 .run
+WORK_DIR=${WORK_DIR:-"${PROJECT_DIR}/target/pkg"}
 # run 包内的配置来源：全部内联在 deploy/conf 的两份 yaml 里，
 # server / auditor 不再有 server.d、auditor.d 子目录
 
@@ -322,7 +325,7 @@ GIT_SHA=$(git -C "$PROJECT_DIR" rev-parse --short HEAD 2>/dev/null || echo unkno
 ARCH=$(uname -s | tr 'A-Z' 'a-z')-$(uname -m)
 BUILT_AT=$(date -u +%Y%m%d)
 PKG_NAME="${PKG_PREFIX}-${VERSION}-${GIT_SHA}-${ARCH}-${BUILT_AT}"
-PKG_DIR="$DIST_DIR/$PKG_NAME"
+PKG_DIR="$WORK_DIR/$PKG_NAME"
 
 echo "==> 组装 run 包（组件 ${COMPONENT}）：$PKG_DIR"
 rm -rf "$PKG_DIR"
@@ -652,9 +655,10 @@ if [ "$PORTABILITY" = static ]; then
 fi
 
 mkdir -p "$DIST_DIR"
-rm -f "$DIST_DIR/$PKG_NAME.tar.gz" "$DIST_DIR/$PKG_NAME.run"
-# 包内路径统一以 ${PKG_NAME}/ 开头，解包后就是 install.sh 期望的目录结构
-(cd "$DIST_DIR" && tar czf "$PKG_NAME.tar.gz" "$PKG_NAME")
+rm -f "$DIST_DIR/$PKG_NAME.run"
+# 包内路径统一以 ${PKG_NAME}/ 开头，解包后就是 install.sh 期望的目录结构。
+# 归档只是 .run 的负载，生成在工作区，追加载荷后连同组装目录一起删掉。
+(cd "$WORK_DIR" && tar czf "$PKG_NAME.tar.gz" "$PKG_NAME")
 
 # 自解压 .run：头部脚本按行号取尾部 payload（tar.gz）解到临时目录，
 # 调用包内 install.sh；退出时删除临时目录（里面可能有 CA 私钥）。
@@ -698,14 +702,16 @@ sed -e "s#@PKG_NAME@#${PKG_NAME}#" -e "s#@PKG_SUMMARY@#${PKG_SUMMARY}#" \
 rm -f "$RUN_HEADER"
 # 校验必须在追加载荷之前做：sh -n 会把整个文件当脚本解析，尾部 tar 数据必然报错
 sh -n "$DIST_DIR/$PKG_NAME.run" || { echo ".run 头部语法有问题" >&2; exit 1; }
-cat "$DIST_DIR/$PKG_NAME.tar.gz" >> "$DIST_DIR/$PKG_NAME.run"
+cat "$WORK_DIR/$PKG_NAME.tar.gz" >> "$DIST_DIR/$PKG_NAME.run"
 chmod 0755 "$DIST_DIR/$PKG_NAME.run"
+# dist 只留 .run：组装目录与负载归档用完即删（自检失败时到不了这一行，
+# 包目录会原样留在工作区供排查）
+rm -rf "$PKG_DIR" "$WORK_DIR/$PKG_NAME.tar.gz"
 
 echo
 echo "run 包已生成："
 echo "  安装器 $DIST_DIR/$PKG_NAME.run"
-echo "  归档   $DIST_DIR/$PKG_NAME.tar.gz（与 .run 内容相同，供不方便跑安装器的场合手动解包）"
-echo "  目录   $PKG_DIR"
+echo "  工作区 $WORK_DIR（本次的组装目录与归档已删除）"
 echo
 echo "下一步：把 .run 拷到目标机，执行"
 echo "  sudo ./$PKG_NAME.run"

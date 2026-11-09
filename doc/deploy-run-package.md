@@ -42,11 +42,17 @@ deploy/build_run_package.sh --component=icap                    # 打 ICAP 服�
 deploy/build_run_package.sh --component=icap --static --netns=/run/netns/ns-vpp   # 老 glibc 目标机
 ```
 
-产物在 `dist/`：
+产物在 `dist/`，只有交付用的自解压安装器：
 
 - `g3-run-<版本>-<git短sha>-<os>-<arch>-<日期>.run` / `g3icap-run-<...>.run`
-  —— 交付用的自解压安装器；
-- 同名 `.tar.gz` 与目录 —— 内容相同，留作不便执行 `.run` 时的手动解包通道。
+
+组装包用的目录和中间 `.tar.gz` 都在工作区 `target/pkg/`（`WORK_DIR` 可改），`.run` 一生成就
+清掉——`dist/` 下不会留下第二份拷贝。不便执行 `.run`、只想要裸目录时，从 `.run` 里解出负载：
+
+```sh
+L=$(sed -n 's/^PAYLOAD_LINE=\(.*\)/\1/p' g3-run-xxx.run)   # 头部脚本占多少行
+tail -n +"$L" g3-run-xxx.run | tar xzf -                   # 解出 g3-run-xxx/
+```
 
 g3 包里永远有 CA，构建时按这个顺序确定：
 
@@ -84,7 +90,7 @@ g3 包里永远有 CA，构建时按这个顺序确定：
 打包前可以确认一下：
 
 ```sh
-ldd dist/g3-run-*/bin/g3proxy | grep 'not found'   # 应该没有输出
+ldd target/release/g3proxy | grep 'not found'   # 应该没有输出（打进包的就是这个二进制）
 ```
 
 注意这一条只证明**构建机**上库是齐的，不代表目标机齐——同一条命令在目标机上跑，才能看出
@@ -108,7 +114,8 @@ ldd dist/g3-run-*/bin/g3proxy | grep 'not found'   # 应该没有输出
 | `--static` | `PORTABILITY=static` | 关 | 在 `--portable` 之上把 glibc 也静态进去 |
 | `--netns=no` / `--netns=<绝对路径>` | `NETNS`/`NETNS_PATH` | `yes`、`/run/netns/ns-vpp` | 本包的服务单元是否写 `NetworkNamespacePath=` 及路径；两个包必须给同一个路径 |
 | `--build-args=` | `G3_BUILD_ARGS` | 空 | 原样附加给 cargo 的参数（逃生口） |
-| `--dist-dir=` | `DIST_DIR` | `<仓库>/dist` | 产物目录 |
+| `--dist-dir=` | `DIST_DIR` | `<仓库>/dist` | 产物目录，只放最终的 `.run` |
+|  | `WORK_DIR` | `<仓库>/target/pkg` | 组装工作区：包目录与中间归档，成功后清空 |
 
 脚本自己判断 c-ares：`pkg-config --atleast-version 1.18.0 libcares` 通过就用系统库，否则退回
 `vendored-c-ares`，与 `scripts/package` 里现有打包脚本的判定一致。`--portable` / `--static`
@@ -136,7 +143,7 @@ deploy/build_run_package.sh --portable --netns=no --dist-dir=dist-portable
 确认目标配置。这样打出来的二进制只剩 glibc 那套动态依赖：
 
 ```sh
-ldd dist-portable/g3-run-*/bin/g3proxy \
+ldd target/release/g3proxy \
   | grep -vE 'linux-vdso|libc\.so|libm\.so|libgcc_s|ld-linux'   # 应该没有输出
 ```
 
@@ -207,7 +214,8 @@ icap 包没有配置可加载，这一轮换成 `g3icap --version`（同样能�
 不能有任何 `GLIBC_` 符号版本要求），见上一节。
 
 只有真正交叉编译（`--target` 是别的三元组）才会打印跳过信息、跳过配置自检。
-这两步失败都不会出 `.run`，包目录留在 `--dist-dir`（默认 `dist/`）里供排查。
+这两步失败都不会出 `.run`，包目录留在工作区（`WORK_DIR`，默认 `target/pkg/`）里供排查——
+成功了反倒会把它删掉，`dist/` 只留那个 `.run`。
 
 ### 网络命名空间（NETNS）：三个服务必须在一个里
 
