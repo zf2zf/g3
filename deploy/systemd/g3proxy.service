@@ -3,6 +3,9 @@ Description=G3 Proxy (run package under @PREFIX@)
 Documentation=file://@PREFIX@/README.md
 After=syslog.target network-online.target
 Wants=network-online.target
+# 崩溃循环不能把端口永久留在 dead 状态：systemd 默认 10s/5 次就拒绝再启动，
+# 必须人工 reset-failed。这里取消速率上限，靠下面的退避把重启拉开。
+StartLimitIntervalSec=0
 
 [Service]
 Type=exec
@@ -15,8 +18,12 @@ ExecStart=@PREFIX@/bin/g3proxy -c @PREFIX@/conf/g3proxy.yaml --control-dir @CONT
 ExecReload=@PREFIX@/bin/g3proxy-ctl --control-dir @CONTROL_DIR@ -G @GROUP@ reload
 # 优雅下线：先置 offline 让在途连接收尾，再由 systemd 收进程
 ExecStop=@PREFIX@/bin/g3proxy-ctl --control-dir @CONTROL_DIR@ -G @GROUP@ -p $MAINPID offline
-KillMode=none
+KillMode=mixed
 Restart=on-failure
+# 固定 2s 退避即可，别用 RestartSteps/RestartMaxDelaySec：那是 systemd 254 才有的键，
+# 本包要覆盖的 Kylin V10 / Ubuntu 22.04（systemd 249）会把不认识的键静默忽略，
+# 配上 StartLimitIntervalSec=0 就变成 100ms 一次疯狂重启。
+RestartSec=2s
 SuccessExitStatus=SIGQUIT
 # 退出码 255 是配置/启动错误，别让它反复重启刷日志
 RestartPreventExitStatus=255

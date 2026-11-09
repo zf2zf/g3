@@ -172,8 +172,56 @@ cargo 才把 rustflags 只施加给目标工件，构建脚本与 proc-macro 走
 ```
 
 任一条不是 `statically linked`、或者还带着 `GLIBC_` 符号版本要求，打包直接失败——这种包发到
-老 glibc 的机器上就是白跑一趟，在构建机拦住比在目标机报错好。手工复核（在目标机上也该用这两条
-判断包对不对）：
+老 glibc 的机器上就是白跑一趟，在构建机拦住比在目标机报错好。
+
+> **`--static` 的包在 HTTPS 拦截下会崩，2026-11-09 实测（Ubuntu 22.04 / glibc 2.35 / x86-64-v3 构建机）。**
+> 现象是装完 40 秒内 g3proxy 反复 core-dump，glibc 报 `malloc(): unaligned tcache chunk detected`、
+> `free(): double free detected in tcache`、`malloc_consolidate(): invalid chunk size` 几种堆损坏变体，
+> 栈顶落在 OpenSSL 的 `tls_process_server_certificate → X509_new_ex → CRYPTO_malloc`（这里只是第一个
+> 撞上已损坏堆元数据的分配点，不是真凶），崩溃时另一线程正在 `x509_pubkey_ex_d2i_ex → OSSL_DECODER →
+> BIO_free` 上解证书。崩溃循环撞满 systemd 的默认速率上限后 unit 直接 failed，3128 无人监听。
+>
+> 同一份流量做的 2×2 差分把这个变量钉死了，而且**与这几天改的 keylog / ICAP / 上传审计代码无关**：
+> Nov-4 的老代码 `0dcc6c72` 打成的静态包同样在 20 秒内崩（`free(): too many chunks detected in tcache`），
+> 而动态 glibc 的包（`--portable`，内置 OpenSSL 4.0.2）跑 3360 条任务零崩溃、零解密错误。
+>
+> **静态产物还有第二个、更早出现的症状**：每一轮静态压测都带 `tlsv1 alert decrypt error`——客户端报告
+> 密钥材料错误，说明静态包在崩之前就已经在真实 TLS 会话上算错了密钥。实测比例（任务数：错误数）
+> 2:6、4:13、10:52、14:38、36:420、58:912；动态产物 0:3360。
+>
+> 崩溃点不固定，一次是 SIGSEGV 落在 `ossl_provider_ctx` 读 `prov->provctx`（入口已有 NULL 检查，
+> 传进来的指针非空但是悬垂），其余是 glibc 的 `malloc()/free()` 堆元数据断言。下面这些解释都已被
+> 实测否证，别再往里猜：
+>
+> - **不是 static-PIE 的自定位 / IRELATIVE**：改用 `-C relocation-model=static` 编出非 PIE 的普通静态
+>   二进制，2 轮内同样 `malloc(): unaligned tcache chunk`。
+> - **不是静态 TLS 模型不匹配**：`readelf -r` 里 `R_X86_64_TLSGD`/`TDESC` 数量为 0，静态产物根本不走
+>   `__tls_get_addr`。
+> - **不是 OpenSSL CPU 能力探测选错汇编路径**：`OPENSSL_ia32cap=0x0:0x0` 之后，崩溃与解密错误都照旧
+>   （这台机是 QEMU 虚拟 CPU，只有 `sse4_1 sse4_2 aes`，本来就容易踩这类坑）。
+> - **不是 glibc 分配器的可调项**：`GLIBC_TUNABLES=glibc.malloc.arena_max=1` 与
+>   `glibc.malloc.tcache_count=0` 都拦不住崩溃。
+> - **不是两份 OpenSSL 绑定共存**：`Cargo.lock` 只锁 `variant-ssl 0.17.37`（registry 里的 0.18.1 是
+>   别的项目留下的）；两个产物内都是单份 OpenSSL 4.0.2 符号。
+> - **不是普通的越界写 / use-after-free**：valgrind memcheck（自带分配器 + redzone）在静态产物上灌完
+>   472 条任务，`Invalid write/read/free` 一条都没有；仅有的"读未初始化值"聚类落在 glibc 的静态启动
+>   路径（`_dl_non_dynamic_init`/`_dl_init_paths`/`_dl_get_origin`、`getrandom`），属于启动噪声。
+>   写入目标始终是**仍然存活的对象**，所以 memcheck 结构上就看不见它。
+> - **和并行执行强相关**：`runtime.thread_number: 1` 时 456 条任务不崩；把 8 个 worker 的静态进程用
+>   `taskset -c 0` 绑到单个 CPU（并发连接数不变，只是没有真并行）420 条任务不崩——但解密错误照旧出现。
+>
+> 结论：这是**只在静态产物里出现、被真并行放大的内存损坏**，具体坏在哪一行仍未定位。要继续查只能上
+> ASAN/TSAN（本机 stable 1.95 不支持 `-Zsanitizer=address`，需要 nightly + `-Zbuild-std`，并且 vendored
+> OpenSSL 也要带 sanitizer 重编一遍）。在定位之前，**给 HTTPS 拦截场景用 `--static` 就是不可接受的**：
+> 它不是"偶尔 core dump"，而是先静默算错会话密钥。
+>
+> 因此：**目标机 glibc 不比构建机老就别用 `--static`，用 `--portable`**（一样内置 OpenSSL/c-ares，只是
+> 不静态 glibc）。真要给老 glibc 目标机出静态包，上线前必须按上面的方法压一遍：至少 2 个 worker 线程、
+> 几十路并发 HTTPS 拦截，确认既没有 core-dump、也没有 `alert decrypt error` 再装。单元里也已经加了 `StartLimitIntervalSec=0` +
+> `RestartSec=2s` + `KillMode=mixed`：崩了会自己带退避重启、不会把端口永久留在 dead 状态，`systemctl
+> stop` 也会连带收掉残留进程（`KillMode=none` 时那个残留能挂着好几天不放客户端连接）。
+>
+> 手工复核（在目标机上也该用这两条判断包对不对）：
 
 ```sh
 ldd bin/g3proxy bin/g3fcgen bin/g3proxy-ctl                    # 都该是 statically linked

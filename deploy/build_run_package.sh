@@ -251,6 +251,9 @@ if [ "$PORTABILITY" = static ]; then
 	RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C target-feature=+crt-static"
 	export RUSTFLAGS
 	echo "==> 静态链接 glibc：RUSTFLAGS=${RUSTFLAGS}，TARGET=${TARGET}"
+	echo "    注意：实测 --static 包在并发 HTTPS 拦截下会堆损坏 core-dump（thread_number=1 不复现，"
+	echo "    动态 glibc 同代码不崩），只有目标机 glibc 比构建机老才值得用这一档，理由与压测方法见"
+	echo "    doc/deploy-run-package.md 的 --static 一节。"
 fi
 
 # feature 必须写成 包名/feature：一次 -p 多个包时，不存在的裸 feature 名会让
