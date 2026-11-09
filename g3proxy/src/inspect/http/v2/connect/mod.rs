@@ -33,8 +33,8 @@ use g3_types::net::WebSocketNotes;
 
 use super::H2StreamTransferError;
 use crate::config::server::ServerConfig;
-use crate::inspect::http::upload_audit;
 use crate::inspect::StreamInspectContext;
+use crate::inspect::http::upload_audit;
 use crate::serve::ServerIdleChecker;
 
 mod standard;

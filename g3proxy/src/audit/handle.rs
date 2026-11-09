@@ -81,9 +81,7 @@ impl AuditHandle {
             websocket_inspect_policy: auditor.config.websocket_inspect_policy.build(),
             smtp_inspect_policy: auditor.config.smtp_inspect_policy.build(),
             imap_inspect_policy: auditor.config.imap_inspect_policy.build(),
-            upload_audit_sem: GaugeSemaphore::new(
-                auditor.config.upload_audit_max_concurrency,
-            ),
+            upload_audit_sem: GaugeSemaphore::new(auditor.config.upload_audit_max_concurrency),
             upload_audit_skipped: AtomicU64::new(0),
         }
     }

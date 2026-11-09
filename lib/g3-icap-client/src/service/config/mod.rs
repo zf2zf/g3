@@ -19,8 +19,9 @@
 //!   （如 `X-ICAP-Header`），不在名单内的扩展头会被丢弃；
 //! - `bypass`：ICAP 服务故障时是否放行流量（true = 降级放行；false = 拒绝）；
 //! - `log_audit_header`：把送审的头部（ICAP 头 + 封装的 HTTP 请求头，不含正文）
-//!   以 info 级打出来，供现场排查送审内容；关闭时只保留 debug 级那一条。
-//!   两者都要进程带 `-v` 启动才看得到（库的 `log` 记录默认只放行 warn 及以上）。
+//!   以 info 级打出来，供现场排查送审内容；关闭时退回只留 debug 级那一条。
+//!   应用方（g3proxy）解析到该开关打开时会自动把 `log` 的级别门限放到 info，
+//!   现场开开关不需要给进程加 `-v`；debug 那条仍需 `-vv` 才可见。
 //!
 //! 请求头拼装：[`IcapServiceConfig::build_request_header`] 产出"请求头前缀"
 //! （请求行 + Host + User-Agent + Authorization），上层协议适配器在此基础上
@@ -167,6 +168,11 @@ impl IcapServiceConfig {
     /// 送审头部日志开关：true = 每次送审以 info 级打出头部（正文不打，密钥头屏蔽）。
     pub fn set_log_audit_header(&mut self, enabled: bool) {
         self.log_audit_header = enabled;
+    }
+
+    /// 送审头部日志开关是否打开（见 [`Self::set_log_audit_header`]）。
+    pub fn log_audit_header_enabled(&self) -> bool {
+        self.log_audit_header
     }
 
     /// 向 RESPMOD 响应头白名单中添加一项；内部以小写字符串存储。

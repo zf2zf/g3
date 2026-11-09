@@ -307,9 +307,11 @@ where
                             .end_to_end_headers
                             .get(header::CONTENT_TYPE)
                             .map(|v| v.to_str());
-                        let audit_body = body_type.zip(
-                            upload_audit::h1_upload_audit(cfg, body_type, content_type),
-                        );
+                        let audit_body = body_type.zip(upload_audit::h1_upload_audit(
+                            cfg,
+                            body_type,
+                            content_type,
+                        ));
 
                         match (audit_body, self.ctx.audit_handle.icap_reqmod_client()) {
                             (Some((body_type, body_framing)), Some(reqmod_client)) => {

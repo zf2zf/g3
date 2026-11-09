@@ -163,9 +163,9 @@ HTTP 转发任务日志里与旁路上报相关的字段：
 HTTP 请求头——正文一个字节都不打，`X-TLS-*` 密钥行的值屏蔽成 `***`。
 开关关着时这段内容仍按 debug 级打，开关只是免去逐条改代码或抓包。
 
-看这条日志要给 g3proxy 加 `-v`：库里的 `log` 记录经桥进进程日志时，默认（不带 `-v`）
-只放行 warn 及以上，info/debug 会被丢掉。现场排查就
-`systemctl edit g3proxy` 给 `ExecStart` 补一个 `-v` 再重启，查完撤掉。
+这条日志是 info 级，g3proxy 检测到开关打开会自动把库日志的级别门限放到 info，
+`journalctl -u g3proxy -f` 直接可见，不用改 `ExecStart` 加 `-v`；开关关着时那条
+debug 仍需 `-vv` 才看得到。
 
 ## 7. 在部署环境把链路验一遍
 

@@ -24,11 +24,7 @@ use http::Version;
 
 /// ICAP `X-Transformed-From` 的协议来源取值：客户端侧走 TLS 就是 `HTTPS`。
 pub(crate) const fn scheme_tag(over_tls: bool) -> &'static str {
-    if over_tls {
-        "HTTPS"
-    } else {
-        "HTTP"
-    }
+    if over_tls { "HTTPS" } else { "HTTP" }
 }
 
 /// ICAP `X-Http-Version` 的取值；无法识别的版本返回 `None`（不发这个头）。
@@ -201,7 +197,10 @@ mod tests {
     #[test]
     fn h1_read_until_end_is_not_audited() {
         let cfg = config(true, 0, false);
-        assert_eq!(h1_upload_audit(&cfg, Some(HttpBodyType::ReadUntilEnd), None), None);
+        assert_eq!(
+            h1_upload_audit(&cfg, Some(HttpBodyType::ReadUntilEnd), None),
+            None
+        );
     }
 
     #[test]
@@ -274,7 +273,12 @@ mod tests {
         );
         assert_eq!(h2_upload_audit(&cfg, true, Some(100), None), None);
         assert_eq!(
-            h2_upload_audit(&cfg, true, Some(1000), Some("application/x-www-form-urlencoded")),
+            h2_upload_audit(
+                &cfg,
+                true,
+                Some(1000),
+                Some("application/x-www-form-urlencoded")
+            ),
             None
         );
     }

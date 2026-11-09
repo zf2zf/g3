@@ -132,9 +132,10 @@ For *map* value, the keys are:
 
   When disabled (the default), the ICAP request header is still logged at *debug* level.
 
-  Note that these records are emitted by the library *log* facade, which is bridged
-  into the process log at *info* and above only when g3proxy is started with the
-  `-v` flag. Without it, only *warn* and above are passed through.
+  These records are emitted by the library *log* facade, which is bridged into the
+  process log at *warn* and above by default. Enabling this option makes g3proxy
+  raise the level automatically so the *info* records show up without the `-v`
+  flag; the *debug* line mentioned above still requires `-vv`.
 
   This config option now only apply to the bypass upload audit pipeline.
 

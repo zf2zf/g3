@@ -454,4 +454,3 @@ impl<I: IdleCheck> HttpResponseAdapter<I> {
         }
     }
 }
-

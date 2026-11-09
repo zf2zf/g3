@@ -22,13 +22,11 @@ h1_interception:
   req_hasbody: true
   req_body_min_size: 8
 
-# ICAP 服务配置
-icap_reqmod_service: icap://127.0.0.1:1344/icap_audit
-# 排查送审内容时改成 map 形态，多一个 log_audit_header 开关：把每条送审的
-# ICAP 头 + 封装的请求头打进日志，正文不打，X-TLS-* 密钥值屏蔽成 ***。
-# 看这条日志要给 g3proxy 加 -v，否则 info 会被日志桥丢掉。
-# icap_reqmod_service:
-#   url: icap://127.0.0.1:1344/icap_audit
-#   log_audit_header: true
+# ICAP 服务配置。log_audit_header: true 时把每条送审的 ICAP 头 + 封装的请求头
+# 打进日志（正文不打，X-TLS-* 密钥值屏蔽成 ***）；g3proxy 检测到该开关会自动
+# 把库日志门限放到 info，无需加 -v。默认 false（退回 debug 级，要 -vv 才看到）。
+icap_reqmod_service:
+  url: icap://127.0.0.1:1344/icap_audit
+  log_audit_header: false
 
 application_audit_ratio: 1.0

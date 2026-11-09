@@ -41,7 +41,7 @@ use crate::config::server::ServerConfig;
 use crate::config::server::ftp_proxy::{FtpProxyServerConfig, TlsUpstreamType};
 use crate::escape::ArcEscaper;
 use crate::module::tcp_connect::{TcpConnectTaskConf, TcpConnectTaskNotes, TlsConnectTaskConf};
-use crate::serve::audit_bridge::{run_upload_audit_or_relay, UploadAuditContext};
+use crate::serve::audit_bridge::{UploadAuditContext, run_upload_audit_or_relay};
 use crate::serve::{ServerTaskError, ServerTaskNotes, ServerTaskStage};
 
 /// 控制任务与其派生的数据通道任务共用的上下文。
@@ -381,132 +381,132 @@ impl FtpProxyTask {
             clt_line.clear();
 
             tokio::select! {
-                            biased;
+                biased;
 
-                            n = read_line_limited(&mut clt_reader, &mut clt_line) => {
-                                match n {
-                                    // 客户端主动关闭控制连接
-                                    Ok(0) => return Ok(()),
-                                    Ok(n) => {
-                                        self.ctx.server_stats.add_control_in_bytes(n as u64);
-                                        // 收到命令即视为活动，清零空闲计数
-                                        idle_count = 0;
+                n = read_line_limited(&mut clt_reader, &mut clt_line) => {
+                    match n {
+                        // 客户端主动关闭控制连接
+                        Ok(0) => return Ok(()),
+                        Ok(n) => {
+                            self.ctx.server_stats.add_control_in_bytes(n as u64);
+                            // 收到命令即视为活动，清零空闲计数
+                            idle_count = 0;
 
-                                        // 上传命令：拦截数据通道，客户端 -> 上游，可选审计
-                                        if is_upload_command(&clt_line) {
-                                            if ups_w.write_all(&clt_line).await.is_err() {
-                                                return Ok(());
-                                            }
-                                            handle_upload_data_channel(
-                                                &mut clt_w,
-                                                &mut ups_r,
-                                                &self.ctx,
-                                                self.max_idle_count,
-                                                pending_data.take(),
-                                                &clt_line,
-                                            ).await;
-                                            continue;
-                                        } else if is_data_channel_command(&clt_line) {
-                                            // LIST / NLST / RETR: need data channel, server → client direction.
-                                            // 下载/列目录：数据通道方向为上游 -> 客户端
-                                            if ups_w.write_all(&clt_line).await.is_err() {
-                                                return Ok(());
-                                            }
-                                            // Forward the server's 150/125 "starting data connection" response.
-                                            // 先透传 150/125 “正在打开数据连接”应答
-                                            if let Some(resp) = read_ftp_response(&mut ups_r).await {
-                                                let _ = clt_w.write_all(&resp).await;
-                                            }
-                                            // 消费 PASV/EPSV 阶段预留的监听，完成一次数据转发
-                                            if let Some(pending) = pending_data.take() {
-                                                handle_download_data_channel(
-                                                    pending,
-                                                    self.ctx.idle_wheel.clone(),
-                                                    self.max_idle_count,
-                                                ).await;
-                                            }
-                                            // Forward the server's 226 "transfer complete" response.
-                                            // 再透传 226 “传输完成”应答
-                                            if let Some(resp) = read_ftp_response(&mut ups_r).await {
-                                                let _ = clt_w.write_all(&resp).await;
-                                            }
-                                            continue;
-                                        } else if is_pasv_command(&clt_line) {
-                                            // 客户端请求被动模式：向上游取回数据地址，
-                                            // 在本机另开监听，并把应答改写成本机的监听地址。
-                                            // 若已存在待用通道则不再重复协商，直接透传。
-                                            if pending_data.is_none() {
-                                                if ups_w.write_all(&clt_line).await.is_err() {
-                                                    return Ok(());
-                                                }
-                                                if let Some(resp_bytes) = read_ftp_response(&mut ups_r).await {
-                                                    if let Some(ups_data_addr) = parse_pasv_response(&resp_bytes, self.upstream_ip) && let Some(listener) = open_local_data_listener().await {
-
-                                                        let rewritten = if is_epsv_command(&clt_line) {
-                                                            // EPSV: keep (|||port|) format, just rewrite port.
-                                                            // EPSV：保留 (|||port|) 管道格式，只替换端口
-                                                            rewrite_epsv_response(&resp_bytes, listener.local_addr().map(|a| a.port()).unwrap_or(0))
-                                                        } else {
-                                                            // PASV: rewrite with proxy IP + listener port.
-                                                            // PASV：替换为代理地址 + 监听端口
-                                                            let proxy_addr = std::net::SocketAddr::V4(
-                                                                std::net::SocketAddrV4::new(
-                                                                    Ipv4Addr::LOCALHOST,
-                                                                    listener.local_addr().map(|a| a.port()).unwrap_or(0),
-                                                                ),
-                                                            );
-                                                            rewrite_pasv_response(&resp_bytes, Some(proxy_addr))
-                                                        };
-                                                        let _ = clt_w.write_all(&rewritten).await;
-                                                        // 记下本机监听与上游真实数据地址，等待后续命令消费
-                                                        pending_data = Some(PendingDataChannel {
-                                                            listener: Arc::new(listener),
-                                                            upstream_data_addr: ups_data_addr,
-                                                        });
-                                                        continue;
-                                                    }
-                                                    // 解析或建监听失败：原样透传上游应答，退化为直连数据通道
-                                                    let _ = clt_w.write_all(&resp_bytes).await;
-                                                }
-                                                continue;
-                                            } else if ups_w.write_all(&clt_line).await.is_err() {
-                                                return Ok(());
-                                            }
-                                        } else if ups_w.write_all(&clt_line).await.is_err() {
-                                            // 其余命令（USER/PASS/CWD/QUIT 等）原样透传
-                                            return Ok(());
-                                        }
-                                    }
-                                    Err(_) => return Ok(()),
-                                }
-                            }
-
-                            n = ups_r.read(&mut ups_buf) => {
-                                // 上游控制通道的其它输出（多为命令应答）直接透传给客户端
-                                match n {
-                                    Ok(0) => return Ok(()),
-                                    Ok(n) => {
-                                        self.ctx.server_stats.add_control_out_bytes(n as u64);
-                                        if clt_w.write_all(&ups_buf[..n]).await.is_err() {
-                                            return Ok(());
-                                        }
-                                    }
-                                    Err(_) => return Ok(()),
-                                }
-                            }
-
-                            _ = idle_interval.tick() => {
-                                // 空闲检测：连续 tick 达到上限则断开；
-                                // 服务器要求强制退出时立即断开
-                                idle_count += 1;
-                                if idle_count >= self.max_idle_count {
+                            // 上传命令：拦截数据通道，客户端 -> 上游，可选审计
+                            if is_upload_command(&clt_line) {
+                                if ups_w.write_all(&clt_line).await.is_err() {
                                     return Ok(());
                                 }
-                                if self.ctx._server_quit_policy.force_quit() {
+                                handle_upload_data_channel(
+                                    &mut clt_w,
+                                    &mut ups_r,
+                                    &self.ctx,
+                                    self.max_idle_count,
+                                    pending_data.take(),
+                                    &clt_line,
+                                ).await;
+                                continue;
+                            } else if is_data_channel_command(&clt_line) {
+                                // LIST / NLST / RETR: need data channel, server → client direction.
+                                // 下载/列目录：数据通道方向为上游 -> 客户端
+                                if ups_w.write_all(&clt_line).await.is_err() {
                                     return Ok(());
                                 }
+                                // Forward the server's 150/125 "starting data connection" response.
+                                // 先透传 150/125 “正在打开数据连接”应答
+                                if let Some(resp) = read_ftp_response(&mut ups_r).await {
+                                    let _ = clt_w.write_all(&resp).await;
+                                }
+                                // 消费 PASV/EPSV 阶段预留的监听，完成一次数据转发
+                                if let Some(pending) = pending_data.take() {
+                                    handle_download_data_channel(
+                                        pending,
+                                        self.ctx.idle_wheel.clone(),
+                                        self.max_idle_count,
+                                    ).await;
+                                }
+                                // Forward the server's 226 "transfer complete" response.
+                                // 再透传 226 “传输完成”应答
+                                if let Some(resp) = read_ftp_response(&mut ups_r).await {
+                                    let _ = clt_w.write_all(&resp).await;
+                                }
+                                continue;
+                            } else if is_pasv_command(&clt_line) {
+                                // 客户端请求被动模式：向上游取回数据地址，
+                                // 在本机另开监听，并把应答改写成本机的监听地址。
+                                // 若已存在待用通道则不再重复协商，直接透传。
+                                if pending_data.is_none() {
+                                    if ups_w.write_all(&clt_line).await.is_err() {
+                                        return Ok(());
+                                    }
+                                    if let Some(resp_bytes) = read_ftp_response(&mut ups_r).await {
+                                        if let Some(ups_data_addr) = parse_pasv_response(&resp_bytes, self.upstream_ip) && let Some(listener) = open_local_data_listener().await {
+
+                                            let rewritten = if is_epsv_command(&clt_line) {
+                                                // EPSV: keep (|||port|) format, just rewrite port.
+                                                // EPSV：保留 (|||port|) 管道格式，只替换端口
+                                                rewrite_epsv_response(&resp_bytes, listener.local_addr().map(|a| a.port()).unwrap_or(0))
+                                            } else {
+                                                // PASV: rewrite with proxy IP + listener port.
+                                                // PASV：替换为代理地址 + 监听端口
+                                                let proxy_addr = std::net::SocketAddr::V4(
+                                                    std::net::SocketAddrV4::new(
+                                                        Ipv4Addr::LOCALHOST,
+                                                        listener.local_addr().map(|a| a.port()).unwrap_or(0),
+                                                    ),
+                                                );
+                                                rewrite_pasv_response(&resp_bytes, Some(proxy_addr))
+                                            };
+                                            let _ = clt_w.write_all(&rewritten).await;
+                                            // 记下本机监听与上游真实数据地址，等待后续命令消费
+                                            pending_data = Some(PendingDataChannel {
+                                                listener: Arc::new(listener),
+                                                upstream_data_addr: ups_data_addr,
+                                            });
+                                            continue;
+                                        }
+                                        // 解析或建监听失败：原样透传上游应答，退化为直连数据通道
+                                        let _ = clt_w.write_all(&resp_bytes).await;
+                                    }
+                                    continue;
+                                } else if ups_w.write_all(&clt_line).await.is_err() {
+                                    return Ok(());
+                                }
+                            } else if ups_w.write_all(&clt_line).await.is_err() {
+                                // 其余命令（USER/PASS/CWD/QUIT 等）原样透传
+                                return Ok(());
                             }
                         }
+                        Err(_) => return Ok(()),
+                    }
+                }
+
+                n = ups_r.read(&mut ups_buf) => {
+                    // 上游控制通道的其它输出（多为命令应答）直接透传给客户端
+                    match n {
+                        Ok(0) => return Ok(()),
+                        Ok(n) => {
+                            self.ctx.server_stats.add_control_out_bytes(n as u64);
+                            if clt_w.write_all(&ups_buf[..n]).await.is_err() {
+                                return Ok(());
+                            }
+                        }
+                        Err(_) => return Ok(()),
+                    }
+                }
+
+                _ = idle_interval.tick() => {
+                    // 空闲检测：连续 tick 达到上限则断开；
+                    // 服务器要求强制退出时立即断开
+                    idle_count += 1;
+                    if idle_count >= self.max_idle_count {
+                        return Ok(());
+                    }
+                    if self.ctx._server_quit_policy.force_quit() {
+                        return Ok(());
+                    }
+                }
+            }
         }
     }
 }

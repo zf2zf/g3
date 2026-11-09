@@ -127,122 +127,122 @@ impl FtpOverConnectBridge {
             clt_line.clear();
 
             tokio::select! {
-                            biased;
+                biased;
 
-                            n = clt_reader.read_until(b'\n', &mut clt_line) => {
-                                match n {
-                                    Ok(0) => break,
-                                    Ok(_n) => {
-                                        if is_upload_command(&clt_line) {
-                                            // Forward the STOR/APPE upstream and wait for
-                                            // the "150 opening..." reply.
-                                            // 先把 STOR/APPE 发给上游，并等待“正在打开数据连接”应答
-                                            if ups_writer.write_all(&clt_line).await.is_err() {
-                                                break;
-                                            }
-                                            if let Some(resp) = read_ftp_response(&mut ups_reader).await {
-                                                let _ = clt_w.write_all(&resp).await;
-                                            }
+                n = clt_reader.read_until(b'\n', &mut clt_line) => {
+                    match n {
+                        Ok(0) => break,
+                        Ok(_n) => {
+                            if is_upload_command(&clt_line) {
+                                // Forward the STOR/APPE upstream and wait for
+                                // the "150 opening..." reply.
+                                // 先把 STOR/APPE 发给上游，并等待“正在打开数据连接”应答
+                                if ups_writer.write_all(&clt_line).await.is_err() {
+                                    break;
+                                }
+                                if let Some(resp) = read_ftp_response(&mut ups_reader).await {
+                                    let _ = clt_w.write_all(&resp).await;
+                                }
 
-                                            // Drain the data channel through the audit pipeline.
-                                            // 把数据通道引流到审计链路
-                                            if let Some((listener, ups_data_addr)) = pending_data.take() {
-                                                let _ = self.process_upload(listener, ups_data_addr).await;
-                                            }
+                                // Drain the data channel through the audit pipeline.
+                                // 把数据通道引流到审计链路
+                                if let Some((listener, ups_data_addr)) = pending_data.take() {
+                                    let _ = self.process_upload(listener, ups_data_addr).await;
+                                }
 
-                                            // Forward the "226 transfer complete..." reply.
-                                            // 再透传“传输完成”应答
-                                            if let Some(resp) = read_ftp_response(&mut ups_reader).await {
-                                                let _ = clt_w.write_all(&resp).await;
-                                            }
-                                        } else if is_data_channel_command(&clt_line) {
-                                            // STOR/APPE/STOU/LIST/NLST/RETR all need the data channel.
-                                            // Forward the command and wait for the server's 150 reply.
-                                            // 取/存类命令都需要数据通道：转发命令并等待 150 应答
-                                            if ups_writer.write_all(&clt_line).await.is_err() {
-                                                break;
-                                            }
-                                            if let Some(resp) = read_ftp_response(&mut ups_reader).await {
-                                                let _ = clt_w.write_all(&resp).await;
-                                            }
+                                // Forward the "226 transfer complete..." reply.
+                                // 再透传“传输完成”应答
+                                if let Some(resp) = read_ftp_response(&mut ups_reader).await {
+                                    let _ = clt_w.write_all(&resp).await;
+                                }
+                            } else if is_data_channel_command(&clt_line) {
+                                // STOR/APPE/STOU/LIST/NLST/RETR all need the data channel.
+                                // Forward the command and wait for the server's 150 reply.
+                                // 取/存类命令都需要数据通道：转发命令并等待 150 应答
+                                if ups_writer.write_all(&clt_line).await.is_err() {
+                                    break;
+                                }
+                                if let Some(resp) = read_ftp_response(&mut ups_reader).await {
+                                    let _ = clt_w.write_all(&resp).await;
+                                }
 
-                                            // Consume the pending listener and relay data.
-                                            // 消费掉预留的监听并按方向完成一次数据转发
-                                            if let Some((listener, ups_data_addr)) = pending_data.take() {
-                                                if is_upload_command(&clt_line) {
-                                                    // Upload: client → server, audit-enabled path.
-                                                    // 上传：客户端 -> 服务器，走可审计路径
-                                                    let _ = self.process_upload(listener, ups_data_addr).await;
+                                // Consume the pending listener and relay data.
+                                // 消费掉预留的监听并按方向完成一次数据转发
+                                if let Some((listener, ups_data_addr)) = pending_data.take() {
+                                    if is_upload_command(&clt_line) {
+                                        // Upload: client → server, audit-enabled path.
+                                        // 上传：客户端 -> 服务器，走可审计路径
+                                        let _ = self.process_upload(listener, ups_data_addr).await;
+                                    } else {
+                                        // Download/List: server → client, plain relay path.
+                                        // 下载/列目录：服务器 -> 客户端，走普通转发路径
+                                        let _ = process_download(listener, ups_data_addr).await;
+                                    }
+                                }
+
+                                // Forward the server's 226 "transfer complete" response.
+                                // 透传 226 “传输完成”应答
+                                if let Some(resp) = read_ftp_response(&mut ups_reader).await {
+                                    let _ = clt_w.write_all(&resp).await;
+                                }
+                            } else if is_pasv_command(&clt_line) {
+                                // Client requests passive mode: open a listener and rewrite
+                                // the server's reply to point at us.
+                                // 客户端请求被动模式：本机开监听，并把服务端应答改写指向我们
+                                if pending_data.is_none() {
+                                    if ups_writer.write_all(&clt_line).await.is_err() {
+                                        break;
+                                    }
+                                    if let Some(resp_bytes) = read_ftp_response(&mut ups_reader).await {
+                                        if let Some(ups_data_addr) = parse_pasv_response(&resp_bytes, self.upstream_ip) {
+                                            let bind_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
+                                            if let Ok(listener) = TcpListener::bind(bind_addr).await && let Ok(local_addr) = listener.local_addr() {
+
+                                                let rewritten = if is_epsv_command(&clt_line) {
+                                                    // EPSV: keep the (|||port|) pipe format, just replace port.
+                                                    // EPSV：保留 (|||port|) 管道格式，只替换端口
+                                                    rewrite_epsv_response(&resp_bytes, local_addr.port())
                                                 } else {
-                                                    // Download/List: server → client, plain relay path.
-                                                    // 下载/列目录：服务器 -> 客户端，走普通转发路径
-                                                    let _ = process_download(listener, ups_data_addr).await;
-                                                }
-                                            }
-
-                                            // Forward the server's 226 "transfer complete" response.
-                                            // 透传 226 “传输完成”应答
-                                            if let Some(resp) = read_ftp_response(&mut ups_reader).await {
-                                                let _ = clt_w.write_all(&resp).await;
-                                            }
-                                        } else if is_pasv_command(&clt_line) {
-                                            // Client requests passive mode: open a listener and rewrite
-                                            // the server's reply to point at us.
-                                            // 客户端请求被动模式：本机开监听，并把服务端应答改写指向我们
-                                            if pending_data.is_none() {
-                                                if ups_writer.write_all(&clt_line).await.is_err() {
-                                                    break;
-                                                }
-                                                if let Some(resp_bytes) = read_ftp_response(&mut ups_reader).await {
-                                                    if let Some(ups_data_addr) = parse_pasv_response(&resp_bytes, self.upstream_ip) {
-                                                        let bind_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
-                                                        if let Ok(listener) = TcpListener::bind(bind_addr).await && let Ok(local_addr) = listener.local_addr() {
-
-                                                            let rewritten = if is_epsv_command(&clt_line) {
-                                                                // EPSV: keep the (|||port|) pipe format, just replace port.
-                                                                // EPSV：保留 (|||port|) 管道格式，只替换端口
-                                                                rewrite_epsv_response(&resp_bytes, local_addr.port())
-                                                            } else {
-                                                                // PASV: replace with proxy IP + listener port.
-                                                                // PASV：替换为代理地址 + 监听端口
-                                                                let proxy_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, local_addr.port()));
-                                                                rewrite_pasv_response(&resp_bytes, Some(proxy_addr))
-                                                            };
-                                                            let _ = clt_w.write_all(&rewritten).await;
-                                                            pending_data = Some((Arc::new(listener), ups_data_addr));
-                                                            continue;
-                                                        }
-                                                    }
-                                                    // Fall through: forward the original response if anything failed.
-                                                    // 解析或监听创建失败：原样透传应答
-                                                    let _ = clt_w.write_all(&resp_bytes).await;
-                                                }
+                                                    // PASV: replace with proxy IP + listener port.
+                                                    // PASV：替换为代理地址 + 监听端口
+                                                    let proxy_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, local_addr.port()));
+                                                    rewrite_pasv_response(&resp_bytes, Some(proxy_addr))
+                                                };
+                                                let _ = clt_w.write_all(&rewritten).await;
+                                                pending_data = Some((Arc::new(listener), ups_data_addr));
                                                 continue;
-                                            } else if ups_writer.write_all(&clt_line).await.is_err() {
-                                                break;
                                             }
-                                        } else if ups_writer.write_all(&clt_line).await.is_err() {
-                                            // 其它命令原样透传
-                                            break;
                                         }
+                                        // Fall through: forward the original response if anything failed.
+                                        // 解析或监听创建失败：原样透传应答
+                                        let _ = clt_w.write_all(&resp_bytes).await;
                                     }
-                                    Err(_) => break,
+                                    continue;
+                                } else if ups_writer.write_all(&clt_line).await.is_err() {
+                                    break;
                                 }
-                            }
-
-                            n = ups_reader.read(&mut ups_buf) => {
-                                // 上游的其它输出（多为命令应答）直接透传给客户端
-                                match n {
-                                    Ok(0) => break,
-                                    Ok(n) => {
-                                        if clt_w.write_all(&ups_buf[..n]).await.is_err() {
-                                            break;
-                                        }
-                                    }
-                                    Err(_) => break,
-                                }
+                            } else if ups_writer.write_all(&clt_line).await.is_err() {
+                                // 其它命令原样透传
+                                break;
                             }
                         }
+                        Err(_) => break,
+                    }
+                }
+
+                n = ups_reader.read(&mut ups_buf) => {
+                    // 上游的其它输出（多为命令应答）直接透传给客户端
+                    match n {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if clt_w.write_all(&ups_buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
         }
     }
 
@@ -261,23 +261,17 @@ impl FtpOverConnectBridge {
 
         // CONNECT 模式下拿不到原始命令串（控制通道由隧道对端持有），
         // 因此命令名与路径只能填占位值，审计侧仅能按“存在一次上传”处理。
-        let audit_ctx = self
-            .icap_client
-            .as_ref()
-            .map(|client| UploadAuditContext {
-                icap_client: client.clone(),
-                idle_wheel: self.idle_wheel.clone(),
-                max_idle_count: 60, // 60 ticks × 1s interval = 60s idle timeout
-                copy_config: self.server_config.limited_copy_config(),
-                client_addr: Some(self.cc_info.client_addr()),
-                username: None,
-                framing: g3_icap_client::reqmod::ftp::build_ftp_framing(
-                    "STOR",
-                    "ftp-over-connect",
-                ),
-                data_channel_tuple: None,
-                keylog_buffer: None,
-            });
+        let audit_ctx = self.icap_client.as_ref().map(|client| UploadAuditContext {
+            icap_client: client.clone(),
+            idle_wheel: self.idle_wheel.clone(),
+            max_idle_count: 60, // 60 ticks × 1s interval = 60s idle timeout
+            copy_config: self.server_config.limited_copy_config(),
+            client_addr: Some(self.cc_info.client_addr()),
+            username: None,
+            framing: g3_icap_client::reqmod::ftp::build_ftp_framing("STOR", "ftp-over-connect"),
+            data_channel_tuple: None,
+            keylog_buffer: None,
+        });
 
         let _ = run_upload_audit_or_relay(
             &mut clt_conn,

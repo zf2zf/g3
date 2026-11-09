@@ -135,6 +135,20 @@ impl Auditor {
     /// 引流客户端初始化时会 spawn 其 QUIC 连接池任务，因此该调用对 ICAP 只建对象、
     /// 对引流会真正拉起后台连接维护任务。
     fn set_agent_clients(&mut self) -> anyhow::Result<()> {
+        // 送审头日志（log_audit_header）是 info 级的 log 桥记录，默认门限（不带 -v）只放行 warn。
+        // 这条日志本来就是现场用开关主动打开的，门限随开关一起放开，省掉改 ExecStart 加 -v 这一步；
+        // 量与审计请求数同阶，远小于每请求必打的 Inspect/Intercept。门限只会抬高不回退，
+        // reload 关掉开关后不再打印的是这条本身，其余库的 info 日志会持续到进程重启。
+        let audit_header_logging = [
+            self.config.icap_reqmod_service.as_deref(),
+            self.config.icap_respmod_service.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|c| c.log_audit_header_enabled());
+        if audit_header_logging && log::max_level() < log::LevelFilter::Info {
+            log::set_max_level(log::LevelFilter::Info);
+        }
         if let Some(c) = self.config.icap_reqmod_service.clone() {
             self.icap_reqmod_service = Some(Arc::new(
                 IcapServiceClient::new(c).context("failed to create ICAP REQMOD client")?,

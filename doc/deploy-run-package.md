@@ -414,16 +414,15 @@ ss -lntp | grep -E '1344|2999'                                 # 监听在该命
 不想抓包、也不想只看 g3icap 那侧，可以让代理自己把送审的头部打出来：把 auditor 的
 `icap_reqmod_service` 改成 map 形态，加 `log_audit_header: true`，再重载 auditor 即可。
 它每送一条就打一行 `Bypass ICAP audit header (...)`，内容是 ICAP 请求头加封装的 HTTP
-请求头——正文一个字节不打，`X-TLS-*` 密钥行的值屏蔽成 `***`。这条记录是 info 级，而库的
-`log` 记录默认只放行 warn 及以上，所以要给 g3proxy 补一个 `-v` 才看得见：
+请求头——正文一个字节不打，`X-TLS-*` 密钥行的值屏蔽成 `***`。这条记录是 info 级，
+g3proxy 检测到开关打开会自动把库日志的级别门限放到 info，不用给进程加 `-v`：
 
 ```sh
-sudo systemctl edit g3proxy      # [Service] 里把 ExecStart 末尾补上 -v
-sudo systemctl daemon-reload && sudo systemctl restart g3proxy
 journalctl -u g3proxy -f | grep 'Bypass ICAP audit header'
 ```
 
-查完把开关关掉、`-v` 撤掉：这条日志里带着完整的请求头（Cookie、Authorization 之类都在），
+查完把开关关掉再 reload（关掉后这条本身不再打印；期间其他库的 info 日志会持续到
+进程重启）。这条日志里带着完整的请求头（Cookie、Authorization 之类都在），
 只适合排障时短期开。
 
 reload 走 `g3proxy-ctl reload`，可以只重载某一类：

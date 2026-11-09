@@ -277,10 +277,10 @@ impl<I: IdleCheck> BypassAdapter<I> {
     }
 
     /// 送审头部的调试日志：正文一律不打，只把 ICAP 请求头与封装的 HTTP 请求头打出来。
-    /// 开关 `log_audit_header` 打开时走 info 级，关掉时退回原来的 debug 一条——两者都要
-    /// 求 g3proxy 带 `-v` 启动：库代码的 `log` 记录经桥进 slog，默认（不带 `-v`）只放行
-    /// warn 及以上。两个级别都屏蔽承载密钥的 X-TLS-* 头——TLS 会话密钥进了日志，
-    /// 等于把同一批抓包一并解密了。
+    /// 开关 `log_audit_header` 打开时走 info 级，关掉时退回原来的 debug 一条。g3proxy
+    /// 解析到开关打开会自动把 `log` 的级别门限放到 info，现场开开关不需要给进程加 `-v`；
+    /// 开关关着要看那条 debug 则仍需 `-vv`。两个级别都屏蔽承载密钥的 X-TLS-* 头——
+    /// TLS 会话密钥进了日志，等于把同一批抓包一并解密了。
     fn log_audit_header(&self, icap_header: &[u8], req_hdr: &[u8]) {
         let enabled = self.icap_client.config.log_audit_header;
         if !enabled && log::max_level() < log::Level::Debug {
