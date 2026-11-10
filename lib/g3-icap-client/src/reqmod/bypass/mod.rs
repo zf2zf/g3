@@ -997,15 +997,16 @@ fn masked_header_lines(header: &[u8]) -> String {
         .join("\n")
 }
 
-/// 是否是承载密钥的 ICAP 扩展头：`X-TLS-` 前缀里只有版本、密码套件和 server
-/// random 是握手公开值，其余条目（`X-TLS-<LABEL>: <client_random> <secret>`）
-/// 都是 TLS keylog，不能进日志。
+/// 是否是承载密钥的 ICAP 扩展头：`X-TLS-` 前缀里只有版本、密码套件和两个握手
+/// 随机数是 ClientHello/ServerHello 里的明文公开值，其余条目
+/// （`X-TLS-MASTER-SECRET`、TLS 1.3 的 `<client_random> <secret>` 流量密钥）
+/// 都是 keylog 秘密，不能进日志。
 fn is_keylog_header(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     name.starts_with("x-tls-")
         && !matches!(
             name.as_str(),
-            "x-tls-version" | "x-tls-cipher" | "x-tls-server_random"
+            "x-tls-version" | "x-tls-cipher-suite" | "x-tls-server-random" | "x-tls-client-random"
         )
 }
 
@@ -1856,6 +1857,7 @@ mod tests {
         let client_random = "bb".repeat(32);
         let secret = "cc".repeat(32);
         keylog.set_server_random(server_random.clone());
+        keylog.set_cipher_suite(0x1302); // TLS_AES_256_GCM_SHA384
         assert!(keylog.add(
             "CLIENT_RANDOM".to_string(),
             client_random.clone(),
@@ -1911,8 +1913,10 @@ mod tests {
             "X-Remote-IP: 198.51.100.9\r\n",
             "X-Remote-PORT: 21\r\n",
             "X-Proto-P: 6\r\n",
-            &format!("X-TLS-SERVER_RANDOM: {server_random}\r\n"),
-            &format!("X-TLS-CLIENT_RANDOM: {client_random} {secret}\r\n"),
+            "X-TLS-CIPHER-SUITE: 4866\r\n",
+            &format!("X-TLS-SERVER-RANDOM: {server_random}\r\n"),
+            &format!("X-TLS-CLIENT-RANDOM: {client_random}\r\n"),
+            &format!("X-TLS-MASTER-SECRET: {secret}\r\n"),
             &format!("Encapsulated: req-hdr=0, req-body={}\r\n", req_hdr.len()),
         ] {
             assert!(
@@ -2023,14 +2027,20 @@ mod tests {
         let header = b"REQMOD icap://127.0.0.1:1344/icap_audit ICAP/1.0\r\n\
             Allow: 204\r\n\
             X-TLS-VERSION: TLSv1.3\r\n\
-            X-TLS-CLIENT_RANDOM: deadbeef cafebabe\r\n\
-            X-TLS-CLIENT_HANDSHAKE_TRAFFIC_SECRET: deadbeef 11223344\r\n\
+            X-TLS-CIPHER-SUITE: 4866\r\n\
+            X-TLS-SERVER-RANDOM: aaaaaaaa\r\n\
+            X-TLS-CLIENT-RANDOM: deadbeef\r\n\
+            X-TLS-MASTER-SECRET: beefcafe\r\n\
+            X-TLS-CLIENT-TRAFFIC-SECRET: deadbeef 11223344\r\n\
             X-Client-Username: jo\thn\r\n";
         let text = masked_header_lines(header);
         assert!(text.contains("X-TLS-VERSION: TLSv1.3"), "{text}");
-        assert!(text.contains("X-TLS-CLIENT_RANDOM: ***"), "{text}");
-        assert!(text.contains("X-TLS-CLIENT_HANDSHAKE_TRAFFIC_SECRET: ***"));
-        assert!(!text.contains("cafebabe"));
+        assert!(text.contains("X-TLS-CIPHER-SUITE: 4866"), "{text}");
+        assert!(text.contains("X-TLS-SERVER-RANDOM: aaaaaaaa"), "{text}");
+        assert!(text.contains("X-TLS-CLIENT-RANDOM: deadbeef"), "{text}");
+        assert!(text.contains("X-TLS-MASTER-SECRET: ***"), "{text}");
+        assert!(text.contains("X-TLS-CLIENT-TRAFFIC-SECRET: ***"));
+        assert!(!text.contains("beefcafe"));
         assert!(!text.contains("11223344"));
         assert!(text.contains("X-Client-Username: jo hn"), "{text}");
     }

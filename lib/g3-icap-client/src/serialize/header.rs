@@ -8,8 +8,8 @@
 //! 每个 `add_*` 函数向头部缓冲区追加一组 "Name: value\r\n" 形式的 ICAP 头：
 //! - `add_connection_tuple`：X-Proxy-IP/PORT、X-Remote-IP/PORT、X-Proto-P 五元组，
 //!   供审计侧还原连接归属（repid 审计场景，见 wming 添加的标记）；
-//! - `add_keylog_headers`：X-TLS-VERSION / X-TLS-CIPHER / X-TLS-SERVER_RANDOM 以及
-//!   各密钥日志行对应的 X-TLS-* 头，值中的 ASCII 控制字符会被替换为空格，
+//! - `add_keylog_headers`：X-TLS-VERSION / X-TLS-CIPHER-SUITE / X-TLS-CLIENT-RANDOM /
+//!   X-TLS-SERVER-RANDOM 以及各密钥日志对应的 X-TLS-* 头，值中的 ASCII 控制字符会被替换为空格，
 //!   防止恶意 keylog 内容注入伪造头部（header injection）；
 //! - `add_client_addr`：X-Client-IP / X-Client-Port，即 ICAP 请求所描述流量的客户端；
 //! - `add_client_username`：X-Client-Username 明文 + X-Authenticated-User
@@ -38,18 +38,20 @@ pub fn add_connection_tuple(buf: &mut Vec<u8>, tuple: &ConnectionTuple) {
 }
 
 /// Add TLS keylog entries as ICAP headers.
-/// Each keylog line is sent as a separate X-TLS-KeyLog header.
 ///
-/// 中文补充：先把 TLS 版本/密码套件/server_random 写入独立的 X-TLS-* 头，
-/// 再逐条追加密钥日志行（如 CLIENT_RANDOM 开头的行）。value 中的 ASCII 控制
-/// 字符（\r、\n、NUL 等）一律替换为空格，避免破坏 "Name: value\r\n" 线格式、
-/// 被利用注入额外头部。
+/// 中文补充：先写 TLS 版本/密码套件/两个握手随机数这四条通用头，再逐条追加密钥
+/// （TLS 1.2 的 `X-TLS-MASTER-SECRET`、TLS 1.3 的 `X-TLS-*-TRAFFIC-SECRET` 与
+/// `X-TLS-EXPORTER-SECRET`，命名规则见 `TlsKeyLogBuffer::to_icap_headers`）。
+/// value 中的 ASCII 控制字符（\r、\n、NUL 等）一律替换为空格，避免破坏
+/// "Name: value\r\n" 线格式、被利用注入额外头部。
 pub fn add_keylog_headers(buf: &mut Vec<u8>, keylog: &TlsKeyLogBuffer) {
-    // 元数据（版本/套件/server random）与 keylog 条目任一存在就输出：
+    // 元数据（版本/套件/两个随机数）与 keylog 条目任一存在就输出：
     // TLS 1.2 会话复用等场景可能没有新条目，但握手公开值仍有解密价值。
+    let client_random = keylog.client_random();
     if keylog.is_empty()
         && keylog.tls_version().is_none()
-        && keylog.cipher_name().is_none()
+        && keylog.cipher_suite().is_none()
+        && client_random.is_none()
         && keylog.server_random().is_none()
     {
         return;
@@ -57,11 +59,14 @@ pub fn add_keylog_headers(buf: &mut Vec<u8>, keylog: &TlsKeyLogBuffer) {
     if let Some(version) = keylog.tls_version() {
         let _ = write!(buf, "X-TLS-VERSION: {}\r\n", version.as_icap_str());
     }
-    if let Some(cipher) = keylog.cipher_name() {
-        let _ = write!(buf, "X-TLS-CIPHER: {cipher}\r\n");
+    if let Some(cipher) = keylog.cipher_suite() {
+        let _ = write!(buf, "X-TLS-CIPHER-SUITE: {cipher}\r\n");
+    }
+    if let Some(client_random) = client_random {
+        let _ = write!(buf, "X-TLS-CLIENT-RANDOM: {}\r\n", client_random);
     }
     if let Some(server_random) = keylog.server_random() {
-        let _ = write!(buf, "X-TLS-SERVER_RANDOM: {}\r\n", server_random);
+        let _ = write!(buf, "X-TLS-SERVER-RANDOM: {}\r\n", server_random);
     }
     for (name, value) in keylog.to_icap_headers() {
         buf.put_slice(name.as_bytes());

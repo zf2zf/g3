@@ -137,10 +137,11 @@ X-Proxy-PORT: 8080␍␊
 X-Remote-IP: 93.184.216.34␍␊
 X-Remote-PORT: 443␍␊
 X-Proto-P: 6␍␊
-X-TLS-VERSION: TLSv1_3␍␊
-X-TLS-CIPHER: TLS_AES_256_GCM_SHA384␍␊
-X-TLS-SERVER_RANDOM: 3a7f...␍␊
-X-TLS-CLIENT_HANDSHAKE_TRAFFIC_SECRET: <client_random> <hexsecret>␍␊
+X-TLS-VERSION: TLSv1.3␍␊
+X-TLS-CIPHER-SUITE: 4866␍␊
+X-TLS-CLIENT-RANDOM: 1b2c...␍␊
+X-TLS-SERVER-RANDOM: 3a7f...␍␊
+X-TLS-CLIENT-HANDSHAKE-TRAFFIC-SECRET: <hexsecret>␍␊
 Allow: 204, 206␍␊                                                  ← 视协议/配置而定
 Encapsulated: req-hdr=0, req-body=246␍␊                           ← 封装偏移量
 Preview: 1024␍␊                                                   ← preview 模式才有
@@ -180,10 +181,12 @@ Content-Length / chunked / 无限流无关。
 | `X-Proxy-IP` / `X-Proxy-PORT` | IP / 数字 | `serialize/header.rs:17`（本机扩展） | 代理本机（server 侧）地址 |
 | `X-Remote-IP` / `X-Remote-PORT` | IP / 数字 | 同上 | 上游目标服务器地址 |
 | `X-Proto-P` | `6`(TCP) / `17`(UDP) | 同上 | IANA 协议号，供审计服务关联五元组（repid audit） |
-| `X-TLS-VERSION` | 如 `TLSv1_3` | `serialize/header.rs:27`（本机扩展） | TLS 版本 |
-| `X-TLS-CIPHER` | 如 `TLS_AES_256_GCM_SHA384` | 同上 | 协商的加密套件 |
-| `X-TLS-SERVER_RANDOM` | hex | 同上 | ServerHello random |
-| `X-TLS-<LABEL>` | `<client_random> <hex secret>` | `g3-types/src/net/tls/keylog.rs:195` | 每条 NSS keylog 一个头，如 `X-TLS-CLIENT_TRAFFIC_SECRET_0`，供审计侧解密流量 |
+| `X-TLS-VERSION` | 如 `TLSv1.3` | `serialize/header.rs`（本机扩展） | TLS 版本 |
+| `X-TLS-CIPHER-SUITE` | 整数 | 同上 | 协商的加密套件的线上编号（IANA 两字节值的十进制，`TLS_AES_256_GCM_SHA384` = `0x1302` → `4866`）|
+| `X-TLS-CLIENT-RANDOM` | hex | 同上 | 通用：ClientHello random，TLS 1.2/1.3 都发 |
+| `X-TLS-SERVER-RANDOM` | hex | 同上 | 通用：ServerHello random |
+| `X-TLS-MASTER-SECRET` | hex | `g3-types/src/net/tls/keylog.rs` | TLS 1.2 主密钥。NSS 把这行标签叫 `CLIENT_RANDOM`，随机数部分已在通用头里，这里只留密钥 |
+| `X-TLS-CLIENT-HANDSHAKE-TRAFFIC-SECRET` / `X-TLS-SERVER-HANDSHAKE-TRAFFIC-SECRET` / `X-TLS-CLIENT-TRAFFIC-SECRET` / `X-TLS-SERVER-TRAFFIC-SECRET` / `X-TLS-EXPORTER-SECRET` | hex | 同上 | TLS 1.3：每条密钥一个头，NSS 标签的下划线换成连字符、尾部序号去掉（`CLIENT_TRAFFIC_SECRET_0` → `X-TLS-CLIENT-TRAFFIC-SECRET`），供审计侧解密流量 |
 | `Allow` | `204` / `204, 206` | 各 Adapter | 本请求**只接受**哪些响应码；preview 请求刻意不带，避免 100-continue 后又收到 204/206 |
 | `Encapsulated` | `req-hdr=0, req-body=<off>` 等 | 各 Adapter | 封装报文头/体在 ICAP 消息体中的字节偏移 |
 | `Preview` | 字节数 | `reqmod/h1/preview.rs:31` | 本次只发送前 N 字节预览，等服务器回 `100 Continue` 再续传 |
@@ -326,7 +329,7 @@ X-Body-Framing: content-length
 X-Client-IP: 10.0.0.7
 X-Client-Port: 51234
 X-TLS-VERSION: TLSv1.3
-X-TLS-CLIENT_RANDOM: ***
+X-TLS-CLIENT-TRAFFIC-SECRET: ***
 Encapsulated: req-hdr=0, req-body=96
 [encapsulated req-hdr]
 POST /upload HTTP/1.1

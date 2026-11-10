@@ -28,8 +28,9 @@
 //! 本模块还附带本机审计扩展（非 RFC 3507 要求）：
 //! `H2RequestAdapter::push_extended_headers` 会追加 `X-Proxy-IP` / `X-Proxy-PORT` /
 //! `X-Remote-IP` / `X-Remote-PORT` / `X-Proto-P` 五元组（来自 [`ConnectionTuple`]）与
-//! `X-TLS-VERSION` / `X-TLS-CIPHER` / `X-TLS-SERVER_RANDOM` / `X-TLS-KeyLog`
-//! 等 keylog 头（来自 `TlsKeyLogBuffer`），供 ICAP 侧做 repid 审计与解密取证。
+//! `X-TLS-VERSION` / `X-TLS-CIPHER-SUITE` / `X-TLS-SERVER-RANDOM` 以及逐条 keylog 头
+//! （`X-TLS-MASTER-SECRET`、`X-TLS-CLIENT-TRAFFIC-SECRET` 等，来自 `TlsKeyLogBuffer`），
+//! 供 ICAP 侧做 repid 审计与解密取证。
 //!
 //! 文件分工：
 //! - `forward_header.rs`：无 body 的请求（`null-body` 偏移）与 CONNECT
@@ -283,7 +284,7 @@ impl<I: IdleCheck> H2RequestAdapter<I> {
         if let Some(ref tuple) = self.connection_tuple {
             crate::serialize::add_connection_tuple(data, tuple);
         }
-        // TLS keylog：X-TLS-VERSION / X-TLS-CIPHER / X-TLS-SERVER_RANDOM / X-TLS-KeyLog
+        // TLS keylog：X-TLS-VERSION / X-TLS-CIPHER-SUITE / X-TLS-SERVER-RANDOM / 逐条密钥
         if let Some(ref keylog) = self.keylog_buffer {
             crate::serialize::add_keylog_headers(data, keylog);
         }

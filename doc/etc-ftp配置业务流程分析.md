@@ -308,8 +308,8 @@ let audit_ctx = FtpUploadAuditContext {
     }),
 
     // 🔴 TLS KeyLog（本地添加）
-    keylog_buffer: self.keylog_buffer.clone(), // → ICAP 头: X-TLS-VERSION / X-TLS-CIPHER /
-                                               //             X-TLS-SERVER_RANDOM / X-TLS-KeyLog-*
+    keylog_buffer: self.keylog_buffer.clone(), // → ICAP 头: X-TLS-VERSION / X-TLS-CIPHER-SUITE /
+                                               //   X-TLS-CLIENT-RANDOM / X-TLS-SERVER-RANDOM / 逐条密钥
 };
 ```
 
@@ -320,7 +320,8 @@ let mut adapter = icap_client.ftp_upload_audit_adapter(...).await?;
 
 adapter.set_client_addr(addr);           // → X-Client-IP, X-Client-Port
 adapter.set_connection_tuple(tuple);     // → X-Proxy-IP, X-Proxy-PORT, X-Remote-IP, X-Remote-PORT, X-Proto-P
-adapter.set_keylog_buffer(keylog);       // → X-TLS-VERSION, X-TLS-CIPHER, X-TLS-SERVER_RANDOM, X-TLS-KeyLog-*
+adapter.set_keylog_buffer(keylog);       // → X-TLS-VERSION, X-TLS-CIPHER-SUITE, X-TLS-CLIENT-RANDOM,
+                                           //   X-TLS-SERVER-RANDOM, X-TLS-MASTER-SECRET(1.2)/各流量密钥(1.3)
 
 adapter.audit_and_forward(&mut state, clt_r, ups_w, "STOR", "/path/to/file").await;
 ```
@@ -345,10 +346,10 @@ X-Remote-IP: 10.20.79.186                    ← ▲ 五元组 · 远端
 X-Remote-PORT: 21
 X-Proto-P: 6                                  ← ▲ 五元组 · TCP
 X-TLS-VERSION: TLSv1.3                        ← █ TLS KeyLog (仅 FTPS)
-X-TLS-CIPHER: TLS_AES_256_GCM_SHA384          ← █ TLS KeyLog
-X-TLS-SERVER_RANDOM: <hex>                    ← █ TLS KeyLog
-X-TLS-KeyLog-1: CLIENT_RANDOM <hex> <hex>     ← █ TLS 会话密钥
-X-TLS-KeyLog-2: SERVER_HANDSHAKE_TRAFFIC_SECRET ...
+X-TLS-CIPHER-SUITE: 4866                      ← █ TLS KeyLog (0x1302)
+X-TLS-CLIENT-RANDOM: <hex>                    ← █ TLS KeyLog
+X-TLS-SERVER-RANDOM: <hex>                    ← █ TLS KeyLog
+X-TLS-CLIENT-HANDSHAKE-TRAFFIC-SECRET: <hex>  ← █ TLS 会话密钥 (1.3；1.2 为 X-TLS-MASTER-SECRET)
                                                ← 数据走 chunked body 流式传输
 ```
 
@@ -888,7 +889,7 @@ enum TlsUpstreamType {
 | ConnectionTuple 数据结构 | `lib/g3-icap-client/src/reqmod/mod.rs` | 五元组：proxy IP:Port + remote IP:Port + protocol |
 | add_connection_tuple() 序列化 | `lib/g3-icap-client/src/serialize/header.rs` | → X-Proxy-IP, X-Proxy-PORT, X-Remote-IP, X-Remote-PORT, X-Proto-P |
 | TlsKeyLogBuffer | `lib/g3-types/src/net/tls/keylog.rs` | NSS 格式 KeyLog 缓冲，最大 100 条/连接 |
-| add_keylog_headers() 序列化 | `lib/g3-icap-client/src/serialize/header.rs` | → X-TLS-VERSION, X-TLS-CIPHER, X-TLS-SERVER_RANDOM, X-TLS-KeyLog-* |
+| add_keylog_headers() 序列化 | `lib/g3-icap-client/src/serialize/header.rs` | → X-TLS-VERSION, X-TLS-CIPHER-SUITE, X-TLS-CLIENT-RANDOM, X-TLS-SERVER-RANDOM, 逐条密钥 |
 | FtpUploadAdapter (FTP→ICAP 适配器) | `lib/g3-icap-client/src/reqmod/ftp/mod.rs` | chunked 转发 + fail-open 设计 |
 | H1/H2 适配器 KeyLog + 五元组注入 | `lib/g3-icap-client/src/reqmod/h1/mod.rs` + `h2/mod.rs` | `set_keylog_buffer()` + `set_connection_tuple()` |
 | TLS 握手 KeyLog 捕获 | `lib/g3-types/src/net/openssl/client/intercept.rs` | OpenSSL `set_keylog_callback` → `TlsKeyLogEntry::parse` |

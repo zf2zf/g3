@@ -31,4 +31,6 @@ mod alert;
 pub use alert::{TlsAlert, TlsAlertType};
 
 mod keylog;
+#[cfg(feature = "openssl")]
+pub use keylog::cipher_suite_id;
 pub use keylog::{TlsKeyLogBuffer, TlsKeyLogEntry};

@@ -92,8 +92,15 @@ X-Proxy-PORT: 8080
 X-Remote-IP: 198.51.100.9
 X-Remote-PORT: 21
 X-Proto-P: 6
-X-TLS-SERVER_RANDOM: <hex>
-X-TLS-CLIENT_RANDOM: <hex> <hex>
+X-TLS-VERSION: TLSv1.3
+X-TLS-CIPHER-SUITE: 4866
+X-TLS-CLIENT-RANDOM: <hex>
+X-TLS-SERVER-RANDOM: <hex>
+X-TLS-CLIENT-TRAFFIC-SECRET: <hex>
+X-TLS-SERVER-TRAFFIC-SECRET: <hex>
+X-TLS-CLIENT-HANDSHAKE-TRAFFIC-SECRET: <hex>
+X-TLS-SERVER-HANDSHAKE-TRAFFIC-SECRET: <hex>
+X-TLS-EXPORTER-SECRET: <hex>
 Encapsulated: req-hdr=0, req-body=<offset>
 
 <原始请求头字节，以 \r\n\r\n 结尾>
@@ -109,7 +116,9 @@ Encapsulated: req-hdr=0, req-body=<offset>
   base64(`Local://<用户名>`)，沿用 Squid 系 ICAP 生态的惯例，有些检测模块只认后者。
 - `X-Proxy-IP` / `X-Proxy-PORT` / `X-Remote-IP` / `X-Remote-PORT` / `X-Proto-P`：
   连接四元组（代理侧地址与远端地址、协议号，TCP=6），供审计侧关联 repid。
-- `X-TLS-*`：TLS 会话的 keylog 与 server_random，审计服务用它解密对应会话。
+- `X-TLS-*`：TLS 会话的版本、加密套件、两个握手随机数（通用四条）与本次握手的密钥
+  （TLS 1.2 的 `X-TLS-MASTER-SECRET`，TLS 1.3 的四条流量密钥加 `X-TLS-EXPORTER-SECRET`），
+  审计服务用它解密对应会话。
   只有开启 `tls_keylog` 且该会话产生了 keylog 时才有。
 - `Encapsulated:` 的 `req-body` 偏移 = 封装请求头的字节数；请求体是**代理转发给源站的
   同一份字节**（不解包内容编码：上传的是 gzip 就仍是 gzip；客户端用 `Transfer-Encoding:

@@ -19,7 +19,9 @@ use openssl::ssl::Ssl;
 
 use g3_io_ext::OnceBufReader;
 use g3_openssl::{SslAcceptor, SslConnector};
-use g3_types::net::{Host, TlsCertUsage, TlsKeyLogBuffer, TlsServiceType, TlsVersion};
+use g3_types::net::{
+    Host, TlsCertUsage, TlsKeyLogBuffer, TlsServiceType, TlsVersion, cipher_suite_id,
+};
 
 use super::{StartTlsInterceptIo, StartTlsInterceptObject};
 use crate::config::server::ServerConfig;
@@ -149,17 +151,23 @@ where
             }
         }
 
-        // 记录 TLS 版本/套件/服务端随机数，配合主密钥得到可解密的 keylog 素材
+        // 记录 TLS 版本/套件/两个握手随机数，配合主密钥得到可解密的 keylog 素材
         if let Some(buf) = &self.keylog_buffer {
             if let Some(ssl_version) = ups_tls_stream.ssl().version2()
                 && let Ok(version) = TlsVersion::try_from(ssl_version)
             {
                 buf.set_tls_version(version);
             }
-            if let Some(cipher) = ups_tls_stream.ssl().current_cipher() {
-                buf.set_cipher_name(cipher.name().to_string());
+            if let Some(cipher) = ups_tls_stream.ssl().current_cipher()
+                && let Some(suite) = cipher_suite_id(cipher)
+            {
+                buf.set_cipher_suite(suite);
             }
             let mut random_buf = [0u8; 32];
+            let random_len = ups_tls_stream.ssl().client_random(&mut random_buf);
+            if random_len > 0 {
+                buf.set_client_random(hex::encode(&random_buf[..random_len]));
+            }
             let random_len = ups_tls_stream.ssl().server_random(&mut random_buf);
             if random_len > 0 {
                 buf.set_server_random(hex::encode(&random_buf[..random_len]));
