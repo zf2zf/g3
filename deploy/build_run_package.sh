@@ -3,6 +3,8 @@
 # 编译并打一个 g3 "run 包"：可执行程序 + systemd 单元 + 安装/卸载脚本（以及配置），
 # 产物是 dist/ 下的一个可直接执行的自解压 .run。组装用的目录和 tar.gz 都放在工作区
 # （target/pkg，见 WORK_DIR），生成 .run 后即删——dist 下只留 .run 这一个文件。
+# 包名尾部带裁剪模式与命名空间标签，如 g3-run-<ver>-<sha>-linux-x86_64-<date>
+# -portable-ns-vpp / -static-hostnet；默认库链接且进 ns-vpp 时只有 -ns-vpp。
 #
 # 两个组件，共用同一套编译开关与命名空间约定：
 #   --component=g3    g3proxy + g3proxy-ctl + g3fcgen，装到 /opt/zf/g3（默认）
@@ -92,6 +94,62 @@ usage() {
 	awk 'NR > 2 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"
 }
 
+# 构建环境依赖检查：缺工具就早停，别等 cargo 编到一半才报找不到 capnp 或 pkg-config。
+# 参考 doc/dev-setup.md 的"Dependent Tools and Libraries"一节。
+check_build_dependencies() {
+	missing=""
+	# 始终需要的工具链
+	command -v cargo >/dev/null 2>&1 || missing="$missing cargo"
+	command -v rustc >/dev/null 2>&1 || missing="$missing rustc"
+	command -v gcc >/dev/null 2>&1 || missing="$missing gcc"
+	command -v make >/dev/null 2>&1 || missing="$missing make"
+	command -v pkg-config >/dev/null 2>&1 || missing="$missing pkg-config"
+	# capnproto 编译器：g3proxy-proto 的 build.rs 需要它生成 RPC 代码
+	command -v capnp >/dev/null 2>&1 || missing="$missing capnp"
+
+	if [ -n "$missing" ]; then
+		echo "==> 构建环境缺少依赖：$missing" >&2
+		echo "    请参考 doc/dev-setup.md 安装：" >&2
+		case "$(uname -s)" in
+		Linux)
+			if command -v dnf >/dev/null 2>&1; then
+				echo "    RHEL/Kylin: dnf install gcc pkgconf make capnproto" >&2
+			elif command -v apt-get >/dev/null 2>&1; then
+				echo "    Debian/Ubuntu: apt-get install gcc pkgconf make capnproto" >&2
+			fi
+			;;
+		Darwin)
+			echo "    macOS: brew install pkgconf capnproto" >&2
+			;;
+		esac
+		echo "    Rust 工具链: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh" >&2
+		exit 1
+	fi
+
+	# g3 组件在非 portable 模式下额外需要 Lua 与 Python 开发库
+	if [ "$COMPONENT" = g3 ] && [ "$PORTABILITY" = no ]; then
+		lua_ok=0
+		for mod in lua lua55 lua54 lua53; do
+			if pkg-config --exists "$mod" 2>/dev/null; then
+				lua_ok=1
+				break
+			fi
+		done
+		if [ "$lua_ok" = 0 ]; then
+			echo "==> 提示：未找到 Lua 开发库，g3proxy 默认 feature 里的 lua54 可能编不过" >&2
+			echo "    安装: dnf install lua-devel 或 apt-get install lua5.4-dev" >&2
+			echo "    或改用 --portable 关掉 Lua/Python feature" >&2
+		fi
+		if ! pkg-config --exists python3 2>/dev/null && ! command -v python3-config >/dev/null 2>&1; then
+			echo "==> 提示：未找到 Python3 开发库，g3proxy 默认 feature 里的 python 可能编不过" >&2
+			echo "    安装: dnf install python3-devel 或 apt-get install libpython3-dev" >&2
+			echo "    或改用 --portable 关掉 Lua/Python feature" >&2
+		fi
+	fi
+
+	echo "==> 构建环境依赖检查通过"
+}
+
 # --参数=值 形式的配置，逐个覆盖上面从环境变量取来的默认值
 while [ $# -gt 0 ]; do
 	opt=$1
@@ -153,6 +211,9 @@ while [ $# -gt 0 ]; do
 done
 
 cd "$PROJECT_DIR"
+
+# 构建环境依赖检查：缺工具就早停，别等 cargo 编到一半才报错
+check_build_dependencies
 
 # 组件差异全集中在这张表里：编译哪些包、进哪些可执行程序与单元、包名前缀、安装前缀，
 # 以及裸 feature 名默认挂在哪个包上。其余部分——编译开关、命名空间展开、静态断言、
@@ -327,7 +388,19 @@ CRATE_VERSION=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' "$PROJECT_DIR/${FEATURE
 GIT_SHA=$(git -C "$PROJECT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)
 ARCH=$(uname -s | tr 'A-Z' 'a-z')-$(uname -m)
 BUILT_AT=$(date -u +%Y%m%d)
-PKG_NAME="${PKG_PREFIX}-${VERSION}-${GIT_SHA}-${ARCH}-${BUILT_AT}"
+# 裁剪模式与网络命名空间进包名：同一版本号可能出好几个包（portable/static、
+# 不同 netns），光看文件名要能分出来，装错机器的概率就低了。
+case "$PORTABILITY" in
+static) TAG_PORTABILITY=-static ;;
+portable) TAG_PORTABILITY=-portable ;;
+*) TAG_PORTABILITY= ;;
+esac
+if [ "$NETNS" = yes ]; then
+	TAG_NETNS="-$(basename "$NETNS_PATH")"
+else
+	TAG_NETNS=-hostnet
+fi
+PKG_NAME="${PKG_PREFIX}-${VERSION}-${GIT_SHA}-${ARCH}-${BUILT_AT}${TAG_PORTABILITY}${TAG_NETNS}"
 PKG_DIR="$WORK_DIR/$PKG_NAME"
 
 echo "==> 组装 run 包（组件 ${COMPONENT}）：$PKG_DIR"
