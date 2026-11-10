@@ -6,14 +6,22 @@
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 
+use chrono::Utc;
+use uuid::Uuid;
+
 use g3_io_ext::haproxy::ProxyAddr;
 use g3_socket::RawSocket;
 use g3_socket::util::AddressFamily;
 use g3_types::net::TcpMiscSockOpts;
 
+use crate::server::task::generate_uuid;
+
 #[derive(Clone, Debug)]
 pub struct ClientConnectionInfo {
     worker_id: Option<usize>,
+    /// 本条客户端连接的会话 ID。随 `ClientConnectionInfo` 一同克隆传递，
+    /// 因此同一条长连接上的多次审计上报能拿到同一个值。
+    session_id: Uuid,
     client_addr: SocketAddr,
     server_addr: SocketAddr,
     sock_peer_addr: SocketAddr,
@@ -26,6 +34,7 @@ impl ClientConnectionInfo {
     pub fn new(peer_addr: SocketAddr, local_addr: SocketAddr) -> Self {
         ClientConnectionInfo {
             worker_id: None,
+            session_id: generate_uuid(&Utc::now()),
             client_addr: peer_addr,
             server_addr: local_addr,
             sock_peer_addr: peer_addr,
@@ -53,6 +62,12 @@ impl ClientConnectionInfo {
     #[inline]
     pub fn worker_id(&self) -> Option<usize> {
         self.worker_id
+    }
+
+    /// 本条客户端连接的会话 ID，同一条长连接上的多次上报取值相同
+    #[inline]
+    pub fn session_id(&self) -> Uuid {
+        self.session_id
     }
 
     #[inline]

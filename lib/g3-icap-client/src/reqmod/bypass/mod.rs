@@ -17,6 +17,7 @@ use std::sync::Arc;
 use bytes::BufMut;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, empty, sink};
 use tokio::time::Instant;
+use uuid::Uuid;
 
 use g3_io_ext::{IdleCheck, LimitedWriteExt, OnceBufReader, StreamCopyConfig};
 use g3_types::net::TlsKeyLogBuffer;
@@ -136,6 +137,7 @@ impl IcapReqmodClient {
             client_username: None,
             connection_tuple: None,
             keylog_buffer: None,
+            client_session_id: None,
             upstream_half_close: true,
         })
     }
@@ -155,6 +157,8 @@ pub struct BypassAdapter<I: IdleCheck> {
     connection_tuple: Option<ConnectionTuple>,
     /* added for TLS keylog */
     keylog_buffer: Option<Arc<TlsKeyLogBuffer>>,
+    /// 客户端连接会话 ID（不带 `-` 的 UUID），序列化成 X-Client-Session-ID 上报
+    client_session_id: Option<Uuid>,
     /// 客户端请求体送达后是否半关闭上游写侧。FTP 数据通道靠 EOF 信令传输
     /// 结束，必须关闭；HTTP 请求体自带结束标记，上游连接要留给后续请求复用。
     upstream_half_close: bool,
@@ -180,6 +184,7 @@ impl<I: IdleCheck> BypassAdapter<I> {
             client_username: None,
             connection_tuple: None,
             keylog_buffer: None,
+            client_session_id: None,
             upstream_half_close: true,
         }
     }
@@ -217,10 +222,17 @@ impl<I: IdleCheck> BypassAdapter<I> {
         self.keylog_buffer = Some(buffer);
     }
 
+    /// 注入客户端连接会话 ID（会以 X-Client-Session-ID 头回传）。
+    /// 取值是不带 `-` 的 UUID；同一条客户端长连接上的多次上报必须传同一个值，
+    /// 审计侧据此把一次会话里的多个请求关联起来。
+    pub fn set_client_session_id(&mut self, id: Uuid) {
+        self.client_session_id = Some(id);
+    }
+
     /// 追加本扩展专用的 ICAP 头：Allow: 204 告诉服务器"只回 204 放行
     /// 就行，不需要修改后的内容"；X-Transformed-From 声明协议来源，
     /// X-Http-Version 与 X-Body-Framing 补充 HTTP 的版本与请求体成帧形态；
-    /// 其余为可选的客户端地址 / 用户名 / 五元组 / keylog 关联信息。
+    /// 其余为可选的会话 ID / 客户端地址 / 用户名 / 五元组 / keylog 关联信息。
     fn push_extended_headers(&self, data: &mut Vec<u8>, framing: &BypassFraming) {
         data.put_slice(b"Allow: 204\r\n");
         let _ = write!(data, "X-Transformed-From: {}\r\n", framing.transformed_from);
@@ -229,6 +241,9 @@ impl<I: IdleCheck> BypassAdapter<I> {
         }
         if let Some(body_framing) = framing.body_framing {
             let _ = write!(data, "X-Body-Framing: {body_framing}\r\n");
+        }
+        if let Some(id) = self.client_session_id {
+            crate::serialize::add_client_session_id(data, id);
         }
         if let Some(addr) = self.client_addr {
             crate::serialize::add_client_addr(data, addr);
@@ -1846,6 +1861,8 @@ mod tests {
             .await
             .unwrap();
         adapter.set_client_addr("203.0.113.7:5555".parse().unwrap());
+        let session_id = uuid::Uuid::parse_str("6b3f1c2a-0d4e-5a6b-8c9d-0e1f2a3b4c5d").unwrap();
+        adapter.set_client_session_id(session_id);
         adapter.set_client_username(arcstr::ArcStr::from("alice"));
         adapter.set_connection_tuple(ConnectionTuple {
             server_addr: "192.0.2.1:8080".parse().unwrap(),
@@ -1904,6 +1921,8 @@ mod tests {
             "X-Transformed-From: HTTPS\r\n",
             "X-Http-Version: 2.0\r\n",
             "X-Body-Framing: content-length\r\n",
+            // 会话 ID 必须不带 `-`
+            "X-Client-Session-ID: 6b3f1c2a0d4e5a6b8c9d0e1f2a3b4c5d\r\n",
             "X-Client-IP: 203.0.113.7\r\n",
             "X-Client-Port: 5555\r\n",
             "X-Client-Username: alice\r\n",

@@ -377,6 +377,7 @@ where
         };
 
         bypass.set_client_addr(self.ctx.task_notes.client_addr);
+        bypass.set_client_session_id(self.ctx.task_notes.session_id);
         if let Some(username) = self.ctx.raw_user_name() {
             bypass.set_client_username(username.clone());
         }

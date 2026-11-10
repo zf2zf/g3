@@ -83,6 +83,7 @@ Allow: 204
 X-Transformed-From: HTTPS
 X-Http-Version: 2.0
 X-Body-Framing: content-length
+X-Client-Session-ID: 3cfedfcbdce311f1af9c1db8b9f0da3c
 X-Client-IP: 203.0.113.7
 X-Client-Port: 5555
 X-Client-Username: alice
@@ -111,6 +112,8 @@ Encapsulated: req-hdr=0, req-body=<offset>
 
 字段含义：
 
+- `X-Client-Session-ID`：本次上报所属的客户端连接，不带 `-` 的 UUID；同一条长连接
+  上的多次上报取值相同，审计侧据此把同一会话的多个请求关联起来。
 - `X-Client-IP` / `X-Client-Port`：发起上传的客户端地址。
 - `X-Client-Username` 明文用户名；`X-Authenticated-User` 是
   base64(`Local://<用户名>`)，沿用 Squid 系 ICAP 生态的惯例，有些检测模块只认后者。

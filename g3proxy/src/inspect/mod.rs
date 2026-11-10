@@ -94,6 +94,8 @@ impl StreamInspectUserContext {
 #[derive(Clone)]
 pub(crate) struct StreamInspectTaskNotes {
     task_id: Uuid,
+    /// 客户端连接会话 ID；同一条长连接上的多次上报取值相同，随审计上送
+    pub(crate) session_id: Uuid,
     /// 下游客户端地址
     pub(crate) client_addr: SocketAddr,
     /// 本代理服务器监听地址
@@ -129,6 +131,7 @@ impl From<&ServerTaskNotes> for StreamInspectTaskNotes {
     fn from(task_notes: &ServerTaskNotes) -> Self {
         StreamInspectTaskNotes {
             task_id: task_notes.id,
+            session_id: task_notes.client_session_id(),
             client_addr: task_notes.client_addr(),
             server_addr: task_notes.server_addr(),
             worker_id: task_notes.worker_id(),

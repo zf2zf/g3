@@ -986,6 +986,7 @@ impl<'a> HttpProxyForwardTask<'a> {
             }
         };
         adapter.set_client_addr(self.ctx.client_addr());
+        adapter.set_client_session_id(self.task_notes.client_session_id());
         // 上游连接的实际两端作为 ICAP 五元组：代理侧本地地址 + 下一跳地址，
         // 与 inspect/FTP 审计路径一致，供审计侧按 repid 关联真实数据流
         if let (Some(local_addr), Some(remote_addr)) = (self.tcp_notes.local, self.tcp_notes.next) {

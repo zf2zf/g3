@@ -11,6 +11,7 @@
 //! - `add_keylog_headers`：X-TLS-VERSION / X-TLS-CIPHER-SUITE / X-TLS-CLIENT-RANDOM /
 //!   X-TLS-SERVER-RANDOM 以及各密钥日志对应的 X-TLS-* 头，值中的 ASCII 控制字符会被替换为空格，
 //!   防止恶意 keylog 内容注入伪造头部（header injection）；
+//! - `add_client_session_id`：X-Client-Session-ID，即 ICAP 请求所描述流量所属的客户端连接；
 //! - `add_client_addr`：X-Client-IP / X-Client-Port，即 ICAP 请求所描述流量的客户端；
 //! - `add_client_username`：X-Client-Username 明文 + X-Authenticated-User
 //!   （base64("Local://<user>")，沿用 Squid 等 ICAP 服务的认证用户名编码约定）；
@@ -21,6 +22,8 @@ use std::net::SocketAddr;
 
 use base64::prelude::*;
 use bytes::BufMut;
+
+use uuid::Uuid;
 
 use g3_types::net::{HttpHeaderMap, TlsKeyLogBuffer};
 
@@ -81,6 +84,13 @@ pub fn add_keylog_headers(buf: &mut Vec<u8>, keylog: &TlsKeyLogBuffer) {
         }
         buf.put_slice(b"\r\n");
     }
+}
+
+/// 追加 X-Client-Session-ID 头：标明被检测流量属于哪一条客户端连接。
+/// 值为不带 `-` 的 UUID；同一条长连接上的多次上报取值相同，审计侧据此把同一
+/// 会话内的多个请求关联起来。
+pub(crate) fn add_client_session_id(buf: &mut Vec<u8>, id: Uuid) {
+    let _ = write!(buf, "X-Client-Session-ID: {}\r\n", id.simple());
 }
 
 /// 追加 X-Client-IP / X-Client-Port 头，标明被检测流量发起方的客户端地址。

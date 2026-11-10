@@ -113,6 +113,12 @@ impl ServerTaskNotes {
         self.cc_info.worker_id()
     }
 
+    /// 本条客户端连接的会话 ID：同一条长连接上的多次审计上报取值相同
+    #[inline]
+    pub(crate) fn client_session_id(&self) -> Uuid {
+        self.cc_info.session_id()
+    }
+
     #[inline]
     pub(crate) fn user_ctx(&self) -> Option<&UserContext> {
         self.user_ctx.as_ref()

@@ -128,6 +128,7 @@ Authorization: Basic cHJveHk6cHdA␍␊                                ← 可�
 X-Transformed-From: HTTPS␍␊                                      ← 扩展头区（采集信息）
 X-Http-Version: 1.1␍␊                                            ← HTTP 专属：原始请求版本
 X-Body-Framing: content-length␍␊                                 ← 上传旁路才有：请求体成帧方式
+X-Client-Session-ID: 3cfedfcbdce311f1af9c1db8b9f0da3c␍␊        ← 本机扩展：所属客户端连接，同一条长连接多次上报取值相同
 X-Client-IP: 10.0.0.5␍␊
 X-Client-Port: 52334␍␊
 X-Client-Username: alice␍␊
@@ -175,6 +176,7 @@ Content-Length / chunked / 无限流无关。
 | `X-Transformed-From` | `HTTP` / `HTTPS` / `SMTP` / `IMAP` / `FTP` | 各 Adapter | 标识被封装的原始协议；HTTP 按客户端侧是否走 TLS 取 `HTTP` / `HTTPS` |
 | `X-Http-Version` | `1.0` / `1.1` / `2.0` | HTTP Adapter / 上传旁路 Adapter | 原始请求版本；`X-Transformed-From` 为 `HTTP` / `HTTPS` 时才有 |
 | `X-Body-Framing` | `content-length` / `chunked` / `stream` | 上传旁路 Adapter | 请求体在客户端侧的成帧方式 |
+| `X-Client-Session-ID` | 32 位 hex（不带 `-` 的 UUID） | `serialize/header.rs`（本机扩展） | 本次上报所属的客户端连接；同一条长连接上的多次上报取值相同，审计侧据此把同一会话的多个请求串起来。仅 HTTP/HTTPS 路径填写 |
 | `X-Client-IP` / `X-Client-Port` | IP / 数字 | `serialize/header.rs:54` | 发起请求的客户端地址 |
 | `X-Client-Username` | 明文用户名 | `serialize/header.rs:59` | 认证用户名 |
 | `X-Authenticated-User` | base64(`Local://<user>`) | 同上 | 兼容 ICAP 生态（如 Squid）的认证头 |
@@ -326,6 +328,7 @@ Allow: 204
 X-Transformed-From: HTTPS
 X-Http-Version: 1.1
 X-Body-Framing: content-length
+X-Client-Session-ID: 3cfedfcbdce311f1af9c1db8b9f0da3c
 X-Client-IP: 10.0.0.7
 X-Client-Port: 51234
 X-TLS-VERSION: TLSv1.3

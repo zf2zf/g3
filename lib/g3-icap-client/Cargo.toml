@@ -32,6 +32,7 @@ g3-h2.workspace = true
 g3-smtp-proto.workspace = true
 g3-yaml = { workspace = true, optional = true, features = ["rustls", "http"] }
 log.workspace = true
+uuid.workspace = true
 
 [features]
 default = []

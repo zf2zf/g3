@@ -34,6 +34,7 @@ use arcstr::ArcStr;
 use http::Method;
 use tokio::io::{AsyncBufRead, AsyncWrite};
 use tokio::time::Instant;
+use uuid::Uuid;
 
 use g3_http::server::HttpAdaptedRequest;
 use g3_http::{HttpBodyReader, HttpBodyType};
@@ -134,6 +135,7 @@ impl IcapReqmodClient {
             /* added by wming for repid audit */
             connection_tuple: None,
             keylog_buffer: None,
+            client_session_id: None,
             transformed_scheme: "HTTP",
             http_version: Some("1.1"),
         })
@@ -159,6 +161,8 @@ pub struct HttpRequestAdapter<I: IdleCheck> {
     /* added by wming for repid audit */
     connection_tuple: Option<ConnectionTuple>,
     keylog_buffer: Option<Arc<TlsKeyLogBuffer>>,
+    /// 客户端连接会话 ID（不带 `-` 的 UUID），以 `X-Client-Session-ID` 上报
+    client_session_id: Option<Uuid>,
     /// `X-Transformed-From` 取值：`HTTP` / `HTTPS`，由调用方按实际承载设置
     transformed_scheme: &'static str,
     /// `X-Http-Version` 取值（`1.0` / `1.1`）；`None` 时不发这个头
@@ -239,6 +243,13 @@ impl<I: IdleCheck> HttpRequestAdapter<I> {
         self.keylog_buffer = Some(buffer);
     }
 
+    /// 设置客户端连接会话 ID，会以 `X-Client-Session-ID` 上报。
+    /// 取值是不带 `-` 的 UUID；同一条客户端长连接上的多次上报必须传同一个值，
+    /// 审计侧据此把一次会话里的多个请求关联起来。
+    pub fn set_client_session_id(&mut self, id: Uuid) {
+        self.client_session_id = Some(id);
+    }
+
     /// 设置协议来源标签：`scheme` 为 `HTTP` / `HTTPS`（写进 `X-Transformed-From`），
     /// `version` 为客户端实际使用的 HTTP 版本（写进 `X-Http-Version`，
     /// `None` 表示不发这个头）。不调用则按明文声明：`HTTP` + 版本 `1.1`。
@@ -251,12 +262,15 @@ impl<I: IdleCheck> HttpRequestAdapter<I> {
     ///
     /// `X-Transformed-From` 声明封装报文的来源（`HTTP` / `HTTPS`），
     /// `X-Http-Version` 给出协议版本；两者都由调用方按实际承载设置。
-    /// 其余均为 g3 自有扩展（客户端地址、用户名、五元组、TLS keylog），
+    /// 其余均为 g3 自有扩展（会话 ID、客户端地址、用户名、五元组、TLS keylog），
     /// 未设置的项直接跳过，因此同一个适配器也能服务于不便提供这些信息的路径。
     fn push_extended_headers(&self, data: &mut Vec<u8>) {
         let _ = write!(data, "X-Transformed-From: {}\r\n", self.transformed_scheme);
         if let Some(version) = self.http_version {
             let _ = write!(data, "X-Http-Version: {version}\r\n");
+        }
+        if let Some(id) = self.client_session_id {
+            crate::serialize::add_client_session_id(data, id);
         }
         if let Some(addr) = self.client_addr {
             crate::serialize::add_client_addr(data, addr);

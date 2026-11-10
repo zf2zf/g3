@@ -1260,6 +1260,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "url",
+ "uuid",
  "yaml-rust2",
 ]
 

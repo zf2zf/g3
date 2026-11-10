@@ -222,6 +222,7 @@ impl<'a, SC: ServerConfig> ExchangeHead<'a, SC> {
                     let mut adaptation_state =
                         ReqmodAdaptationRunState::new(self.http_notes.started_ins);
                     adapter.set_client_addr(self.ctx.task_notes.client_addr);
+                    adapter.set_client_session_id(self.ctx.task_notes.session_id);
                     adapter.set_protocol_tag(
                         upload_audit::scheme_tag(self.ctx.over_tls()),
                         upload_audit::http_version_tag(Version::HTTP_2),

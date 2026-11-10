@@ -264,6 +264,7 @@ impl<'a, SC: ServerConfig> H1ForwardTask<'a, SC> {
             }
         };
         adapter.set_client_addr(self.ctx.task_notes.client_addr);
+        adapter.set_client_session_id(self.ctx.task_notes.session_id);
         if let Some(username) = self.ctx.raw_user_name() {
             adapter.set_client_username(username.clone());
         }
