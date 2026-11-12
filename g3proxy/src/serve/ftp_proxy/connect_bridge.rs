@@ -34,7 +34,7 @@ use tokio::net::{TcpListener, TcpStream};
 use g3_daemon::server::ClientConnectionInfo;
 use g3_io_ext::IdleWheel;
 
-use super::ctl_common::{
+use crate::inspect::ftp::ctl::{
     is_data_channel_command, is_epsv_command, is_pasv_command, is_upload_command,
     parse_pasv_response, read_ftp_response, rewrite_epsv_response, rewrite_pasv_response,
 };

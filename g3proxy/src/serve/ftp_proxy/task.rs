@@ -30,7 +30,7 @@ use g3_daemon::stat::task::TcpStreamTaskStats;
 use g3_openssl::SslConnector;
 use g3_types::net::{OpensslClientConfig, UpstreamAddr};
 
-use super::ctl_common::{
+use crate::inspect::ftp::ctl::{
     is_data_channel_command, is_epsv_command, is_pasv_command, is_upload_command,
     parse_pasv_response, read_ftp_response, read_line_limited, rewrite_epsv_response,
     rewrite_pasv_response,

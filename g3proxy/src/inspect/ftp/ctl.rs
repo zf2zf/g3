@@ -3,15 +3,10 @@
  * Copyright 2023-2025 ByteDance and/or its affiliates.
  */
 
-//! Shared control-channel parsing and data-channel helpers used
-//! by both the native FTP proxy task and the FTP-over-HTTP-CONNECT
-//! bridge. Keeping a single implementation means both paths behave
-//! consistently when detecting STOR/STOU/APPE and rewriting
-//! PASV/EPSV responses.
+//! FTP control-channel parsing primitives: command detection,
+//! response reading, and PASV/EPSV response parsing/rewriting.
 //!
-//! 控制通道解析与数据通道辅助函数，供原生 FTP 代理任务和
-//! FTP-over-HTTP-CONNECT 桥接共用。只保留一份实现，
-//! 两条路径在识别 STOR/STOU/APPE、改写 PASV/EPSV 应答时行为一致。
+//! FTP 控制通道解析原语：命令识别、应答读取、PASV/EPSV 应答解析与改写。
 
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};

@@ -9,6 +9,9 @@
 //! [`FtpUploadDataInterceptObject`]、上传标记查询 [`check_ftp_upload_data`]
 //! 和 FTPS 域名查询 [`get_ftps_domain`]。
 
+/// FTP 控制通道解析与 PASV/EPSV 应答改写原语
+pub(crate) mod ctl;
+
 pub(crate) mod object;
 pub(crate) use object::FtpInterceptObject;
 

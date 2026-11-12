@@ -20,8 +20,6 @@
 /// FTP over HTTP CONNECT 隧道模式下的桥接实现（目前未被调用，保留待接入）
 #[allow(dead_code)]
 pub(crate) mod connect_bridge;
-/// 控制通道解析与 PASV/EPSV 应答改写等公共逻辑，原生模式与 CONNECT 模式共用
-pub(crate) mod ctl_common;
 /// FTP 代理服务器主体：监听、配置热加载、上游选择与任务派发
 pub(crate) mod server;
 /// 服务器级别的运行统计指标（连接数、存活任务数、字节数）

@@ -27,7 +27,7 @@ use crate::inspect::{
     StreamTransitTask,
 };
 use crate::log::task::TaskEvent;
-use crate::serve::ftp_proxy::ctl_common::{
+use super::ctl::{
     is_auth_tls_command, is_upload_command, parse_upload_command, read_ftp_response,
 };
 use super::upload_state::get_ftp_upload_state;
