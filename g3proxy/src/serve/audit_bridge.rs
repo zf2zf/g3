@@ -92,34 +92,6 @@ pub(crate) struct UploadAuditContext {
     pub(crate) keylog_buffer: Option<Arc<TlsKeyLogBuffer>>,
 }
 
-/// Entry point for all upload data channels (single-direction transfer).
-///
-/// * If `audit_ctx` is `Some`, build a `BypassAdapter` and stream
-///   through it (upload + ICAP audit simultaneously).
-/// * If `audit_ctx` is `None`, fall back to a plain copy loop — no
-///   extra allocations, no overhead.
-/// 所有上传数据通道的统一入口（单向转发）。
-///
-/// * `audit_ctx` 为 `Some` 时：构建 `BypassAdapter`，在同一条流上完成
-///   “上传转发 + ICAP 审计”。
-/// * `audit_ctx` 为 `None` 时：退化为普通拷贝循环，无额外分配、无审计开销。
-pub(crate) async fn run_upload_audit_or_relay<CR, UW>(
-    clt_r: &mut CR,
-    ups_w: &mut UW,
-    idle_wheel: &Arc<IdleWheel>,
-    max_idle_count: usize,
-    audit_ctx: Option<UploadAuditContext>,
-) -> Option<u64>
-where
-    CR: AsyncRead + Send + Sync + Unpin,
-    UW: AsyncWrite + Send + Sync + Unpin,
-{
-    match audit_ctx {
-        Some(ac) => audit_and_forward(clt_r, ups_w, ac).await,
-        None => raw_forward_with_idle(clt_r, ups_w, idle_wheel, max_idle_count).await,
-    }
-}
-
 /// Bidirectional transfer for HTTP CONNECT tunnel mode.
 /// Handles upload audit on client→upstream direction, while doing plain copy on upstream→client.
 /// HTTP CONNECT 隧道模式的双向转发。
