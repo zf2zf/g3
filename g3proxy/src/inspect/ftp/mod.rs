@@ -16,3 +16,6 @@ pub(crate) mod upload_data;
 pub(crate) use upload_data::{
     FtpUploadDataInterceptObject, check_ftp_upload_data, get_ftps_domain,
 };
+
+/// 跨连接共享的 FTP 上传/FTPS 状态表（CONNECT 模式下控制与数据通道分离时使用）
+pub(crate) mod upload_state;

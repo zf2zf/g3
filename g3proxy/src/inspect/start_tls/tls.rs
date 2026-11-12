@@ -138,7 +138,7 @@ where
                     // 以「客户端 IP + FTP 服务端 IP」为键存入全局上传状态，供数据通道侧取回
                     let client_ip = self.ctx.task_notes.client_addr.ip();
                     let ftp_server_ip = self.ctx.connect_notes.server_addr.ip();
-                    crate::serve::ftp_proxy::upload_state::get_ftp_upload_state().save_tls_session(
+                    crate::inspect::ftp::upload_state::get_ftp_upload_state().save_tls_session(
                         client_ip,
                         ftp_server_ip,
                         session_der,

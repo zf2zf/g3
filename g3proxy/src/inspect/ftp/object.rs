@@ -30,7 +30,7 @@ use crate::log::task::TaskEvent;
 use crate::serve::ftp_proxy::ctl_common::{
     is_auth_tls_command, is_upload_command, parse_upload_command, read_ftp_response,
 };
-use crate::serve::ftp_proxy::upload_state::get_ftp_upload_state;
+use super::upload_state::get_ftp_upload_state;
 use crate::serve::{ServerTaskError, ServerTaskResult};
 
 // 记录一条 FTP 拦截日志，自动附带会话公共字段（任务 id、检测深度、源站地址）。
@@ -311,7 +311,7 @@ where
             g3_types::net::Host::Domain(d) => d.to_string(),
             g3_types::net::Host::Ip(ip) => ip.to_string(),
         };
-        crate::serve::ftp_proxy::upload_state::get_ftp_upload_state().mark_ftps_domain(
+        super::upload_state::get_ftp_upload_state().mark_ftps_domain(
             client_ip,
             ftp_server_ip,
             &domain,

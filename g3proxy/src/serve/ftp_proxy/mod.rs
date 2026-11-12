@@ -28,7 +28,5 @@ pub(crate) mod server;
 pub(crate) mod stats;
 /// 单条 FTP 控制连接的任务：上游建连、通道转发与数据通道拦截
 pub(crate) mod task;
-/// 跨连接共享的 FTP 上传/FTPS 状态表（HTTP CONNECT 模式下控制与数据分离时使用）
-pub(crate) mod upload_state;
 
 pub(crate) use server::FtpProxyServer;

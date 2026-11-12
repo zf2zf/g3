@@ -7,7 +7,7 @@
 //!
 //! 本模块处理 TLS 拦截完成后的 FTPS 上传数据连接：当数据连接被识别为
 //! 上传方向（控制连接上已出现 STOR/APPE 命令）时，对解密后的数据触发 ICAP 审计。
-//! 上传标记与 FTPS 域名通过 [`crate::serve::ftp_proxy::upload_state`] 全局状态与控制连接侧交接。
+//! 上传标记与 FTPS 域名通过 [`crate::inspect::ftp::upload_state`] 全局状态与控制连接侧交接。
 
 use std::io;
 use std::net::SocketAddr;
@@ -22,7 +22,7 @@ use crate::config::server::ServerConfig;
 use crate::inspect::{BoxAsyncRead, BoxAsyncWrite, StreamInspectContext};
 use crate::serve::ServerTaskResult;
 use crate::serve::audit_bridge::{UploadAuditContext, run_upload_audit_or_relay_bidi};
-use crate::serve::ftp_proxy::upload_state::{PendingUploadInfo, get_ftp_upload_state};
+use super::upload_state::{PendingUploadInfo, get_ftp_upload_state};
 
 /// 记录一条 FTP 上传数据连接的拦截日志。
 ///

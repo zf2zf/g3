@@ -129,7 +129,7 @@ where
         // Reuse FTPS control channel TLS session for data channel (vsftpd require_ssl_reuse)
         // 把控制通道缓存的 TLS 会话注入到数据通道，满足 require_ssl_reuse 要求
         if ftps_domain.is_some()
-            && let Some(session_der) = crate::serve::ftp_proxy::upload_state::get_ftp_upload_state()
+            && let Some(session_der) = crate::inspect::ftp::upload_state::get_ftp_upload_state()
                 .get_tls_session(
                     self.ctx.task_notes.client_addr.ip(),
                     self.ctx.connect_notes.server_addr.ip(),

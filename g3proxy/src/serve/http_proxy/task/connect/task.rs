@@ -28,7 +28,7 @@ use crate::module::tcp_connect::{
     TcpConnectError, TcpConnectTaskConf, TcpConnectTaskNotes, TcpConnection,
 };
 use crate::serve::audit_bridge::{UploadAuditContext, run_upload_audit_or_relay_bidi};
-use crate::serve::ftp_proxy::upload_state::get_ftp_upload_state;
+use crate::inspect::ftp::upload_state::get_ftp_upload_state;
 use crate::serve::http_proxy::HttpConnectTaskAliveGuard;
 use crate::serve::{
     ServerStats, ServerTaskError, ServerTaskForbiddenError, ServerTaskNotes, ServerTaskResult,
