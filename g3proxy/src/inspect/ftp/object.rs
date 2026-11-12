@@ -8,7 +8,7 @@
 //! 本模块处理 HTTP CONNECT 模式下的 FTP 控制连接检测。
 //! 上传命令（STOR/APPE）会被识别并写入全局状态，供后续数据连接建立时做 ICAP 审计；
 //! 遇到 AUTH TLS（或隐式 FTPS）时标记域名并切换到 TLS 拦截状态机（FTPS MITM）。
-//! 与原生 FTP 代理不同：这里不重写 PASV 响应，客户端直接连通 FTP 服务器。
+//! 这里不重写 PASV 响应，客户端直接连通 FTP 服务器。
 
 use std::time::Duration;
 
@@ -21,16 +21,14 @@ use g3_io_ext::{IdleInterval, OnceBufReader, StreamCopyConfig};
 use g3_slog_types::{LtUpstreamAddr, LtUuid};
 use g3_types::net::UpstreamAddr;
 
+use super::ctl::{is_auth_tls_command, is_upload_command, parse_upload_command, read_ftp_response};
+use super::upload_state::get_ftp_upload_state;
 use crate::config::server::ServerConfig;
 use crate::inspect::{
     BoxAsyncRead, BoxAsyncWrite, StartTlsProtocol, StreamInspectContext, StreamInspection,
     StreamTransitTask,
 };
 use crate::log::task::TaskEvent;
-use super::ctl::{
-    is_auth_tls_command, is_upload_command, parse_upload_command, read_ftp_response,
-};
-use super::upload_state::get_ftp_upload_state;
 use crate::serve::{ServerTaskError, ServerTaskResult};
 
 // 记录一条 FTP 拦截日志，自动附带会话公共字段（任务 id、检测深度、源站地址）。
@@ -284,7 +282,7 @@ where
     /// 通过 HTTP CONNECT 隧道中继 FTP 控制连接。
     /// 上传命令（STOR/APPE）会被标记到全局状态，供随后的数据连接做 ICAP 审计。
     ///
-    /// 与原生 FTP 代理的关键差异：
+    /// 关键行为：
     /// - 不重写 PASV 响应（客户端直连 FTP 服务器）
     /// - 上传命令在全局状态中标记，供数据连接检测使用
     async fn relay_control_channel(
