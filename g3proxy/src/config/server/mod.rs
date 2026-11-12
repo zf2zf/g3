@@ -22,7 +22,6 @@ use crate::audit::AuditHandle;
 use crate::auth::UserGroup;
 
 pub(crate) mod dummy_close;
-pub(crate) mod ftp_proxy;
 pub(crate) mod intelli_proxy;
 pub(crate) mod native_tls_port;
 #[cfg(feature = "quic")]
@@ -132,7 +131,6 @@ pub(crate) trait ServerConfig {
 #[def_fn(diff_action, &Self, ServerConfigDiffAction)]
 pub(crate) enum AnyServerConfig {
     DummyClose(dummy_close::DummyCloseServerConfig),
-    FtpProxy(ftp_proxy::FtpProxyServerConfig),
     PlainTcpPort(plain_tcp_port::PlainTcpPortConfig),
     PlainTlsPort(plain_tls_port::PlainTlsPortConfig),
     NativeTlsPort(native_tls_port::NativeTlsPortConfig),
@@ -203,11 +201,6 @@ fn load_server(
             let server = dummy_close::DummyCloseServerConfig::parse(map, position)
                 .context("failed to load this DummyClose server")?;
             Ok(AnyServerConfig::DummyClose(server))
-        }
-        "ftp_proxy" | "ftpproxy" => {
-            let server = ftp_proxy::FtpProxyServerConfig::parse(map, position)
-                .context("failed to load this FtpProxy server")?;
-            Ok(AnyServerConfig::FtpProxy(server))
         }
         "plain_tcp_port" | "plaintcpport" | "plain_tcp" | "plaintcp" => {
             let server = plain_tcp_port::PlainTcpPortConfig::parse(map, position)

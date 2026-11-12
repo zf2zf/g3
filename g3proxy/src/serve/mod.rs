@@ -30,7 +30,6 @@ pub(crate) use idle_check::ServerIdleChecker;
 
 pub(crate) mod audit_bridge;
 mod dummy_close;
-pub(crate) mod ftp_proxy;
 mod intelli_proxy;
 mod native_tls_port;
 #[cfg(feature = "quic")]

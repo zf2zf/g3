@@ -66,11 +66,10 @@ impl IdleCheck for CountingIdleChecker {
 }
 
 /// Context needed to perform ICAP bypass audit of a single upload stream.
-/// FTP callers build it in `serve/ftp_proxy/task.rs` (see
-/// `build_audit_context`); HTTP callers fill the same shape with the real
-/// request framing and the task's username.
+/// FTP callers build it in `inspect/ftp/upload_data.rs`; HTTP callers fill
+/// the same shape with the real request framing and the task's username.
 /// 对单条上传流做 ICAP 旁路审计所需的上下文。
-/// FTP 调用方在 `serve/ftp_proxy/task.rs` 的 `build_audit_context` 中拼装；
+/// FTP 调用方在 `inspect/ftp/upload_data.rs` 中拼装；
 /// HTTP 调用方以同样的形状填入真实请求 framing 与任务用户名。
 pub(crate) struct UploadAuditContext {
     /// ICAP REQMOD 客户端
