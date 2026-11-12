@@ -7,6 +7,10 @@
 # 全新安装（目标机上还没有 g3proxy.yaml）会交互式询问 g3proxy 的监听端口，
 # 直接回车用配置模板里的默认值；已有配置时不再询问，端口以现网文件为准。
 #
+# 网络命名空间也在安装时选择：回车用默认 /run/netns/ns-vpp（升级时取已装单元正在用
+# 的值，新装且已装对端 g3icap 时跟随它），输 no 留在 host 网络；非交互安装落默认值。
+# 选的值必须与已装的 g3icap 一致，否则在写任何系统目录之前拦住。
+#
 # PREFIX / SYSTEMD_DIR 环境变量仅供测试，现场部署不要设置它们。
 
 set -eu
@@ -111,21 +115,46 @@ configure_listen_port() {
 
 # 命名空间契约：g3proxy 与 g3fcgen 必须进同一个命名空间——进 ns 之后 127.0.0.1 就是那个
 # 命名空间的回环，g3proxy 取中间人证书走的正是它；而且要跟目标机上已经装好的 g3icap 一致，
-# 否则审计请求会打到自己命名空间的空回环上，静默丢掉。NetworkNamespacePath 这两行是打包时
-# 展开进单元的，这里只核对、不改，且在写任何系统目录之前拦住。
+# 否则审计请求会打到自己命名空间的空回环上，静默丢掉。命名空间在安装时选择、在这里
+# 展开进单元（两个单元用同一个值），与已装 g3icap 的核对在写任何系统目录之前做。
 unit_netns() {
 	sed -n 's/^NetworkNamespacePath=//p' "$1" 2>/dev/null | head -1
 }
 
-PROXY_NS=$(unit_netns "$SCRIPT_DIR/systemd/g3proxy.service")
-FCGEN_NS=$(unit_netns "$SCRIPT_DIR/systemd/g3fcgen.service")
-if [ "$PROXY_NS" != "$FCGEN_NS" ]; then
-	echo "这个包自己就不对：g3proxy 与 g3fcgen 的网络命名空间不一致" >&2
-	echo "  g3proxy.service: ${PROXY_NS:-（host）}" >&2
-	echo "  g3fcgen.service: ${FCGEN_NS:-（host）}" >&2
-	echo "回构建机重新打包（deploy/build_run_package.sh），别手改包里的单元文件" >&2
-	exit 1
+# 默认值：升级取本服务单元正在用的命名空间（别把服务搬走）；新装时已装对端 g3icap
+# 就跟随它；都没有才用默认 /run/netns/ns-vpp。
+DEFAULT_NS=/run/netns/ns-vpp
+if [ -e "$SYSTEMD_DIR/g3proxy.service" ]; then
+	DEFAULT_NS=$(unit_netns "$SYSTEMD_DIR/g3proxy.service")
+	[ -n "$DEFAULT_NS" ] || DEFAULT_NS=no
+elif [ -e "$SYSTEMD_DIR/g3icap.service" ]; then
+	DEFAULT_NS=$(unit_netns "$SYSTEMD_DIR/g3icap.service")
+	[ -n "$DEFAULT_NS" ] || DEFAULT_NS=no
 fi
+
+# 命名空间交互：回车用默认值，输 no 留在 host 网络；输入非法就重问；stdin 是 EOF
+# （非交互场景，如管道/自动化）直接落默认值，不卡住。
+while :; do
+	printf '网络命名空间 [%s]（输 no 留在 host 网络）：' "$DEFAULT_NS"
+	if ! read answer; then
+		answer=''
+		echo
+	fi
+	[ -n "$answer" ] || answer=$DEFAULT_NS
+	case $answer in
+	no | host)
+		PROXY_NS=''
+		break
+		;;
+	/*)
+		PROXY_NS=$answer
+		break
+		;;
+	*)
+		echo "  要是绝对路径（/run/netns/<名字>），或 no 留在 host 网络"
+		;;
+	esac
+done
 
 if [ -e "$SYSTEMD_DIR/g3icap.service" ]; then
 	ICAP_NS=$(unit_netns "$SYSTEMD_DIR/g3icap.service")
@@ -133,26 +162,28 @@ if [ -e "$SYSTEMD_DIR/g3icap.service" ]; then
 		echo "目标机已装的 g3icap 在命名空间 ${ICAP_NS:-（host）}，本包要装的是 ${PROXY_NS:-（host）}" >&2
 		echo "两者必须同一个命名空间：g3proxy 送审计只连自己命名空间里的 127.0.0.1:1344，" >&2
 		echo "装在别的 ns 等于审计静默丢掉。三选一：" >&2
-		echo "  1) 重装 ICAP：sudo /opt/zf/icap/uninstall.sh，再装用同一个 --netns 打的 icap 包；" >&2
+		echo "  1) 重装 ICAP：sudo /opt/zf/icap/uninstall.sh，再装 icap 包，安装时选同一个命名空间；" >&2
 		echo "  2) 现场改它：sudo systemctl edit g3icap 写 NetworkNamespacePath=${PROXY_NS:-（清空则留在 host）}，" >&2
 		echo "     再 sudo systemctl daemon-reload restart g3icap；" >&2
-		echo "  3) 回构建机用与 g3icap 相同的路径重新打本包。" >&2
+		echo "  3) 重装本包，安装时选与 g3icap 相同的命名空间。" >&2
 		exit 1
 	fi
 	echo "==> 网络命名空间与已装的 g3icap 一致：${PROXY_NS:-（都在 host）}"
 fi
 
 if [ -n "$PROXY_NS" ] && [ ! -e "$PROXY_NS" ]; then
-	echo "单元指定的网络命名空间不存在：${PROXY_NS}" >&2
+	echo "选择的网络命名空间不存在：${PROXY_NS}" >&2
 	echo "命名空间由 vpp 侧建（或由 ip netns add 建），systemd 不会代你创建。三选一：" >&2
 	echo "  1) 先把命名空间建出来（例如 ip netns add ${PROXY_NS##*/}，或由 vpp 侧创建）；" >&2
-	echo "  2) 现场让服务留在 host：sudo systemctl edit g3proxy g3fcgen，各写 [Service] 与一条" >&2
-	echo "     空的 NetworkNamespacePath=，再 daemon-reload；" >&2
-	echo "  3) 回构建机 NETNS=no 重新打包。" >&2
+	echo "  2) 重装本包，输 no 让服务留在 host 网络；" >&2
+	echo "  3) 装完后现场改：sudo systemctl edit g3proxy g3fcgen，各写 [Service] 与一条空的" >&2
+	echo "     NetworkNamespacePath=，再 daemon-reload。" >&2
 	exit 1
 fi
 if [ -n "$PROXY_NS" ]; then
 	echo "==> g3proxy 与 g3fcgen 装入网络命名空间：${PROXY_NS}"
+else
+	echo "==> g3proxy 与 g3fcgen 留在 host 网络"
 fi
 
 # 装完之后在 ns 里看一眼两个回环端口通不通。只提示、不判失败：另一个包可能还没装，
@@ -218,12 +249,29 @@ if ! "$PREFIX/bin/g3proxy" -t -c "$PREFIX/conf/g3proxy.yaml"; then
 fi
 
 echo "==> 安装 systemd 单元到 ${SYSTEMD_DIR}"
-sed "s#@PREFIX@#${PREFIX}#g; s#@CONTROL_DIR@#${CONTROL_DIR}#g; s#@GROUP@#${DAEMON_GROUP}#g" \
-	"$SCRIPT_DIR/systemd/g3proxy.service" > "$SYSTEMD_DIR/g3proxy.service"
+# @NETNS@ 单独占一行：选了命名空间就展开成指令，no 则整行删掉，不留空行
+if [ -n "$PROXY_NS" ]; then
+	NETNS_LINES=$(printf '# 进程搬进安装时选定的、已建好的网络命名空间；PrivateNetwork=no 是 systemd 默认值，\n# 写出来只是表明这里不做网络隔离。进 ns 之后 127.0.0.1 是该命名空间的回环，\n# 所以 g3proxy、g3fcgen 与 g3icap 必须共用同一个命名空间，2999 与 1344 才连得上。\nNetworkNamespacePath=%s\nPrivateNetwork=no' "$PROXY_NS")
+else
+	NETNS_LINES=''
+fi
+render_unit() {
+	awk -v netns="$NETNS_LINES" '
+		$0 == "@NETNS@" {
+			if (netns != "") printf "%s\n", netns
+			next
+		}
+		{ print }
+	' "$1"
+}
+render_unit "$SCRIPT_DIR/systemd/g3proxy.service" \
+	| sed "s#@PREFIX@#${PREFIX}#g; s#@CONTROL_DIR@#${CONTROL_DIR}#g; s#@GROUP@#${DAEMON_GROUP}#g" \
+	> "$SYSTEMD_DIR/g3proxy.service"
 chmod 0644 "$SYSTEMD_DIR/g3proxy.service"
 echo "  g3proxy.service"
-sed "s#@PREFIX@#${PREFIX}#g; s#@GROUP@#${FCGEN_GROUP}#g" \
-	"$SCRIPT_DIR/systemd/g3fcgen.service" > "$SYSTEMD_DIR/g3fcgen.service"
+render_unit "$SCRIPT_DIR/systemd/g3fcgen.service" \
+	| sed "s#@PREFIX@#${PREFIX}#g; s#@GROUP@#${FCGEN_GROUP}#g" \
+	> "$SYSTEMD_DIR/g3fcgen.service"
 chmod 0644 "$SYSTEMD_DIR/g3fcgen.service"
 echo "  g3fcgen.service"
 systemctl daemon-reload
@@ -231,8 +279,8 @@ systemctl daemon-reload
 echo "==> 卸载脚本落到 ${PREFIX}/uninstall.sh"
 install -m 0755 "$SCRIPT_DIR/uninstall.sh" "$PREFIX/uninstall.sh"
 
-# 打包时展开进单元的 NetworkNamespacePath 已在装任何文件之前核对过（存在性、与 g3fcgen
-# 一致、与已装的 g3icap 一致），这里只负责起服务。
+# 安装时选的命名空间已在装任何文件之前核对过（存在性、与已装的 g3icap 一致），
+# 这里只负责起服务。
 echo "==> 启动服务"
 # 先起 g3fcgen：g3proxy 的 TLS 拦截在运行时向它取证书
 if ! systemctl enable --now g3fcgen; then
@@ -256,8 +304,8 @@ echo "  journalctl -u g3proxy -u g3fcgen -f"
 echo "重载配置（不中断在途连接）："
 echo "  systemctl reload g3proxy"
 if [ ! -e "$SYSTEMD_DIR/g3icap.service" ]; then
-	echo "ICAP 审计服务端（127.0.0.1:1344）在另一个包里：装 g3icap 包即可，两个包必须用同一个"
-	echo "--netns 路径打包，装完安装脚本会核对是否一致。"
+	echo "ICAP 审计服务端（127.0.0.1:1344）在另一个包里：装 g3icap 包即可，安装时选与本包"
+	echo "相同的网络命名空间，安装脚本会核对是否一致。"
 fi
 echo "卸载（停服务、摘单元，并删除 ${PREFIX}，配置与 CA 一并清除）："
 echo "  sudo ${PREFIX}/uninstall.sh"

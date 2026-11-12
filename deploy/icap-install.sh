@@ -5,9 +5,11 @@
 # 自解压安装器解压后调用本脚本。
 #
 # ICAP 服务端是审计链路的末端，必须和 g3proxy、g3fcgen 在同一个网络命名空间里：
-# g3proxy 进了 ns 之后只会连该命名空间的 127.0.0.1:1344。所以装之前拿目标机上
-# 已有的 g3 单元比对 NetworkNamespacePath，不一致就直接失败——装在别的命名空间里
-# 表面上一切正常，审计请求却静默丢掉，比装不上难查得多。
+# g3proxy 进了 ns 之后只会连该命名空间的 127.0.0.1:1344。命名空间在安装时选择
+# （回车用默认 /run/netns/ns-vpp，升级取已装单元正在用的值，已装对端 g3 时跟随它，
+# 输 no 留在 host 网络，非交互安装落默认值），并拿目标机上已有的 g3 单元比对，
+# 不一致就直接失败——装在别的命名空间里表面上一切正常，审计请求却静默丢掉，
+# 比装不上难查得多。
 #
 # PREFIX / SYSTEMD_DIR 环境变量仅供测试，现场部署不要设置它们。
 
@@ -22,7 +24,7 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 for need in bin systemd install.sh uninstall.sh; do
 	if [ ! -e "$SCRIPT_DIR/$need" ]; then
 		echo "看起来不在 run 包目录里：缺少 $SCRIPT_DIR/$need" >&2
-		echo "请先在构建机执行 deploy/build_run_package.sh --component=icap，" >&2
+		echo "请先在构建机执行 deploy/build_run_package.sh 并选 icap 组件，" >&2
 		echo "再把生成的 .run 拷到目标机执行" >&2
 		exit 1
 	fi
@@ -43,12 +45,47 @@ if [ ! -x "$SCRIPT_DIR/bin/g3icap" ]; then
 	exit 1
 fi
 
-# 本包的命名空间是打包时展开进单元的成品，这里只核对，不改。
+# 命名空间在安装时选择、在这里展开进单元；必须与已装的 g3proxy/g3fcgen 一致，
+# 核对在写任何系统目录之前做。
 unit_netns() {
 	sed -n 's/^NetworkNamespacePath=//p' "$1" 2>/dev/null | head -1
 }
 
-ICAP_NS=$(unit_netns "$SCRIPT_DIR/systemd/g3icap.service")
+# 默认值：升级取本服务单元正在用的命名空间（别把服务搬走）；新装时已装对端 g3
+# 就跟随它；都没有才用默认 /run/netns/ns-vpp。
+DEFAULT_NS=/run/netns/ns-vpp
+if [ -e "$SYSTEMD_DIR/g3icap.service" ]; then
+	DEFAULT_NS=$(unit_netns "$SYSTEMD_DIR/g3icap.service")
+	[ -n "$DEFAULT_NS" ] || DEFAULT_NS=no
+elif [ -e "$SYSTEMD_DIR/g3proxy.service" ]; then
+	DEFAULT_NS=$(unit_netns "$SYSTEMD_DIR/g3proxy.service")
+	[ -n "$DEFAULT_NS" ] || DEFAULT_NS=no
+fi
+
+# 命名空间交互：回车用默认值，输 no 留在 host 网络；输入非法就重问；stdin 是 EOF
+# （非交互场景，如管道/自动化）直接落默认值，不卡住。
+while :; do
+	printf '网络命名空间 [%s]（输 no 留在 host 网络）：' "$DEFAULT_NS"
+	if ! read answer; then
+		answer=''
+		echo
+	fi
+	[ -n "$answer" ] || answer=$DEFAULT_NS
+	case $answer in
+	no | host)
+		ICAP_NS=''
+		break
+		;;
+	/*)
+		ICAP_NS=$answer
+		break
+		;;
+	*)
+		echo "  要是绝对路径（/run/netns/<名字>），或 no 留在 host 网络"
+		;;
+	esac
+done
+
 G3_SEEN=0
 for peer in g3proxy g3fcgen; do
 	unit="$SYSTEMD_DIR/$peer.service"
@@ -59,11 +96,10 @@ for peer in g3proxy g3fcgen; do
 		echo "已安装的 ${peer} 在命名空间 ${peer_ns:-（host）}，本包要装的是 ${ICAP_NS:-（host）}" >&2
 		echo "三者必须共用一个命名空间，否则 g3proxy 送的审计打到自己命名空间的空回环上。" >&2
 		echo "三选一：" >&2
-		echo "  1) 回构建机用与 g3 包相同的路径重打本包：" >&2
-		echo "     deploy/build_run_package.sh --component=icap --netns=${peer_ns:-<g3 包用的路径>}；" >&2
+		echo "  1) 重装本包，安装时选与 g3 包相同的命名空间；" >&2
 		echo "  2) 现场改本服务：sudo systemctl edit g3icap 写 NetworkNamespacePath=${peer_ns:-（清空则留在 host）}，" >&2
 		echo "     再 sudo systemctl daemon-reload restart g3icap；" >&2
-		echo "  3) 两边都退回 host：两个包都用 --netns=no 重打。" >&2
+		echo "  3) 重装 g3 包，安装时选与本包相同的命名空间。" >&2
 		exit 1
 	fi
 	echo "==> 网络命名空间与已装的 ${peer} 一致：${ICAP_NS:-（都在 host）}"
@@ -71,16 +107,16 @@ done
 
 if [ "$G3_SEEN" = 0 ]; then
 	echo "提示：目标机上还没装 g3proxy/g3fcgen，无法比对命名空间。" >&2
-	echo "      先装 g3 包，或保证两个包用同一个 --netns 路径打包（默认 /run/netns/ns-vpp）。" >&2
+	echo "      之后装 g3 包时请选与本包相同的命名空间（默认 /run/netns/ns-vpp）。" >&2
 fi
 
 if [ -n "$ICAP_NS" ] && [ ! -e "$ICAP_NS" ]; then
-	echo "单元指定的网络命名空间不存在：${ICAP_NS}" >&2
+	echo "选择的网络命名空间不存在：${ICAP_NS}" >&2
 	echo "命名空间由 vpp 侧建（或由 ip netns add 建），systemd 不会代你创建。三选一：" >&2
 	echo "  1) 先把命名空间建出来（例如 ip netns add ${ICAP_NS##*/}，或由 vpp 侧创建）；" >&2
-	echo "  2) 现场让它留在 host：sudo systemctl edit g3icap，写 [Service] 与一条空的" >&2
-	echo "     NetworkNamespacePath=，再 daemon-reload；" >&2
-	echo "  3) 回构建机 NETNS=no 重新打包。" >&2
+	echo "  2) 重装本包，输 no 让服务留在 host 网络；" >&2
+	echo "  3) 装完后现场改：sudo systemctl edit g3icap，写 [Service] 与一条空的" >&2
+	echo "     NetworkNamespacePath=，再 daemon-reload。" >&2
 	exit 1
 fi
 
@@ -119,8 +155,20 @@ for doc in README.md VERSION; do
 done
 
 echo "==> 安装 systemd 单元到 ${SYSTEMD_DIR}"
-sed "s#@PREFIX@#${PREFIX}#g" \
-	"$SCRIPT_DIR/systemd/g3icap.service" > "$SYSTEMD_DIR/g3icap.service"
+# @NETNS@ 单独占一行：选了命名空间就展开成指令，no 则整行删掉，不留空行
+if [ -n "$ICAP_NS" ]; then
+	NETNS_LINES=$(printf '# 进程搬进安装时选定的、已建好的网络命名空间。必须与 g3proxy、g3fcgen 共用同一个\n# 命名空间，g3proxy 送到 127.0.0.1:1344 的审计请求才到得了本服务。\nNetworkNamespacePath=%s\nPrivateNetwork=no' "$ICAP_NS")
+else
+	NETNS_LINES=''
+fi
+awk -v netns="$NETNS_LINES" '
+	$0 == "@NETNS@" {
+		if (netns != "") printf "%s\n", netns
+		next
+	}
+	{ print }
+' "$SCRIPT_DIR/systemd/g3icap.service" \
+	| sed "s#@PREFIX@#${PREFIX}#g" > "$SYSTEMD_DIR/g3icap.service"
 chmod 0644 "$SYSTEMD_DIR/g3icap.service"
 echo "  g3icap.service"
 systemctl daemon-reload
@@ -130,6 +178,8 @@ install -m 0755 "$SCRIPT_DIR/uninstall.sh" "$PREFIX/uninstall.sh"
 
 if [ -n "$ICAP_NS" ]; then
 	echo "==> g3icap 装入网络命名空间：${ICAP_NS}"
+else
+	echo "==> g3icap 留在 host 网络"
 fi
 
 echo "==> 启动服务"
