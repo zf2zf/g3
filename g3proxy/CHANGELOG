@@ -11,6 +11,7 @@ v1.13.0:
      - tcp_conn_rate_limit/tcp_conn_limit_quota in user config, use connection_rate_limit instead
      - task_idle_check_duration in server config, use task_idle_check_interval instead
  - Removed: remove the long deprecated cache_file config option in lua and python user group source
+ - Removed: the native FTP gateway server (type ftp_proxy); FTP upload audit is served by the HTTP CONNECT forward proxy only
 
 
 v1.12.3:
